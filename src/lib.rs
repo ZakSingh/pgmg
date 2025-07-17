@@ -48,16 +48,26 @@ pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::
         .map(|table| QualifiedIdent::from_qualified_name(&table))
         .collect();
     
-    let functions = parse_result.functions().into_iter()
-        .map(|func| QualifiedIdent::from_qualified_name(&func))
-        .collect();
+    let mut functions = HashSet::new();
+    
+    // Get functions from pg_query's built-in functionality
+    for func in parse_result.functions() {
+        functions.insert(QualifiedIdent::from_qualified_name(&func));
+    }
+    
+    // Also extract functions from FuncCall nodes to ensure we catch all function calls
+    for (node, _, _, _) in parse_result.protobuf.nodes() {
+        if let NodeRef::FuncCall(func_call) = node {
+            extract_function_from_func_call(func_call, &mut functions);
+        }
+    }
     
     // Extract types from cast expressions
     let types = extract_types_from_ast(&parse_result.protobuf)?;
     
     Ok(Dependencies {
         relations,
-        functions,
+        functions: functions.into_iter().collect(),
         types,
     })
 }
@@ -65,12 +75,34 @@ pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::
 fn extract_types_from_ast(parse_result: &pg_query::protobuf::ParseResult) -> Result<Vec<QualifiedIdent>, Box<dyn std::error::Error>> {
     let mut types = HashSet::new();
     
-    // The original approach works fine for most cases, but we need to ensure we catch TypeCast nodes
-    // Let's implement a workaround by using the debug output to find TypeCast nodes
     for (node, _depth, _context, _has_filter_columns) in parse_result.nodes() {
         match node {
             NodeRef::TypeCast(type_cast) => {
                 if let Some(type_name) = &type_cast.type_name {
+                    if let Some(qualified_type) = extract_type_from_type_name(type_name) {
+                        if !is_builtin_type(&qualified_type.name) {
+                            types.insert(qualified_type);
+                        }
+                    }
+                }
+            }
+            NodeRef::CompositeTypeStmt(composite_type) => {
+                // Extract types from composite type column definitions
+                for col_def in &composite_type.coldeflist {
+                    if let Some(NodeEnum::ColumnDef(column_def)) = &col_def.node {
+                        if let Some(type_name) = &column_def.type_name {
+                            if let Some(qualified_type) = extract_type_from_type_name(type_name) {
+                                if !is_builtin_type(&qualified_type.name) {
+                                    types.insert(qualified_type);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            NodeRef::CreateDomainStmt(domain_stmt) => {
+                // Extract the base type of the domain
+                if let Some(type_name) = &domain_stmt.type_name {
                     if let Some(qualified_type) = extract_type_from_type_name(type_name) {
                         if !is_builtin_type(&qualified_type.name) {
                             types.insert(qualified_type);
@@ -206,66 +238,136 @@ fn extract_dependencies_from_plpgsql_function(
         }
     }
     
-    // Extract SQL statements from the function body
-    let sql_statements = extract_sql_statements_from_json(function_json);
+    // Extract all PL/pgSQL expressions from the function body
+    let plpgsql_expressions = extract_plpgsql_expressions_from_json(function_json);
     
-    // Analyze each SQL statement
-    for sql in sql_statements {
-        // Some extracted queries might be expressions that need to be wrapped in SELECT
-        let sql_to_analyze = if sql.trim().to_uppercase().starts_with("SELECT") 
-            || sql.trim().to_uppercase().starts_with("INSERT")
-            || sql.trim().to_uppercase().starts_with("UPDATE")
-            || sql.trim().to_uppercase().starts_with("DELETE")
-            || sql.trim().to_uppercase().starts_with("WITH") {
-            sql
+    // Analyze each expression
+    for expr in plpgsql_expressions {
+        // Check if it's a regular SQL statement
+        let expr_upper = expr.trim().to_uppercase();
+        if expr_upper.starts_with("SELECT") 
+            || expr_upper.starts_with("INSERT")
+            || expr_upper.starts_with("UPDATE")
+            || expr_upper.starts_with("DELETE")
+            || expr_upper.starts_with("WITH") {
+            // It's a SQL statement, analyze it normally
+            if let Ok(deps) = analyze_statement(&expr) {
+                for relation in deps.relations {
+                    relations.insert(relation);
+                }
+                for function in deps.functions {
+                    functions.insert(function);
+                }
+                for typ in deps.types {
+                    types.insert(typ);
+                }
+            }
         } else {
-            // Wrap expression in SELECT to make it parseable
-            format!("SELECT {}", sql)
-        };
-        
-        if let Ok(deps) = analyze_statement(&sql_to_analyze) {
-            for relation in deps.relations {
-                relations.insert(relation);
-            }
-            for function in deps.functions {
-                functions.insert(function);
-            }
-            for typ in deps.types {
-                types.insert(typ);
-            }
+            // It's a PL/pgSQL expression (assignment, condition, etc.)
+            // Extract function calls and type casts from the expression
+            extract_dependencies_from_plpgsql_expression(&expr, functions, types);
         }
     }
     
     Ok(())
 }
 
-fn extract_sql_statements_from_json(value: &Value) -> Vec<String> {
-    let mut statements = Vec::new();
+fn extract_plpgsql_expressions_from_json(value: &Value) -> Vec<String> {
+    let mut expressions = Vec::new();
     
     match value {
         Value::Object(map) => {
-            // Look for PLpgSQL_expr nodes which contain SQL statements
+            // Look for PLpgSQL_expr nodes which contain expressions
             if let Some(Value::Object(expr_map)) = map.get("PLpgSQL_expr") {
                 if let Some(Value::String(query)) = expr_map.get("query") {
-                    statements.push(query.clone());
+                    expressions.push(query.clone());
                 }
             }
             
             // Recursively search in all values
             for (_, v) in map {
-                statements.extend(extract_sql_statements_from_json(v));
+                expressions.extend(extract_plpgsql_expressions_from_json(v));
             }
         }
         Value::Array(arr) => {
             // Recursively search in array elements
             for v in arr {
-                statements.extend(extract_sql_statements_from_json(v));
+                expressions.extend(extract_plpgsql_expressions_from_json(v));
             }
         }
         _ => {}
     }
     
-    statements
+    expressions
+}
+
+fn extract_dependencies_from_plpgsql_expression(
+    expr: &str,
+    functions: &mut HashSet<QualifiedIdent>,
+    types: &mut HashSet<QualifiedIdent>
+) {
+    // Handle assignment expressions by extracting the right-hand side
+    let expr_to_parse = if expr.contains(":=") {
+        // Extract the RHS of the assignment
+        if let Some(rhs) = expr.split(":=").nth(1) {
+            rhs.trim()
+        } else {
+            expr
+        }
+    } else {
+        expr
+    };
+    
+    // Try to parse the expression as a SELECT statement to leverage existing parsing
+    let select_expr = format!("SELECT {}", expr_to_parse);
+    if let Ok(parse_result) = pg_query::parse(&select_expr) {
+        // Extract function calls
+        for (node, _, _, _) in parse_result.protobuf.nodes() {
+            if let NodeRef::FuncCall(func_call) = node {
+                extract_function_from_func_call(func_call, functions);
+            }
+        }
+        
+        // Extract types using the existing function
+        if let Ok(found_types) = extract_types_from_ast(&parse_result.protobuf) {
+            for typ in found_types {
+                types.insert(typ);
+            }
+        }
+    }
+}
+
+fn extract_function_from_func_call(
+    func_call: &pg_query::protobuf::FuncCall,
+    functions: &mut HashSet<QualifiedIdent>
+) {
+    // Extract function name from funcname list
+    let name_parts: Vec<String> = func_call.funcname.iter()
+        .filter_map(|node| {
+            if let Some(NodeEnum::String(s)) = &node.node {
+                Some(s.sval.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    if !name_parts.is_empty() {
+        let func_ident = if name_parts.len() == 1 {
+            QualifiedIdent::from_name(name_parts[0].clone())
+        } else if name_parts.len() == 2 {
+            QualifiedIdent::new(Some(name_parts[0].clone()), name_parts[1].clone())
+        } else {
+            // Handle cases with more than 2 parts by taking the last two
+            let len = name_parts.len();
+            QualifiedIdent::new(
+                Some(name_parts[len - 2].clone()),
+                name_parts[len - 1].clone(),
+            )
+        };
+        
+        functions.insert(func_ident);
+    }
 }
 
 fn extract_types_from_datum(datum: &Value, types: &mut HashSet<QualifiedIdent>) {
@@ -692,6 +794,215 @@ mod tests {
     }
 
     #[test]
+    fn test_create_type_statement() {
+        let sql = "create type api.update_item as
+(
+    item_id              int,
+    mini_content_status  content_status,
+    mini_assembly_status assembly_status,
+    mini_painting_status painting_status,
+    mini_color           hex_color,
+    description          text,
+    listing              api.update_listing,
+    images               text[],
+    is_hidden            bool
+);";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should find all the custom types used in the type definition
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"content_status"));
+        assert!(type_names.contains(&"assembly_status"));
+        assert!(type_names.contains(&"painting_status"));
+        assert!(type_names.contains(&"hex_color"));
+        assert!(type_names.contains(&"update_listing"));
+        
+        // Should not include built-in types
+        assert!(!type_names.contains(&"int"));
+        assert!(!type_names.contains(&"text"));
+        assert!(!type_names.contains(&"bool"));
+        
+        // Check schema qualification
+        let update_listing = result.types.iter()
+            .find(|t| t.name == "update_listing")
+            .unwrap();
+        assert_eq!(update_listing.schema, Some("api".to_string()));
+    }
+
+    #[test]
+    fn test_create_domain_statement() {
+        let sql = "CREATE DOMAIN api.positive_amount AS numeric CHECK (value > 0);
+                   CREATE DOMAIN email_address AS text CHECK (value ~ '^[^@]+@[^@]+$');
+                   CREATE DOMAIN user_id AS uuid;
+                   CREATE DOMAIN order_status AS status_enum NOT NULL;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should find the custom base types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"status_enum"));
+        
+        // Should not include built-in types like numeric, text, uuid
+        assert!(!type_names.contains(&"numeric"));
+        assert!(!type_names.contains(&"text"));
+        assert!(!type_names.contains(&"uuid"));
+    }
+
+    #[test]
+    fn test_plpgsql_function_calls_in_expressions() {
+        let sql = "
+        CREATE OR REPLACE FUNCTION test_function_calls()
+        RETURNS integer AS $$
+        DECLARE
+            v_result integer;
+            v_status boolean;
+        BEGIN
+            -- Assignment with function call
+            v_result := calculate_total(100);
+            
+            -- IF condition with function call
+            IF is_valid_user(123) THEN
+                v_result := v_result + get_bonus(123);
+            ELSIF check_status() = 'active' THEN
+                v_result := apply_discount(v_result, 0.1);
+            END IF;
+            
+            -- WHILE loop with function call
+            WHILE has_more_items() LOOP
+                v_result := process_item(v_result);
+            END LOOP;
+            
+            -- CASE expression with function calls
+            v_status := CASE 
+                WHEN validate_amount(v_result) THEN true
+                ELSE false
+            END;
+            
+            -- RETURN with function call
+            RETURN finalize_result(v_result);
+        END;
+        $$ LANGUAGE plpgsql;
+        ";
+        
+        let result = analyze_plpgsql(sql).unwrap();
+        
+        // Check that we found all the function calls
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"calculate_total"));
+        assert!(function_names.contains(&"is_valid_user"));
+        assert!(function_names.contains(&"get_bonus"));
+        assert!(function_names.contains(&"check_status"));
+        assert!(function_names.contains(&"apply_discount"));
+        assert!(function_names.contains(&"has_more_items"));
+        assert!(function_names.contains(&"process_item"));
+        assert!(function_names.contains(&"validate_amount"));
+        assert!(function_names.contains(&"finalize_result"));
+    }
+
+    #[test]
+    fn test_plpgsql_complex_expressions() {
+        let sql = "
+        CREATE OR REPLACE FUNCTION process_order(p_order_id integer)
+        RETURNS api.order_result AS $$
+        DECLARE
+            v_total numeric;
+            v_status order_status;
+        BEGIN
+            -- Complex assignment with qualified function calls and type casts
+            v_total := api.calculate_subtotal(p_order_id) + 
+                       shipping.calculate_cost(p_order_id)::numeric;
+            
+            -- IF with type cast and function
+            IF v_total > get_threshold()::numeric THEN
+                v_status := 'approved'::order_status;
+            ELSE
+                v_status := validate_order(p_order_id)::order_status;
+            END IF;
+            
+            -- Nested function calls
+            v_total := apply_tax(
+                apply_discount(v_total, get_customer_discount(p_order_id))
+            );
+            
+            -- RETURN with constructor and cast
+            RETURN (p_order_id, v_status, v_total)::api.order_result;
+        END;
+        $$ LANGUAGE plpgsql;
+        ";
+        
+        let result = analyze_plpgsql(sql).unwrap();
+        
+        // Check function calls
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"calculate_subtotal"));
+        assert!(function_names.contains(&"calculate_cost"));
+        assert!(function_names.contains(&"get_threshold"));
+        assert!(function_names.contains(&"validate_order"));
+        assert!(function_names.contains(&"apply_tax"));
+        assert!(function_names.contains(&"apply_discount"));
+        assert!(function_names.contains(&"get_customer_discount"));
+        
+        // Check schema qualification for functions
+        let calc_subtotal = result.functions.iter()
+            .find(|f| f.name == "calculate_subtotal")
+            .unwrap();
+        assert_eq!(calc_subtotal.schema, Some("api".to_string()));
+        
+        let calc_cost = result.functions.iter()
+            .find(|f| f.name == "calculate_cost")
+            .unwrap();
+        assert_eq!(calc_cost.schema, Some("shipping".to_string()));
+        
+        // Check types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"order_result"));
+        assert!(type_names.contains(&"order_status"));
+        
+        // Check return type qualification
+        let order_result = result.types.iter()
+            .find(|t| t.name == "order_result")
+            .unwrap();
+        assert_eq!(order_result.schema, Some("api".to_string()));
+    }
+
+    #[test]
+    fn test_create_type_with_nested_types() {
+        let sql = "
+        CREATE TYPE address AS (
+            street text,
+            city text,
+            country country_code
+        );
+        
+        CREATE TYPE api.customer_info AS (
+            id uuid,
+            name text,
+            email email_type,
+            billing_address address,
+            shipping_address address,
+            status customer_status
+        );
+        
+        CREATE DOMAIN country_code AS char(2);
+        ";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should find all custom types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"country_code"));
+        assert!(type_names.contains(&"email_type"));
+        assert!(type_names.contains(&"address"));
+        assert!(type_names.contains(&"customer_status"));
+        
+        // Built-in types should be filtered
+        assert!(!type_names.contains(&"text"));
+        assert!(!type_names.contains(&"uuid"));
+        assert!(!type_names.contains(&"char"));
+    }
+
+    #[test]
     fn test_analyze_plpgsql_return_and_param_types() {
         let sql = "
         CREATE OR REPLACE FUNCTION calculate_order_total(
@@ -846,10 +1157,9 @@ mod tests {
         // Dynamic SQL won't be captured as dependencies
         assert_eq!(result.relations.len(), 0);
         
-        // The format function call is in an assignment statement, which is not standard SQL
-        // so it won't be parsed. This is a limitation of analyzing PL/pgSQL functions.
-        // In a real implementation, we might need to parse PL/pgSQL assignment statements specially.
-        assert_eq!(result.functions.len(), 0);
+        // Now we properly extract function calls from assignment statements
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"format"));
     }
 
     #[test]
