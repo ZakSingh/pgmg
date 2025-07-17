@@ -2,6 +2,9 @@ use std::collections::HashSet;
 use pg_query::{NodeEnum, NodeRef};
 use serde_json::Value;
 
+pub mod builtin_catalog;
+use builtin_catalog::BuiltinCatalog;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QualifiedIdent {
     pub schema: Option<String>,
@@ -10,9 +13,9 @@ pub struct QualifiedIdent {
 
 #[derive(Debug, Clone)]
 pub struct Dependencies {
-    pub relations: Vec<QualifiedIdent>,
-    pub functions: Vec<QualifiedIdent>,
-    pub types: Vec<QualifiedIdent>,
+    pub relations: HashSet<QualifiedIdent>,
+    pub functions: HashSet<QualifiedIdent>,
+    pub types: HashSet<QualifiedIdent>,
 }
 
 impl QualifiedIdent {
@@ -63,6 +66,76 @@ pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::
         if let Some(stmt) = &stmt.stmt {
             if let Some(node) = &stmt.node {
                 extract_from_node_with_types(node, &mut relations, &mut functions, &mut types);
+                
+                // Check if this is a CREATE FUNCTION with LANGUAGE SQL
+                if let NodeEnum::CreateFunctionStmt(create_func) = node {
+                    // Extract return type from the function signature
+                    if let Some(return_type) = &create_func.return_type {
+                        if let Some(qualified_type) = extract_type_from_type_name(return_type) {
+                            types.insert(qualified_type);
+                        }
+                    }
+                    
+                    // Extract parameter types
+                    for param in &create_func.parameters {
+                        if let Some(NodeEnum::FunctionParameter(func_param)) = &param.node {
+                            if let Some(param_type) = &func_param.arg_type {
+                                if let Some(qualified_type) = extract_type_from_type_name(param_type) {
+                                    types.insert(qualified_type);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Extract the function name with schema qualification
+                    if let Some(func_ident) = extract_function_name_from_create_stmt(create_func) {
+                        functions.insert(func_ident);
+                    }
+                    
+                    if is_language_sql_function(create_func) {
+                        if let Some(sql_body) = extract_sql_function_body(create_func) {
+                            // Split the SQL body into individual statements and analyze each one
+                            match split_sql_statements(&sql_body) {
+                                Ok(statements) => {
+                                    for statement in statements {
+                                        let trimmed = statement.trim();
+                                        if !trimmed.is_empty() {
+                                            match analyze_statement(trimmed) {
+                                                Ok(body_deps) => {
+                                                    relations.extend(body_deps.relations);
+                                                    functions.extend(body_deps.functions);
+                                                    types.extend(body_deps.types);
+                                                }
+                                                Err(e) => {
+                                                    // Log the error but don't fail the entire analysis
+                                                    eprintln!("Warning: Failed to parse SQL function statement '{}': {}", trimmed, e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Log the error but don't fail the entire analysis
+                                    eprintln!("Warning: Failed to split SQL function body: {}", e);
+                                }
+                            }
+                        }
+                    } else if is_language_plpgsql_function(create_func) {
+                        // For PL/pgSQL functions, analyze the entire SQL statement
+                        // since analyze_plpgsql expects the complete CREATE FUNCTION
+                        match analyze_plpgsql(sql) {
+                            Ok(body_deps) => {
+                                relations.extend(body_deps.relations);
+                                functions.extend(body_deps.functions);
+                                types.extend(body_deps.types);
+                            }
+                            Err(e) => {
+                                // Log the error but don't fail the entire analysis
+                                eprintln!("Warning: Failed to parse PL/pgSQL function: {}", e);
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -74,10 +147,142 @@ pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::
     }
     
     Ok(Dependencies {
-        relations: relations.into_iter().collect(),
-        functions: functions.into_iter().collect(),
-        types: types.into_iter().collect(),
+        relations,
+        functions,
+        types,
     })
+}
+
+/// Check if a CREATE FUNCTION statement is using LANGUAGE SQL
+fn is_language_sql_function(create_func: &pg_query::protobuf::CreateFunctionStmt) -> bool {
+    for option in &create_func.options {
+        if let Some(def_elem) = &option.node {
+            if let NodeEnum::DefElem(def) = def_elem {
+                if def.defname == "language" {
+                    if let Some(arg) = &def.arg {
+                        if let Some(value_node) = &arg.node {
+                            if let NodeEnum::String(string_val) = value_node {
+                                return string_val.sval.to_lowercase() == "sql";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract the SQL body from a LANGUAGE SQL function
+fn extract_sql_function_body(create_func: &pg_query::protobuf::CreateFunctionStmt) -> Option<String> {
+    for option in &create_func.options {
+        if let Some(def_elem) = &option.node {
+            if let NodeEnum::DefElem(def) = def_elem {
+                if def.defname == "as" {
+                    if let Some(arg) = &def.arg {
+                        if let Some(value_node) = &arg.node {
+                            match value_node {
+                                NodeEnum::String(string_val) => {
+                                    return Some(string_val.sval.clone());
+                                }
+                                NodeEnum::List(list) => {
+                                    // Function body can be a list of strings
+                                    let mut body = String::new();
+                                    for item in &list.items {
+                                        if let Some(item_node) = &item.node {
+                                            if let NodeEnum::String(string_val) = item_node {
+                                                body.push_str(&string_val.sval);
+                                                body.push('\n');
+                                            }
+                                        }
+                                    }
+                                    return Some(body);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Split SQL body into individual statements using pg_query's parser
+fn split_sql_statements(sql_body: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let statements = pg_query::split_with_parser(sql_body)?;
+    Ok(statements.into_iter().map(|s| s.to_string()).collect())
+}
+
+/// Check if a CREATE FUNCTION statement is using LANGUAGE plpgsql
+fn is_language_plpgsql_function(create_func: &pg_query::protobuf::CreateFunctionStmt) -> bool {
+    for option in &create_func.options {
+        if let Some(def_elem) = &option.node {
+            if let NodeEnum::DefElem(def) = def_elem {
+                if def.defname == "language" {
+                    if let Some(arg) = &def.arg {
+                        if let Some(value_node) = &arg.node {
+                            if let NodeEnum::String(string_val) = value_node {
+                                return string_val.sval.to_lowercase() == "plpgsql";
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+
+/// Extract the function name and schema from a CREATE FUNCTION statement
+fn extract_function_name_from_create_stmt(create_func: &pg_query::protobuf::CreateFunctionStmt) -> Option<QualifiedIdent> {
+    if create_func.funcname.is_empty() {
+        return None;
+    }
+    
+    let name_parts: Vec<String> = create_func.funcname.iter()
+        .filter_map(|node| {
+            if let Some(NodeEnum::String(string_val)) = &node.node {
+                Some(string_val.sval.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    match name_parts.len() {
+        1 => Some(QualifiedIdent::from_name(name_parts[0].clone())),
+        2 => Some(QualifiedIdent::new(Some(name_parts[0].clone()), name_parts[1].clone())),
+        _ => {
+            // Handle cases with more than 2 parts by taking the last two
+            if name_parts.len() > 2 {
+                let len = name_parts.len();
+                Some(QualifiedIdent::new(
+                    Some(name_parts[len - 2].clone()),
+                    name_parts[len - 1].clone(),
+                ))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Filters out built-in PostgreSQL objects from the dependencies
+pub fn filter_builtins(deps: Dependencies, catalog: &BuiltinCatalog) -> Dependencies {
+    Dependencies {
+        relations: deps.relations.into_iter()
+            .filter(|rel| !catalog.relations.contains(rel))
+            .collect(),
+        functions: deps.functions.into_iter()
+            .filter(|func| !catalog.functions.contains(func))
+            .collect(),
+        types: deps.types.into_iter()
+            .filter(|typ| !catalog.types.contains(typ))
+            .collect(),
+    }
 }
 
 fn extract_from_constraint(
@@ -176,9 +381,7 @@ fn extract_from_node_with_types(
     if let NodeEnum::TypeCast(type_cast) = node {
         if let Some(type_name) = &type_cast.type_name {
             if let Some(qualified_type) = extract_type_from_type_name(type_name) {
-                if !is_builtin_type(&qualified_type.name) {
-                    types.insert(qualified_type);
-                }
+                types.insert(qualified_type);
             }
         }
     }
@@ -423,11 +626,9 @@ fn extract_from_node(
         NodeEnum::CreateDomainStmt(domain_stmt) => {
             // Extract base type from domain definition
             if let Some(type_name) = &domain_stmt.type_name {
-                if let Some(qualified_type) = extract_type_from_type_name(type_name) {
-                    if !is_builtin_type(&qualified_type.name) {
-                        // This will be handled by extract_types_from_ast, but we can also
-                        // extract from domain constraints if they contain function calls
-                    }
+                if let Some(_qualified_type) = extract_type_from_type_name(type_name) {
+                    // This will be handled by extract_types_from_ast, but we can also
+                    // extract from domain constraints if they contain function calls
                 }
             }
             
@@ -669,9 +870,7 @@ fn extract_types_from_ast(parse_result: &pg_query::protobuf::ParseResult) -> Res
             NodeRef::TypeCast(type_cast) => {
                 if let Some(type_name) = &type_cast.type_name {
                     if let Some(qualified_type) = extract_type_from_type_name(type_name) {
-                        if !is_builtin_type(&qualified_type.name) {
-                            types.insert(qualified_type);
-                        }
+                        types.insert(qualified_type);
                     }
                 }
             }
@@ -681,9 +880,7 @@ fn extract_types_from_ast(parse_result: &pg_query::protobuf::ParseResult) -> Res
                     if let Some(NodeEnum::ColumnDef(column_def)) = &col_def.node {
                         if let Some(type_name) = &column_def.type_name {
                             if let Some(qualified_type) = extract_type_from_type_name(type_name) {
-                                if !is_builtin_type(&qualified_type.name) {
-                                    types.insert(qualified_type);
-                                }
+                                types.insert(qualified_type);
                             }
                         }
                     }
@@ -693,9 +890,7 @@ fn extract_types_from_ast(parse_result: &pg_query::protobuf::ParseResult) -> Res
                 // Extract the base type of the domain
                 if let Some(type_name) = &domain_stmt.type_name {
                     if let Some(qualified_type) = extract_type_from_type_name(type_name) {
-                        if !is_builtin_type(&qualified_type.name) {
-                            types.insert(qualified_type);
-                        }
+                        types.insert(qualified_type);
                     }
                 }
             }
@@ -705,9 +900,7 @@ fn extract_types_from_ast(parse_result: &pg_query::protobuf::ParseResult) -> Res
                     if let Some(NodeEnum::ColumnDef(column_def)) = &table_elt.node {
                         if let Some(type_name) = &column_def.type_name {
                             if let Some(qualified_type) = extract_type_from_type_name(type_name) {
-                                if !is_builtin_type(&qualified_type.name) {
-                                    types.insert(qualified_type);
-                                }
+                                types.insert(qualified_type);
                             }
                         }
                         
@@ -724,9 +917,7 @@ fn extract_types_from_ast(parse_result: &pg_query::protobuf::ParseResult) -> Res
                             if let Some(NodeEnum::ColumnDef(column_def)) = &def.node {
                                 if let Some(type_name) = &column_def.type_name {
                                     if let Some(qualified_type) = extract_type_from_type_name(type_name) {
-                                        if !is_builtin_type(&qualified_type.name) {
-                                            types.insert(qualified_type);
-                                        }
+                                        types.insert(qualified_type);
                                     }
                                 }
                             }
@@ -775,28 +966,6 @@ fn extract_type_from_type_name(type_name: &pg_query::protobuf::TypeName) -> Opti
     }
 }
 
-fn is_builtin_type(type_name: &str) -> bool {
-    // List of common PostgreSQL built-in types
-    // This is not exhaustive but covers the most common types
-    matches!(type_name.to_lowercase().as_str(),
-        "int" | "int2" | "int4" | "int8" | "integer" | "smallint" | "bigint" |
-        "serial" | "smallserial" | "bigserial" | "serial2" | "serial4" | "serial8" |
-        "float" | "float4" | "float8" | "real" | "double" | "precision" |
-        "numeric" | "decimal" | "money" |
-        "char" | "varchar" | "text" | "bpchar" | "character" |
-        "bool" | "boolean" |
-        "date" | "time" | "timestamp" | "timestamptz" | "interval" |
-        "uuid" | "json" | "jsonb" | "xml" |
-        "bytea" | "bit" | "varbit" |
-        "inet" | "cidr" | "macaddr" | "macaddr8" |
-        "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" |
-        "tsvector" | "tsquery" |
-        "void" | "unknown" | "anyarray" | "anyelement" | "anynonarray" | "anyenum" |
-        "record" | "cstring" | "any" | "anyrange" | "event_trigger" | "fdw_handler" |
-        "index_am_handler" | "language_handler" | "tsm_handler" | "internal" |
-        "opaque" | "trigger" | "pg_lsn" | "txid_snapshot" | "pg_snapshot"
-    )
-}
 
 pub fn analyze_plpgsql(sql: &str) -> Result<Dependencies, Box<dyn std::error::Error>> {
     let json_result = pg_query::parse_plpgsql(sql)?;
@@ -812,9 +981,7 @@ pub fn analyze_plpgsql(sql: &str) -> Result<Dependencies, Box<dyn std::error::Er
                 // Extract return type
                 if let Some(return_type) = &create_func.return_type {
                     if let Some(qualified_type) = extract_type_from_type_name(return_type) {
-                        if !is_builtin_type(&qualified_type.name) {
-                            all_types.insert(qualified_type);
-                        }
+                        all_types.insert(qualified_type);
                     }
                 }
                 
@@ -823,9 +990,7 @@ pub fn analyze_plpgsql(sql: &str) -> Result<Dependencies, Box<dyn std::error::Er
                     if let Some(NodeEnum::FunctionParameter(func_param)) = &param.node {
                         if let Some(arg_type) = &func_param.arg_type {
                             if let Some(qualified_type) = extract_type_from_type_name(arg_type) {
-                                if !is_builtin_type(&qualified_type.name) {
-                                    all_types.insert(qualified_type);
-                                }
+                                all_types.insert(qualified_type);
                             }
                         }
                     }
@@ -993,11 +1158,8 @@ fn extract_types_from_datum(datum: &Value, types: &mut HashSet<QualifiedIdent>) 
                         QualifiedIdent::from_name(clean_typname.to_string())
                     };
                     
-                    // Filter out built-in types and pg_catalog types
-                    if type_ident.schema.as_ref().map_or(true, |s| s != "pg_catalog") 
-                        && !is_builtin_type(&type_ident.name) {
-                        types.insert(type_ident);
-                    }
+                    // Insert all types - built-ins will be filtered later
+                    types.insert(type_ident);
                 }
             }
         }
@@ -1015,8 +1177,8 @@ mod tests {
         let result = analyze_statement(sql).unwrap();
         
         assert_eq!(result.types.len(), 1);
-        assert_eq!(result.types[0].name, "currency");
-        assert_eq!(result.types[0].schema, None);
+        let currency_type = result.types.iter().find(|t| t.name == "currency").unwrap();
+        assert_eq!(currency_type.schema, None);
     }
 
     #[test]
@@ -1025,8 +1187,8 @@ mod tests {
         let result = analyze_statement(sql).unwrap();
         
         assert_eq!(result.types.len(), 1);
-        assert_eq!(result.types[0].name, "cart_summary");
-        assert_eq!(result.types[0].schema, Some("api".to_string()));
+        let cart_summary_type = result.types.iter().find(|t| t.name == "cart_summary").unwrap();
+        assert_eq!(cart_summary_type.schema, Some("api".to_string()));
     }
 
     #[test]
@@ -1049,7 +1211,8 @@ mod tests {
         assert!(type_names.contains(&"cart_summary"));
         
         // Check that built-in types are filtered out
-        assert!(!type_names.contains(&"int"));
+        // Built-in types are now included in analysis (filtering happens later)
+        // assert!(!type_names.contains(&"int"));
         
         // Check schema qualification
         let api_cart_summary = result.types.iter()
@@ -1064,7 +1227,7 @@ mod tests {
         let result = analyze_statement(sql).unwrap();
         
         assert_eq!(result.types.len(), 1);
-        assert_eq!(result.types[0].name, "currency");
+        assert!(result.types.iter().any(|t| t.name == "currency"));
     }
 
     #[test]
@@ -1098,15 +1261,21 @@ mod tests {
         let result = analyze_statement(sql).unwrap();
         
         assert_eq!(result.types.len(), 1);
-        assert_eq!(result.types[0].name, "custom_type");
+        assert!(result.types.iter().any(|t| t.name == "custom_type"));
     }
 
     #[test]
-    fn test_builtin_types_filtered() {
+    fn test_builtin_types_included() {
         let sql = "SELECT '2023-01-01'::date, 42::integer, 'hello'::text, true::boolean";
         let result = analyze_statement(sql).unwrap();
         
-        assert_eq!(result.types.len(), 0);
+        // Built-in types are now included in analysis (filtering happens later)
+        assert!(result.types.len() > 0);
+        // PostgreSQL uses canonical type names
+        assert!(result.types.iter().any(|t| t.name == "date"));
+        assert!(result.types.iter().any(|t| t.name == "int4")); // integer -> int4
+        assert!(result.types.iter().any(|t| t.name == "text"));
+        assert!(result.types.iter().any(|t| t.name == "bool")); // boolean -> bool
     }
 
     #[test]
@@ -1114,8 +1283,11 @@ mod tests {
         let sql = "SELECT 42::integer, 'data'::custom_type, true::boolean";
         let result = analyze_statement(sql).unwrap();
         
-        assert_eq!(result.types.len(), 1);
-        assert_eq!(result.types[0].name, "custom_type");
+        // Now includes both built-in and custom types
+        assert!(result.types.len() >= 3);
+        assert!(result.types.iter().any(|t| t.name == "custom_type"));
+        assert!(result.types.iter().any(|t| t.name == "int4")); // integer -> int4
+        assert!(result.types.iter().any(|t| t.name == "bool")); // boolean -> bool
     }
 
     #[test]
@@ -1142,7 +1314,7 @@ mod tests {
         let result = analyze_statement(sql).unwrap();
         
         assert_eq!(result.types.len(), 1);
-        assert_eq!(result.types[0].name, "status_log");
+        assert!(result.types.iter().any(|t| t.name == "status_log"));
     }
 
     #[test]
@@ -1169,7 +1341,7 @@ mod tests {
         let result = analyze_statement(sql).unwrap();
         
         assert_eq!(result.types.len(), 1);
-        assert_eq!(result.types[0].name, "custom_type");
+        assert!(result.types.iter().any(|t| t.name == "custom_type"));
     }
 
     #[test]
@@ -1326,7 +1498,8 @@ mod tests {
         assert_eq!(app_status.schema, Some("app_schema".to_string()));
         
         // Built-in date type should be filtered out
-        assert!(!type_names.contains(&"date"));
+        // Built-in types are now included in analysis (filtering happens later)
+        // assert!(!type_names.contains(&"date"));
     }
 
     #[test]
@@ -1429,9 +1602,11 @@ mod tests {
         assert!(type_names.contains(&"update_listing"));
         
         // Should not include built-in types
-        assert!(!type_names.contains(&"int"));
-        assert!(!type_names.contains(&"text"));
-        assert!(!type_names.contains(&"bool"));
+        // Built-in types are now included in analysis (filtering happens later)
+        // assert!(!type_names.contains(&"int"));
+        // Built-in types are now included in analysis (filtering happens later)
+        // assert!(!type_names.contains(&"text"));
+        // assert!(!type_names.contains(&"bool"));
         
         // Check schema qualification
         let update_listing = result.types.iter()
@@ -1454,9 +1629,10 @@ mod tests {
         assert!(type_names.contains(&"status_enum"));
         
         // Should not include built-in types like numeric, text, uuid
-        assert!(!type_names.contains(&"numeric"));
-        assert!(!type_names.contains(&"text"));
-        assert!(!type_names.contains(&"uuid"));
+        // Built-in types are now included in analysis (filtering happens later)
+        // assert!(!type_names.contains(&"numeric"));
+        // assert!(!type_names.contains(&"text"));
+        // assert!(!type_names.contains(&"uuid"));
     }
 
     #[test]
@@ -2033,10 +2209,11 @@ mod tests {
         assert!(type_names.contains(&"warehouse_location"));
         
         // Built-in types should be filtered
-        assert!(!type_names.contains(&"uuid"));
-        assert!(!type_names.contains(&"jsonb"));
-        assert!(!type_names.contains(&"timestamptz"));
-        assert!(!type_names.contains(&"int"));
+        // Built-in types are now included in analysis (filtering happens later)
+        // assert!(!type_names.contains(&"uuid"));
+        // assert!(!type_names.contains(&"jsonb"));
+        // assert!(!type_names.contains(&"timestamptz"));
+        // assert!(!type_names.contains(&"int"));
         
         // Check tables from REFERENCES
         let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
@@ -2236,10 +2413,11 @@ mod tests {
         assert!(type_names.contains(&"address"));
         assert!(type_names.contains(&"customer_status"));
         
-        // Built-in types should be filtered
-        assert!(!type_names.contains(&"text"));
-        assert!(!type_names.contains(&"uuid"));
-        assert!(!type_names.contains(&"char"));
+        // Built-in types are now included (filtering happens later)
+        // assert!(!type_names.contains(&"text")); // This check is no longer valid
+        // Built-in types are now included in analysis (filtering happens later)
+        // assert!(!type_names.contains(&"uuid"));
+        // assert!(!type_names.contains(&"char"));
     }
 
     #[test]
@@ -2574,7 +2752,8 @@ mod tests {
         assert!(type_names.contains(&"user_id_array"));
         
         // Built-in jsonb should be filtered out
-        assert!(!type_names.contains(&"jsonb"));
+        // Built-in types are now included in analysis (filtering happens later)
+        // assert!(!type_names.contains(&"jsonb"));
     }
 
     #[test]
@@ -2981,5 +3160,571 @@ mod tests {
             .find(|f| f.name == "format_timestamp")
             .unwrap();
         assert_eq!(formatting_func.schema, Some("formatting".to_string()));
+    }
+
+    #[test]
+    fn test_filter_builtins() {
+        // Create a mock builtin catalog
+        let mut catalog = BuiltinCatalog::new();
+        
+        // Add some built-in functions
+        catalog.functions.insert(QualifiedIdent::from_name("sum".to_string()));
+        catalog.functions.insert(QualifiedIdent::from_name("count".to_string()));
+        catalog.functions.insert(QualifiedIdent::from_name("now".to_string()));
+        catalog.functions.insert(QualifiedIdent::new(Some("pg_catalog".to_string()), "sum".to_string()));
+        
+        // Add some built-in types
+        catalog.types.insert(QualifiedIdent::from_name("text".to_string()));
+        catalog.types.insert(QualifiedIdent::from_name("integer".to_string()));
+        catalog.types.insert(QualifiedIdent::from_name("jsonb".to_string()));
+        
+        // Add some built-in relations
+        catalog.relations.insert(QualifiedIdent::new(Some("pg_catalog".to_string()), "pg_class".to_string()));
+        catalog.relations.insert(QualifiedIdent::new(Some("information_schema".to_string()), "tables".to_string()));
+        
+        // Create dependencies with a mix of built-ins and custom objects
+        let mut functions = HashSet::new();
+        functions.insert(QualifiedIdent::from_name("sum".to_string()));
+        functions.insert(QualifiedIdent::from_name("my_custom_func".to_string()));
+        functions.insert(QualifiedIdent::from_name("count".to_string()));
+        functions.insert(QualifiedIdent::new(Some("api".to_string()), "process_order".to_string()));
+        functions.insert(QualifiedIdent::new(Some("pg_catalog".to_string()), "sum".to_string()));
+        
+        let mut types = HashSet::new();
+        types.insert(QualifiedIdent::from_name("text".to_string()));
+        types.insert(QualifiedIdent::from_name("my_custom_type".to_string()));
+        types.insert(QualifiedIdent::from_name("jsonb".to_string()));
+        types.insert(QualifiedIdent::new(Some("api".to_string()), "order_status".to_string()));
+        
+        let mut relations = HashSet::new();
+        relations.insert(QualifiedIdent::new(Some("public".to_string()), "users".to_string()));
+        relations.insert(QualifiedIdent::new(Some("pg_catalog".to_string()), "pg_class".to_string()));
+        relations.insert(QualifiedIdent::new(Some("api".to_string()), "orders".to_string()));
+        relations.insert(QualifiedIdent::new(Some("information_schema".to_string()), "tables".to_string()));
+        
+        let deps = Dependencies {
+            functions,
+            types,
+            relations,
+        };
+        
+        // Filter out built-ins
+        let filtered = filter_builtins(deps, &catalog);
+        
+        // Check that only custom objects remain
+        assert_eq!(filtered.functions.len(), 2);
+        assert!(filtered.functions.iter().any(|f| f.name == "my_custom_func"));
+        assert!(filtered.functions.iter().any(|f| f.name == "process_order" && f.schema == Some("api".to_string())));
+        
+        assert_eq!(filtered.types.len(), 2);
+        assert!(filtered.types.iter().any(|t| t.name == "my_custom_type"));
+        assert!(filtered.types.iter().any(|t| t.name == "order_status" && t.schema == Some("api".to_string())));
+        
+        assert_eq!(filtered.relations.len(), 2);
+        assert!(filtered.relations.iter().any(|r| r.name == "users" && r.schema == Some("public".to_string())));
+        assert!(filtered.relations.iter().any(|r| r.name == "orders" && r.schema == Some("api".to_string())));
+    }
+
+    #[test]
+    fn test_filter_builtins_empty_catalog() {
+        // Test with empty catalog (no filtering)
+        let catalog = BuiltinCatalog::new();
+        
+        let mut functions = HashSet::new();
+        functions.insert(QualifiedIdent::from_name("sum".to_string()));
+        functions.insert(QualifiedIdent::from_name("my_func".to_string()));
+        
+        let mut types = HashSet::new();
+        types.insert(QualifiedIdent::from_name("text".to_string()));
+        types.insert(QualifiedIdent::from_name("my_type".to_string()));
+        
+        let mut relations = HashSet::new();
+        relations.insert(QualifiedIdent::from_name("users".to_string()));
+        
+        let deps = Dependencies {
+            functions,
+            types,
+            relations,
+        };
+        
+        let filtered = filter_builtins(deps.clone(), &catalog);
+        
+        // All items should remain since catalog is empty
+        assert_eq!(filtered.functions.len(), 2);
+        assert_eq!(filtered.types.len(), 2);
+        assert_eq!(filtered.relations.len(), 1);
+    }
+
+    #[test]
+    fn test_analyze_with_builtins() {
+        let sql = "SELECT 
+            sum(amount) as total,
+            count(*) as cnt,
+            my_custom_func(data) as custom_result
+        FROM orders
+        WHERE created_at > now() - interval '30 days'
+        AND status = 'active'::order_status";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Before filtering, should have all functions
+        assert!(result.functions.iter().any(|f| f.name == "sum"));
+        assert!(result.functions.iter().any(|f| f.name == "count"));
+        assert!(result.functions.iter().any(|f| f.name == "now"));
+        assert!(result.functions.iter().any(|f| f.name == "my_custom_func"));
+        
+        // Create a mock catalog with built-ins
+        let mut catalog = BuiltinCatalog::new();
+        catalog.functions.insert(QualifiedIdent::from_name("sum".to_string()));
+        catalog.functions.insert(QualifiedIdent::from_name("count".to_string()));
+        catalog.functions.insert(QualifiedIdent::from_name("now".to_string()));
+        
+        // Filter
+        let filtered = filter_builtins(result, &catalog);
+        
+        // After filtering, only custom function remains
+        assert_eq!(filtered.functions.len(), 1);
+        assert!(filtered.functions.iter().any(|f| f.name == "my_custom_func"));
+    }
+
+    #[test]
+    fn test_parser_special_forms_filtering() {
+        let sql = "SELECT 
+            COALESCE(name, 'Unknown') as display_name,
+            NULLIF(status, '') as clean_status,
+            GREATEST(created_at, updated_at) as last_activity,
+            SUBSTRING(description FROM 1 FOR 100) as summary,
+            EXTRACT(year FROM created_at) as year,
+            CURRENT_TIMESTAMP as query_time,
+            CURRENT_USER as who,
+            my_format_func(data) as formatted
+        FROM items
+        WHERE status = ANY(ARRAY['active', 'pending'])
+        AND created_at > CURRENT_DATE - interval '7 days'";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Create a mock catalog with parser special forms
+        let mut catalog = BuiltinCatalog::new();
+        
+        // Add parser special forms (both qualified and unqualified)
+        for construct in ["coalesce", "nullif", "greatest", "substring", "extract", 
+                         "current_timestamp", "current_user", "current_date", "any", "array"] {
+            catalog.functions.insert(QualifiedIdent::from_name(construct.to_string()));
+            catalog.functions.insert(QualifiedIdent::new(Some("pg_catalog".to_string()), construct.to_string()));
+        }
+        
+        // Filter
+        let filtered = filter_builtins(result, &catalog);
+        
+        // After filtering, only custom function remains
+        assert_eq!(filtered.functions.len(), 1);
+        assert!(filtered.functions.iter().any(|f| f.name == "my_format_func"));
+    }
+
+    #[test]
+    fn test_language_sql_function_basic() {
+        let sql = "CREATE FUNCTION get_user_name(user_id integer)
+        RETURNS text
+        LANGUAGE sql
+        AS $$
+            SELECT name FROM users WHERE id = $1;
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract the table from the function body
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"users"));
+        
+        // Should extract the function being created
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"get_user_name"));
+    }
+
+    #[test]
+    fn test_language_sql_function_with_joins() {
+        let sql = "CREATE OR REPLACE FUNCTION get_order_details(p_order_id integer)
+        RETURNS TABLE(order_id integer, customer_name text, total_amount numeric)
+        LANGUAGE sql
+        AS $$
+            SELECT 
+                o.id,
+                c.name,
+                o.total
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.id
+            WHERE o.id = p_order_id;
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract tables from the JOIN
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"customers"));
+        
+        // Should extract the function being created
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"get_order_details"));
+    }
+
+    #[test]
+    fn test_language_sql_function_with_subqueries() {
+        let sql = "CREATE FUNCTION calculate_user_stats(p_user_id integer)
+        RETURNS user_stats_type
+        LANGUAGE sql
+        AS $$
+            SELECT 
+                u.name,
+                (SELECT COUNT(*) FROM orders WHERE customer_id = p_user_id) as order_count,
+                (SELECT SUM(total) FROM orders WHERE customer_id = p_user_id) as total_spent,
+                (SELECT MAX(created_at) FROM orders WHERE customer_id = p_user_id) as last_order_date
+            FROM users u
+            WHERE u.id = p_user_id;
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract tables from main query and subqueries
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"users"));
+        assert!(table_names.contains(&"orders"));
+        
+        // Should extract functions from subqueries
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"count"));
+        assert!(function_names.contains(&"sum"));
+        assert!(function_names.contains(&"max"));
+        assert!(function_names.contains(&"calculate_user_stats"));
+        
+        // Should extract custom types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"user_stats_type"));
+    }
+
+    #[test]
+    fn test_language_sql_function_with_multiple_statements() {
+        let sql = "CREATE FUNCTION process_user_order(p_user_id integer, p_order_id integer)
+        RETURNS order_summary_type
+        LANGUAGE sql
+        AS $$
+            INSERT INTO order_log (user_id, order_id, action, timestamp)
+            VALUES (p_user_id, p_order_id, 'processed', NOW());
+            
+            UPDATE orders 
+            SET status = 'processed'::order_status, 
+                processed_at = CURRENT_TIMESTAMP,
+                processor_id = get_current_processor()
+            WHERE id = p_order_id AND customer_id = p_user_id;
+            
+            SELECT 
+                o.id,
+                o.total,
+                o.status,
+                u.name as customer_name,
+                calculate_tax(o.total, u.state) as tax_amount
+            FROM orders o
+            JOIN users u ON o.customer_id = u.id
+            WHERE o.id = p_order_id;
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract all tables from all statements
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"order_log"));
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"users"));
+        
+        // Should extract function calls from all statements
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"now"));
+        assert!(function_names.contains(&"get_current_processor"));
+        assert!(function_names.contains(&"calculate_tax"));
+        assert!(function_names.contains(&"process_user_order")); // Function name itself
+        
+        // Should extract types from all statements
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"order_summary_type"));
+        assert!(type_names.contains(&"order_status"));
+    }
+
+    #[test]
+    fn test_language_sql_function_with_ddl_and_dml() {
+        let sql = "CREATE FUNCTION setup_user_workspace(p_user_id integer, p_workspace_name text)
+        RETURNS workspace_info_type
+        LANGUAGE sql
+        AS $$
+            CREATE TEMP TABLE workspace_items AS
+            SELECT * FROM template_items WHERE template_type = 'default';
+            
+            INSERT INTO user_workspaces (user_id, name, created_at)
+            VALUES (p_user_id, p_workspace_name, NOW());
+            
+            INSERT INTO workspace_permissions (workspace_id, user_id, permission_level)
+            SELECT 
+                currval('user_workspaces_id_seq'::regclass),
+                p_user_id,
+                'owner'::permission_level;
+            
+            SELECT 
+                uw.id,
+                uw.name,
+                uw.created_at,
+                COUNT(wi.id) as item_count
+            FROM user_workspaces uw
+            LEFT JOIN workspace_items wi ON TRUE
+            WHERE uw.user_id = p_user_id AND uw.name = p_workspace_name
+            GROUP BY uw.id, uw.name, uw.created_at;
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract all tables from DDL and DML statements
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"workspace_items"));
+        assert!(table_names.contains(&"template_items"));
+        assert!(table_names.contains(&"user_workspaces"));
+        assert!(table_names.contains(&"workspace_permissions"));
+        
+        // Should extract function calls
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"now"));
+        assert!(function_names.contains(&"currval"));
+        assert!(function_names.contains(&"count"));
+        assert!(function_names.contains(&"setup_user_workspace"));
+        
+        // Should extract types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"workspace_info_type"));
+        assert!(type_names.contains(&"permission_level"));
+        assert!(type_names.contains(&"regclass"));
+        assert!(type_names.contains(&"text"));
+    }
+
+    #[test]
+    fn test_language_sql_function_with_cte_and_multiple_statements() {
+        let sql = "CREATE FUNCTION analyze_user_activity(p_user_id integer, p_days integer)
+        RETURNS activity_report_type
+        LANGUAGE sql
+        AS $$
+            DELETE FROM temp_activity_cache WHERE user_id = p_user_id;
+            
+            WITH recent_orders AS (
+                SELECT 
+                    o.id,
+                    o.total,
+                    extract_category(p.name) as category
+                FROM orders o
+                JOIN order_items oi ON o.id = oi.order_id
+                JOIN products p ON oi.product_id = p.id
+                WHERE o.customer_id = p_user_id 
+                  AND o.created_at >= NOW() - '30 days'::interval
+            ),
+            category_totals AS (
+                SELECT 
+                    category,
+                    SUM(total) as category_total,
+                    calculate_trend(category, p_days) as trend
+                FROM recent_orders
+                GROUP BY category
+            )
+            INSERT INTO activity_summary (user_id, category, total, trend, report_date)
+            SELECT p_user_id, category, category_total, trend, CURRENT_DATE
+            FROM category_totals;
+            
+            SELECT 
+                generate_report_summary(p_user_id) as summary,
+                array_agg(category ORDER BY total DESC) as top_categories
+            FROM activity_summary
+            WHERE user_id = p_user_id AND report_date = CURRENT_DATE;
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract all tables from all statements including CTEs
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"temp_activity_cache"));
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"order_items"));
+        assert!(table_names.contains(&"products"));
+        assert!(table_names.contains(&"activity_summary"));
+        
+        // Should extract function calls from all statements
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"extract_category"));
+        assert!(function_names.contains(&"now"));
+        assert!(function_names.contains(&"calculate_trend"));
+        assert!(function_names.contains(&"sum"));
+        assert!(function_names.contains(&"generate_report_summary"));
+        assert!(function_names.contains(&"array_agg"));
+        assert!(function_names.contains(&"analyze_user_activity"));
+        
+        // Should extract types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"activity_report_type"));
+        assert!(type_names.contains(&"interval"));
+    }
+
+    #[test]
+    fn test_language_sql_function_with_cte() {
+        let sql = "CREATE FUNCTION get_top_customers(limit_count integer)
+        RETURNS SETOF customer_summary
+        LANGUAGE sql
+        AS $$
+            WITH order_totals AS (
+                SELECT 
+                    customer_id,
+                    SUM(total) as total_spent,
+                    COUNT(*) as order_count
+                FROM orders
+                GROUP BY customer_id
+            ),
+            ranked_customers AS (
+                SELECT 
+                    c.id,
+                    c.name,
+                    c.email,
+                    ot.total_spent,
+                    ot.order_count,
+                    RANK() OVER (ORDER BY ot.total_spent DESC) as rank
+                FROM customers c
+                JOIN order_totals ot ON c.id = ot.customer_id
+            )
+            SELECT * FROM ranked_customers WHERE rank <= limit_count;
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract tables from CTE and main query
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"customers"));
+        
+        // Should extract functions from CTE
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"sum"));
+        assert!(function_names.contains(&"count"));
+        assert!(function_names.contains(&"rank"));
+        assert!(function_names.contains(&"get_top_customers"));
+        
+        // Should extract return type
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"customer_summary"));
+    }
+
+    #[test]
+    fn test_language_sql_function_with_custom_functions() {
+        let sql = "CREATE FUNCTION process_order_data(p_start_date date, p_end_date date)
+        RETURNS TABLE(processed_data jsonb)
+        LANGUAGE sql
+        AS $$
+            SELECT jsonb_build_object(
+                'order_id', o.id,
+                'customer', get_customer_info(o.customer_id),
+                'formatted_total', format_currency(o.total),
+                'shipping_cost', calculate_shipping(o.shipping_address),
+                'tax_amount', compute_tax(o.total, o.tax_rate)
+            ) as processed_data
+            FROM orders o
+            WHERE o.created_at BETWEEN p_start_date AND p_end_date
+              AND validate_order(o.id) = true;
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract the table
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        
+        // Should extract all function calls including custom ones
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"jsonb_build_object"));
+        assert!(function_names.contains(&"get_customer_info"));
+        assert!(function_names.contains(&"format_currency"));
+        assert!(function_names.contains(&"calculate_shipping"));
+        assert!(function_names.contains(&"compute_tax"));
+        assert!(function_names.contains(&"validate_order"));
+        assert!(function_names.contains(&"process_order_data"));
+    }
+
+    #[test]
+    fn test_language_sql_function_with_schema_qualified_objects() {
+        let sql = "CREATE FUNCTION api.get_user_profile(p_user_id integer)
+        RETURNS api.user_profile
+        LANGUAGE sql
+        AS $$
+            SELECT 
+                u.id,
+                u.name,
+                u.email,
+                auth.hash_email(u.email) as email_hash,
+                stats.calculate_user_score(u.id) as score,
+                (SELECT COUNT(*) FROM public.orders WHERE customer_id = u.id) as order_count
+            FROM auth.users u
+            WHERE u.id = p_user_id
+              AND auth.is_active(u.id);
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract schema-qualified tables
+        let relations: Vec<_> = result.relations.iter().collect();
+        assert!(relations.iter().any(|r| r.name == "users" && r.schema == Some("auth".to_string())));
+        assert!(relations.iter().any(|r| r.name == "orders" && r.schema == Some("public".to_string())));
+        
+        // Should extract schema-qualified functions
+        let functions: Vec<_> = result.functions.iter().collect();
+        assert!(functions.iter().any(|f| f.name == "hash_email" && f.schema == Some("auth".to_string())));
+        assert!(functions.iter().any(|f| f.name == "calculate_user_score" && f.schema == Some("stats".to_string())));
+        assert!(functions.iter().any(|f| f.name == "is_active" && f.schema == Some("auth".to_string())));
+        assert!(functions.iter().any(|f| f.name == "get_user_profile" && f.schema == Some("api".to_string())));
+        
+        // Should extract schema-qualified types
+        let types: Vec<_> = result.types.iter().collect();
+        assert!(types.iter().any(|t| t.name == "user_profile" && t.schema == Some("api".to_string())));
+    }
+
+    #[test]
+    fn test_language_sql_function_with_complex_expressions() {
+        let sql = "CREATE FUNCTION calculate_discounted_price(
+            p_original_price numeric,
+            p_customer_tier customer_tier_enum,
+            p_product_category text
+        )
+        RETURNS discount_result
+        LANGUAGE sql
+        AS $$
+            SELECT ROW(
+                p_original_price,
+                CASE p_customer_tier
+                    WHEN 'premium'::customer_tier_enum THEN 
+                        p_original_price * get_premium_discount_rate(p_product_category)
+                    WHEN 'gold'::customer_tier_enum THEN
+                        p_original_price * get_gold_discount_rate(p_product_category)
+                    ELSE
+                        p_original_price * get_standard_discount_rate(p_product_category)
+                END,
+                apply_seasonal_adjustment(p_original_price, CURRENT_DATE),
+                validate_price_range(p_original_price)
+            )::discount_result;
+        $$;";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract custom functions
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"get_premium_discount_rate"));
+        assert!(function_names.contains(&"get_gold_discount_rate"));
+        assert!(function_names.contains(&"get_standard_discount_rate"));
+        assert!(function_names.contains(&"apply_seasonal_adjustment"));
+        assert!(function_names.contains(&"validate_price_range"));
+        assert!(function_names.contains(&"calculate_discounted_price"));
+        
+        // Should extract custom types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"customer_tier_enum"));
+        assert!(type_names.contains(&"discount_result"));
     }
 }
