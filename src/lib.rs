@@ -92,8 +92,9 @@ fn extract_from_constraint(
             relations.insert(table_ident);
         }
     }
-    // Check if it's a DEFAULT constraint
-    if constraint.contype == ConstrType::ConstrDefault as i32 {
+    // Check if it's a DEFAULT or CHECK constraint with expressions
+    if constraint.contype == ConstrType::ConstrDefault as i32 || 
+        constraint.contype == ConstrType::ConstrCheck as i32 {
         if let Some(raw_expr) = &constraint.raw_expr {
             extract_from_node(raw_expr.node.as_ref().unwrap(), relations, functions);
         }
@@ -110,18 +111,25 @@ fn extract_from_node(
         NodeEnum::CreateStmt(create_stmt) => {
             // Extract from table elements (columns, constraints)
             for table_elt in &create_stmt.table_elts {
-                if let Some(NodeEnum::ColumnDef(col_def)) = &table_elt.node {
-                    // Extract DEFAULT functions
-                    if let Some(raw_default) = &col_def.raw_default {
-                        extract_from_node(raw_default.node.as_ref().unwrap(), relations, functions);
-                    }
-                    
-                    // Extract REFERENCES from column constraints
-                    for constraint in &col_def.constraints {
-                        if let Some(NodeEnum::Constraint(c)) = &constraint.node {
-                            extract_from_constraint(c, relations, functions);
+                match &table_elt.node {
+                    Some(NodeEnum::ColumnDef(col_def)) => {
+                        // Extract DEFAULT functions
+                        if let Some(raw_default) = &col_def.raw_default {
+                            extract_from_node(raw_default.node.as_ref().unwrap(), relations, functions);
+                        }
+                        
+                        // Extract REFERENCES from column constraints
+                        for constraint in &col_def.constraints {
+                            if let Some(NodeEnum::Constraint(c)) = &constraint.node {
+                                extract_from_constraint(c, relations, functions);
+                            }
                         }
                     }
+                    Some(NodeEnum::Constraint(table_constraint)) => {
+                        // Handle table-level constraints
+                        extract_from_constraint(table_constraint, relations, functions);
+                    }
+                    _ => {}
                 }
             }
         }
@@ -146,8 +154,49 @@ fn extract_from_node(
                 extract_from_node(arg.node.as_ref().unwrap(), relations, functions);
             }
         }
+        NodeEnum::CreateDomainStmt(domain_stmt) => {
+            // Extract base type from domain definition
+            if let Some(type_name) = &domain_stmt.type_name {
+                if let Some(qualified_type) = extract_type_from_type_name(type_name) {
+                    if !is_builtin_type(&qualified_type.name) {
+                        // This will be handled by extract_types_from_ast, but we can also
+                        // extract from domain constraints if they contain function calls
+                    }
+                }
+            }
+            
+            // Extract from domain constraints
+            for constraint in &domain_stmt.constraints {
+                if let Some(NodeEnum::Constraint(c)) = &constraint.node {
+                    extract_from_constraint(c, relations, functions);
+                }
+            }
+        }
+        NodeEnum::AExpr(a_expr) => {
+            // For expression nodes, recursively traverse left and right expressions
+            if let Some(lexpr) = &a_expr.lexpr {
+                extract_from_node(lexpr.node.as_ref().unwrap(), relations, functions);
+            }
+            if let Some(rexpr) = &a_expr.rexpr {
+                extract_from_node(rexpr.node.as_ref().unwrap(), relations, functions);
+            }
+        }
+        NodeEnum::BoolExpr(bool_expr) => {
+            // For boolean expressions, traverse all arguments
+            for arg in &bool_expr.args {
+                if let Some(node) = &arg.node {
+                    extract_from_node(node, relations, functions);
+                }
+            }
+        }
+        NodeEnum::SubLink(sublink) => {
+            // For subqueries, extract from the subselect
+            if let Some(subselect) = &sublink.subselect {
+                extract_from_node(subselect.node.as_ref().unwrap(), relations, functions);
+            }
+        }
         _ => {
-            // For other node types, recursively traverse their children
+            // For other node types, we could add more specific handling
             // This is a simplified approach - in a full implementation, we'd need to
             // handle all node types and their specific child structures
         }
@@ -1130,6 +1179,72 @@ mod tests {
         let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
         assert!(table_names.contains(&"test_table"));
         assert!(table_names.contains(&"other_table"));
+    }
+    
+    #[test]
+    fn test_domain_constraints() {
+        let sql1 = "create domain api.oauth_credential as api.oauth_credential_inner check (  (value).provider_id is not null and (value).provider_token is not null );";
+        let result1 = analyze_statement(sql1).unwrap();
+        
+        // Should extract the base type api.oauth_credential_inner
+        let type_names: Vec<&str> = result1.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"oauth_credential_inner"));
+        
+        let sql2 = "create domain api.weight_with_unit as api.weight_with_unit_inner  
+    constraint weight_not_null check (value is null or (value).weight is not null)  
+    constraint weight_gt_zero check (value is null or (value).weight > 0)  
+    constraint unit_not_null check (value is null or (value).unit is not null)  
+    constraint max_weight check (  
+        value is null  
+            or (  
+            (value).unit = 'g' and (value).weight <= 9071.85  
+                or (value).unit = 'kg' and (value).weight <= 9.07185  
+                or (value).unit = 'oz' and (value).weight <= 320  
+                or (value).unit = 'lb' and (value).weight <= 20  
+            ));";
+        let result2 = analyze_statement(sql2).unwrap();
+        
+        // Should extract the base type api.weight_with_unit_inner
+        let type_names2: Vec<&str> = result2.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names2.contains(&"weight_with_unit_inner"));
+    }
+    
+    #[test]
+    fn test_table_constraints() {
+        let sql = "CREATE TABLE orders (
+            id uuid,
+            customer_id uuid,
+            total numeric,
+            CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customers(id),
+            CONSTRAINT valid_total CHECK (total > 0),
+            CONSTRAINT unique_order UNIQUE (id)
+        );";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract the referenced table from table-level constraint
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"customers"));
+    }
+    
+    #[test]
+    fn test_check_constraints_with_functions() {
+        let sql = "CREATE TABLE orders (
+            id uuid,
+            total numeric,
+            created_at timestamptz,
+            CONSTRAINT valid_total CHECK (total > 0),
+            CONSTRAINT valid_date CHECK (created_at > now() - interval '1 year'),
+            CONSTRAINT valid_id CHECK (validate_uuid(id))
+        );";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract function calls from CHECK constraints
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"now"));
+        assert!(function_names.contains(&"validate_uuid"));
     }
     
     #[test]
