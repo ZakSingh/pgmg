@@ -194,7 +194,7 @@ end;
 $$;").unwrap();
 
     println!("{}", x);
-    let dependencies = analyze_statement(sql)?;
+    let _dependencies = analyze_statement(sql)?;
     
     Ok(())
 }
