@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use pg_query::{NodeEnum, NodeRef};
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QualifiedIdent {
@@ -8,7 +9,7 @@ pub struct QualifiedIdent {
 }
 
 #[derive(Debug, Clone)]
-pub struct StmtDependencies {
+pub struct Dependencies {
     pub relations: Vec<QualifiedIdent>,
     pub functions: Vec<QualifiedIdent>,
     pub types: Vec<QualifiedIdent>,
@@ -39,7 +40,7 @@ impl QualifiedIdent {
     }
 }
 
-pub fn analyze_statement(sql: &str) -> Result<StmtDependencies, Box<dyn std::error::Error>> {
+pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::Error>> {
     let parse_result = pg_query::parse(sql)?;
     
     // Extract relations and functions using existing pg_query functionality
@@ -54,7 +55,7 @@ pub fn analyze_statement(sql: &str) -> Result<StmtDependencies, Box<dyn std::err
     // Extract types from cast expressions
     let types = extract_types_from_ast(&parse_result.protobuf)?;
     
-    Ok(StmtDependencies {
+    Ok(Dependencies {
         relations,
         functions,
         types,
@@ -81,64 +82,9 @@ fn extract_types_from_ast(parse_result: &pg_query::protobuf::ParseResult) -> Res
         }
     }
     
-    // For INSERT statements, we need to parse the debug output as a workaround
-    // since nodes() doesn't properly traverse TypeCast nodes in VALUES clauses
-    let debug_str = format!("{:?}", parse_result);
-    extract_types_from_debug_string(&debug_str, &mut types);
-    
     Ok(types.into_iter().collect())
 }
 
-fn extract_types_from_debug_string(debug_str: &str, types: &mut HashSet<QualifiedIdent>) {
-    // Look for TypeCast patterns in the debug string
-    // The pattern is: TypeCast { ... type_name: Some(TypeName { ... names: [... String(String { sval: "type_name" }) ...] ... }) ...}
-    let type_cast_pattern = regex::Regex::new(r#"String\(String \{ sval: "([^"]+)" \}\)"#).unwrap();
-    
-    // Find all TypeCast blocks first
-    let typecast_blocks: Vec<&str> = debug_str.split("TypeCast {").collect();
-    
-    for block in typecast_blocks {
-        if block.contains("type_name: Some(TypeName {") {
-            // This is a TypeCast block with a type_name
-            let names_part = if let Some(names_start) = block.find("names: [") {
-                &block[names_start..]
-            } else {
-                continue;
-            };
-            
-            let names_end = if let Some(end) = names_part.find(']') {
-                &names_part[..end]
-            } else {
-                continue;
-            };
-            
-            // Extract all string values from the names array
-            let mut type_parts = Vec::new();
-            for cap in type_cast_pattern.captures_iter(names_end) {
-                type_parts.push(cap[1].to_string());
-            }
-            
-            if !type_parts.is_empty() {
-                let qualified_type = if type_parts.len() == 1 {
-                    QualifiedIdent::from_name(type_parts[0].clone())
-                } else if type_parts.len() == 2 {
-                    QualifiedIdent::new(Some(type_parts[0].clone()), type_parts[1].clone())
-                } else {
-                    // Handle cases with more than 2 parts
-                    let len = type_parts.len();
-                    QualifiedIdent::new(
-                        Some(type_parts[len - 2].clone()),
-                        type_parts[len - 1].clone(),
-                    )
-                };
-                
-                if !is_builtin_type(&qualified_type.name) {
-                    types.insert(qualified_type);
-                }
-            }
-        }
-    }
-}
 
 fn extract_type_from_type_name(type_name: &pg_query::protobuf::TypeName) -> Option<QualifiedIdent> {
     if type_name.names.is_empty() {
@@ -193,6 +139,158 @@ fn is_builtin_type(type_name: &str) -> bool {
         "index_am_handler" | "language_handler" | "tsm_handler" | "internal" |
         "opaque" | "trigger" | "pg_lsn" | "txid_snapshot" | "pg_snapshot"
     )
+}
+
+pub fn analyze_plpgsql(sql: &str) -> Result<Dependencies, Box<dyn std::error::Error>> {
+    let json_result = pg_query::parse_plpgsql(sql)?;
+    
+    let mut all_relations = HashSet::new();
+    let mut all_functions = HashSet::new();
+    let mut all_types = HashSet::new();
+    
+    // First, extract the return type and parameter types from the CREATE FUNCTION statement
+    if let Ok(parse_result) = pg_query::parse(sql) {
+        for (node, _, _, _) in parse_result.protobuf.nodes() {
+            if let NodeRef::CreateFunctionStmt(create_func) = node {
+                // Extract return type
+                if let Some(return_type) = &create_func.return_type {
+                    if let Some(qualified_type) = extract_type_from_type_name(return_type) {
+                        if !is_builtin_type(&qualified_type.name) {
+                            all_types.insert(qualified_type);
+                        }
+                    }
+                }
+                
+                // Extract parameter types
+                for param in &create_func.parameters {
+                    if let Some(NodeEnum::FunctionParameter(func_param)) = &param.node {
+                        if let Some(arg_type) = &func_param.arg_type {
+                            if let Some(qualified_type) = extract_type_from_type_name(arg_type) {
+                                if !is_builtin_type(&qualified_type.name) {
+                                    all_types.insert(qualified_type);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // The result is a JSON array of PL/pgSQL functions
+    if let Value::Array(functions) = &json_result {
+        for function in functions {
+            extract_dependencies_from_plpgsql_function(function, &mut all_relations, &mut all_functions, &mut all_types)?;
+        }
+    }
+    
+    Ok(Dependencies {
+        relations: all_relations.into_iter().collect(),
+        functions: all_functions.into_iter().collect(),
+        types: all_types.into_iter().collect(),
+    })
+}
+
+fn extract_dependencies_from_plpgsql_function(
+    function_json: &Value,
+    relations: &mut HashSet<QualifiedIdent>,
+    functions: &mut HashSet<QualifiedIdent>,
+    types: &mut HashSet<QualifiedIdent>
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Extract types from datums (variable declarations)
+    if let Some(Value::Object(func_obj)) = function_json.get("PLpgSQL_function") {
+        if let Some(Value::Array(datums)) = func_obj.get("datums") {
+            for datum in datums {
+                extract_types_from_datum(datum, types);
+            }
+        }
+    }
+    
+    // Extract SQL statements from the function body
+    let sql_statements = extract_sql_statements_from_json(function_json);
+    
+    // Analyze each SQL statement
+    for sql in sql_statements {
+        // Some extracted queries might be expressions that need to be wrapped in SELECT
+        let sql_to_analyze = if sql.trim().to_uppercase().starts_with("SELECT") 
+            || sql.trim().to_uppercase().starts_with("INSERT")
+            || sql.trim().to_uppercase().starts_with("UPDATE")
+            || sql.trim().to_uppercase().starts_with("DELETE")
+            || sql.trim().to_uppercase().starts_with("WITH") {
+            sql
+        } else {
+            // Wrap expression in SELECT to make it parseable
+            format!("SELECT {}", sql)
+        };
+        
+        if let Ok(deps) = analyze_statement(&sql_to_analyze) {
+            for relation in deps.relations {
+                relations.insert(relation);
+            }
+            for function in deps.functions {
+                functions.insert(function);
+            }
+            for typ in deps.types {
+                types.insert(typ);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+fn extract_sql_statements_from_json(value: &Value) -> Vec<String> {
+    let mut statements = Vec::new();
+    
+    match value {
+        Value::Object(map) => {
+            // Look for PLpgSQL_expr nodes which contain SQL statements
+            if let Some(Value::Object(expr_map)) = map.get("PLpgSQL_expr") {
+                if let Some(Value::String(query)) = expr_map.get("query") {
+                    statements.push(query.clone());
+                }
+            }
+            
+            // Recursively search in all values
+            for (_, v) in map {
+                statements.extend(extract_sql_statements_from_json(v));
+            }
+        }
+        Value::Array(arr) => {
+            // Recursively search in array elements
+            for v in arr {
+                statements.extend(extract_sql_statements_from_json(v));
+            }
+        }
+        _ => {}
+    }
+    
+    statements
+}
+
+fn extract_types_from_datum(datum: &Value, types: &mut HashSet<QualifiedIdent>) {
+    if let Some(Value::Object(var_obj)) = datum.get("PLpgSQL_var") {
+        if let Some(Value::Object(datatype_obj)) = var_obj.get("datatype") {
+            if let Some(Value::Object(type_obj)) = datatype_obj.get("PLpgSQL_type") {
+                if let Some(Value::String(typname)) = type_obj.get("typname") {
+                    // Parse the type name, which might be qualified like "pg_catalog.int4"
+                    // Also remove any quotes from the type name
+                    let clean_typname = typname.trim_matches('"');
+                    let type_ident = if clean_typname.contains('.') {
+                        QualifiedIdent::from_qualified_name(clean_typname)
+                    } else {
+                        QualifiedIdent::from_name(clean_typname.to_string())
+                    };
+                    
+                    // Filter out built-in types and pg_catalog types
+                    if type_ident.schema.as_ref().map_or(true, |s| s != "pg_catalog") 
+                        && !is_builtin_type(&type_ident.name) {
+                        types.insert(type_ident);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -591,6 +689,288 @@ mod tests {
         
         let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
         assert!(function_names.contains(&"process_order"));
+    }
+
+    #[test]
+    fn test_analyze_plpgsql_return_and_param_types() {
+        let sql = "
+        CREATE OR REPLACE FUNCTION calculate_order_total(
+            p_order_id order_id_type,
+            p_discount discount_type
+        )
+        RETURNS api.order_total AS $$
+        DECLARE
+            v_subtotal currency;
+        BEGIN
+            SELECT SUM(price * quantity)::currency INTO v_subtotal
+            FROM order_items
+            WHERE order_id = p_order_id;
+            
+            RETURN (v_subtotal, p_discount)::api.order_total;
+        END;
+        $$ LANGUAGE plpgsql;
+        ";
+        
+        let result = analyze_plpgsql(sql).unwrap();
+        
+        // Check that we found the parameter types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"order_id_type"));
+        assert!(type_names.contains(&"discount_type"));
+        
+        // Check that we found the return type
+        assert!(type_names.contains(&"order_total"));
+        
+        // Check that we found the type from the variable declaration
+        assert!(type_names.contains(&"currency"));
+        
+        // Check schema qualification for return type
+        let order_total = result.types.iter()
+            .find(|t| t.name == "order_total")
+            .unwrap();
+        assert_eq!(order_total.schema, Some("api".to_string()));
+        
+        // Check that we found the table
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"order_items"));
+    }
+
+    #[test]
+    fn test_analyze_plpgsql_simple_function() {
+        let sql = "
+        CREATE OR REPLACE FUNCTION calculate_total(p_account_id integer)
+        RETURNS currency AS $$
+        DECLARE
+            total currency;
+        BEGIN
+            SELECT SUM(amount)::currency INTO total
+            FROM transactions
+            WHERE account_id = p_account_id;
+            
+            RETURN COALESCE(total, (0, 'USD')::currency);
+        END;
+        $$ LANGUAGE plpgsql;
+        ";
+        
+        let result = analyze_plpgsql(sql).unwrap();
+        
+        // Check that we found the table
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"transactions"));
+        
+        // Check that we found the custom type
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"currency"));
+        
+        // Check that we found the functions
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        // SUM and COALESCE are built-in functions
+        assert!(function_names.contains(&"sum"));
+        // The COALESCE call is in the RETURN statement which is not a standard SQL statement
+    }
+
+    #[test]
+    fn test_analyze_plpgsql_with_multiple_statements() {
+        let sql = "
+        CREATE OR REPLACE FUNCTION process_order(
+            p_order_id integer,
+            p_customer_id integer
+        )
+        RETURNS api.order_result AS $$
+        DECLARE
+            v_status order_status;
+            v_total numeric;
+        BEGIN
+            -- Get order status
+            SELECT status::order_status INTO v_status
+            FROM orders
+            WHERE order_id = p_order_id;
+            
+            -- Calculate total
+            SELECT SUM(quantity * price)::numeric INTO v_total
+            FROM order_items
+            WHERE order_id = p_order_id;
+            
+            -- Update customer stats
+            UPDATE customer_stats
+            SET last_order_date = now(),
+                total_spent = total_spent + v_total
+            WHERE customer_id = p_customer_id;
+            
+            -- Return result
+            RETURN (p_order_id, v_status, v_total)::api.order_result;
+        END;
+        $$ LANGUAGE plpgsql;
+        ";
+        
+        let result = analyze_plpgsql(sql).unwrap();
+        
+        // Check tables
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"order_items"));
+        assert!(table_names.contains(&"customer_stats"));
+        
+        // Check types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"order_status"));
+        assert!(type_names.contains(&"order_result"));
+        
+        // Check schema qualification
+        let order_result = result.types.iter()
+            .find(|t| t.name == "order_result")
+            .unwrap();
+        assert_eq!(order_result.schema, Some("api".to_string()));
+    }
+
+    #[test]
+    fn test_analyze_plpgsql_with_dynamic_sql() {
+        let sql = "
+        CREATE OR REPLACE FUNCTION get_table_data(
+            p_table_name text,
+            p_schema_name text DEFAULT 'public'
+        )
+        RETURNS SETOF record AS $$
+        DECLARE
+            v_query text;
+        BEGIN
+            -- This contains dynamic SQL, so we won't capture the table dependency
+            v_query := format('SELECT * FROM %I.%I', p_schema_name, p_table_name);
+            RETURN QUERY EXECUTE v_query;
+        END;
+        $$ LANGUAGE plpgsql;
+        ";
+        
+        let result = analyze_plpgsql(sql).unwrap();
+        
+        // Dynamic SQL won't be captured as dependencies
+        assert_eq!(result.relations.len(), 0);
+        
+        // The format function call is in an assignment statement, which is not standard SQL
+        // so it won't be parsed. This is a limitation of analyzing PL/pgSQL functions.
+        // In a real implementation, we might need to parse PL/pgSQL assignment statements specially.
+        assert_eq!(result.functions.len(), 0);
+    }
+
+    #[test]
+    fn test_analyze_plpgsql_with_cte_and_joins() {
+        let sql = "
+        CREATE OR REPLACE FUNCTION get_user_summary(p_user_id integer)
+        RETURNS user_summary_type AS $$
+        DECLARE
+            result user_summary_type;
+        BEGIN
+            WITH order_stats AS (
+                SELECT 
+                    COUNT(*)::bigint as order_count,
+                    SUM(total)::currency as total_spent
+                FROM orders
+                WHERE user_id = p_user_id
+            ),
+            activity_stats AS (
+                SELECT 
+                    MAX(login_time)::timestamptz as last_login,
+                    COUNT(*)::bigint as login_count
+                FROM user_activity
+                WHERE user_id = p_user_id
+                  AND activity_type = 'login'::activity_enum
+            )
+            SELECT 
+                u.username,
+                u.email,
+                os.order_count,
+                os.total_spent,
+                a_s.last_login,
+                a_s.login_count
+            INTO result
+            FROM users u
+            CROSS JOIN order_stats os
+            CROSS JOIN activity_stats a_s
+            WHERE u.id = p_user_id;
+            
+            RETURN result;
+        END;
+        $$ LANGUAGE plpgsql;
+        ";
+        
+        let result = analyze_plpgsql(sql).unwrap();
+        
+        // Check tables
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"user_activity"));
+        assert!(table_names.contains(&"users"));
+        
+        // Check types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"user_summary_type"));
+        assert!(type_names.contains(&"currency"));
+        assert!(type_names.contains(&"activity_enum"));
+    }
+
+    #[test]
+    fn test_analyze_plpgsql_with_exception_handling() {
+        let sql = "
+        CREATE OR REPLACE FUNCTION safe_divide(
+            p_numerator numeric,
+            p_denominator numeric
+        )
+        RETURNS api.calculation_result AS $$
+        DECLARE
+            v_result numeric;
+        BEGIN
+            BEGIN
+                v_result := p_numerator / p_denominator;
+                
+                INSERT INTO calculation_log (
+                    numerator,
+                    denominator,
+                    result,
+                    status
+                ) VALUES (
+                    p_numerator,
+                    p_denominator,
+                    v_result,
+                    'success'::calc_status
+                );
+                
+                RETURN (true, v_result, NULL)::api.calculation_result;
+            EXCEPTION
+                WHEN division_by_zero THEN
+                    INSERT INTO error_log (
+                        error_type,
+                        error_message,
+                        occurred_at
+                    ) VALUES (
+                        'division_by_zero'::error_type,
+                        'Division by zero attempted',
+                        now()
+                    );
+                    
+                    RETURN (false, NULL, 'Division by zero')::api.calculation_result;
+            END;
+        END;
+        $$ LANGUAGE plpgsql;
+        ";
+        
+        let result = analyze_plpgsql(sql).unwrap();
+        
+        // Check tables
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"calculation_log"));
+        assert!(table_names.contains(&"error_log"));
+        
+        // Check types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"calculation_result"));
+        assert!(type_names.contains(&"calc_status"));
+        assert!(type_names.contains(&"error_type"));
+        
+        // Check schema qualification
+        let calc_result = result.types.iter()
+            .find(|t| t.name == "calculation_result")
+            .unwrap();
+        assert_eq!(calc_result.schema, Some("api".to_string()));
     }
 
     #[test]
