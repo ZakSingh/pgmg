@@ -1312,6 +1312,111 @@ mod tests {
     }
     
     #[test]
+    fn test_create_index_dependencies() {
+        let sql = "CREATE INDEX idx_orders_customer ON orders(customer_id);";
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract the table name from the index
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+    }
+    
+    #[test]
+    fn test_create_index_with_expressions() {
+        let sql = "CREATE INDEX idx_orders_total_usd ON orders (convert_to_usd(total));";
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract the table name
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        
+        // Should extract function calls from index expressions
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"convert_to_usd"));
+    }
+    
+    #[test]
+    fn test_create_materialized_view_dependencies() {
+        let sql = "CREATE MATERIALIZED VIEW order_summary AS 
+            SELECT o.id, o.total, c.name AS customer_name
+            FROM orders o
+            JOIN customers c ON o.customer_id = c.id
+            WHERE o.status = 'active';";
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract all table names from the query
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"customers"));
+        assert!(table_names.contains(&"order_summary")); // The materialized view itself
+    }
+    
+    #[test]
+    fn test_create_materialized_view_with_functions() {
+        let sql = "CREATE MATERIALIZED VIEW daily_stats AS
+            SELECT 
+                date_trunc('day', created_at) as day,
+                count(*) as order_count,
+                sum(calculate_total(amount)) as total_amount
+            FROM orders
+            WHERE created_at >= current_date - interval '30 days'
+            GROUP BY date_trunc('day', created_at);";
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract table names
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        assert!(table_names.contains(&"daily_stats"));
+        
+        // Should extract function calls
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"date_trunc"));
+        assert!(function_names.contains(&"calculate_total"));
+        assert!(function_names.contains(&"count"));
+        assert!(function_names.contains(&"sum"));
+    }
+    
+    #[test]
+    fn test_create_unique_index_with_where_clause() {
+        let sql = "CREATE UNIQUE INDEX idx_active_users ON users(email) WHERE status = 'active' AND validate_email(email);";
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract table name
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"users"));
+        
+        // Should extract function calls from WHERE clause
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"validate_email"));
+    }
+    
+    #[test]
+    fn test_create_index_on_schema_qualified_table() {
+        let sql = "CREATE INDEX idx_user_names ON auth.users(lower(name));";
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract schema-qualified table name
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"users"));
+        let users_table = result.relations.iter().find(|t| t.name == "users").unwrap();
+        assert_eq!(users_table.schema, Some("auth".to_string()));
+        
+        // Should extract function calls from index expression
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"lower"));
+    }
+    
+    #[test]
+    fn test_refresh_materialized_view() {
+        let sql = "REFRESH MATERIALIZED VIEW order_summary;";
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract the materialized view name
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"order_summary"));
+    }
+    
+    #[test]
     fn test_create_table_with_custom_types() {
         let sql = "
         CREATE TABLE api.orders (
