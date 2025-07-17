@@ -101,6 +101,37 @@ fn extract_from_constraint(
     }
 }
 
+fn extract_function_name_from_nodes(
+    nodes: &[pg_query::protobuf::Node],
+    functions: &mut HashSet<QualifiedIdent>,
+) {
+    let function_name_parts: Vec<String> = nodes.iter()
+        .filter_map(|node| {
+            if let Some(NodeEnum::String(string_node)) = &node.node {
+                Some(string_node.sval.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    if !function_name_parts.is_empty() {
+        let func_ident = if function_name_parts.len() == 1 {
+            QualifiedIdent::from_name(function_name_parts[0].clone())
+        } else if function_name_parts.len() == 2 {
+            QualifiedIdent::new(Some(function_name_parts[0].clone()), function_name_parts[1].clone())
+        } else {
+            // Handle cases with more than 2 parts by taking the last two
+            let len = function_name_parts.len();
+            QualifiedIdent::new(
+                Some(function_name_parts[len - 2].clone()),
+                function_name_parts[len - 1].clone(),
+            )
+        };
+        functions.insert(func_ident);
+    }
+}
+
 fn extract_from_node(
     node: &NodeEnum,
     relations: &mut HashSet<QualifiedIdent>,
@@ -194,6 +225,10 @@ fn extract_from_node(
             if let Some(subselect) = &sublink.subselect {
                 extract_from_node(subselect.node.as_ref().unwrap(), relations, functions);
             }
+        }
+        NodeEnum::CreateTrigStmt(trigger_stmt) => {
+            // Extract function name from EXECUTE FUNCTION clause
+            extract_function_name_from_nodes(&trigger_stmt.funcname, functions);
         }
         _ => {
             // For other node types, we could add more specific handling
@@ -509,32 +544,7 @@ fn extract_function_from_func_call(
     functions: &mut HashSet<QualifiedIdent>
 ) {
     // Extract function name from funcname list
-    let name_parts: Vec<String> = func_call.funcname.iter()
-        .filter_map(|node| {
-            if let Some(NodeEnum::String(s)) = &node.node {
-                Some(s.sval.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-    
-    if !name_parts.is_empty() {
-        let func_ident = if name_parts.len() == 1 {
-            QualifiedIdent::from_name(name_parts[0].clone())
-        } else if name_parts.len() == 2 {
-            QualifiedIdent::new(Some(name_parts[0].clone()), name_parts[1].clone())
-        } else {
-            // Handle cases with more than 2 parts by taking the last two
-            let len = name_parts.len();
-            QualifiedIdent::new(
-                Some(name_parts[len - 2].clone()),
-                name_parts[len - 1].clone(),
-            )
-        };
-        
-        functions.insert(func_ident);
-    }
+    extract_function_name_from_nodes(&func_call.funcname, functions);
 }
 
 fn extract_types_from_datum(datum: &Value, types: &mut HashSet<QualifiedIdent>) {
@@ -1245,6 +1255,60 @@ mod tests {
         let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
         assert!(function_names.contains(&"now"));
         assert!(function_names.contains(&"validate_uuid"));
+    }
+    
+    #[test]
+    fn test_trigger_dependencies() {
+        let sql = "CREATE TRIGGER check_order_status
+            BEFORE INSERT OR UPDATE ON orders
+            FOR EACH ROW
+            EXECUTE FUNCTION update_order_status();";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract the table name from the ON clause
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        
+        // Should extract the function name from EXECUTE FUNCTION clause
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"update_order_status"));
+    }
+    
+    #[test]
+    fn test_trigger_with_schema() {
+        let sql = "CREATE TRIGGER audit_user_changes
+            AFTER INSERT OR UPDATE OR DELETE ON auth.users
+            FOR EACH ROW
+            EXECUTE FUNCTION audit.log_user_changes();";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract schema-qualified table name
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"users"));
+        let users_table = result.relations.iter().find(|t| t.name == "users").unwrap();
+        assert_eq!(users_table.schema, Some("auth".to_string()));
+        
+        // Should extract schema-qualified function name
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"log_user_changes"));
+        let log_function = result.functions.iter().find(|f| f.name == "log_user_changes").unwrap();
+        assert_eq!(log_function.schema, Some("audit".to_string()));
+    }
+    
+    #[test]
+    fn test_drop_trigger() {
+        let sql = "DROP TRIGGER check_order_status ON orders;";
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should extract the table name from DROP TRIGGER
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"orders"));
+        
+        // DROP TRIGGER doesn't contain function references
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.is_empty());
     }
     
     #[test]
