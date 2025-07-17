@@ -43,10 +43,11 @@ impl QualifiedIdent {
 pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::Error>> {
     let parse_result = pg_query::parse(sql)?;
     
-    // Extract relations and functions using existing pg_query functionality
-    let relations = parse_result.tables().into_iter()
-        .map(|table| QualifiedIdent::from_qualified_name(&table))
-        .collect();
+    // Extract relations using existing pg_query functionality
+    let mut relations = HashSet::new();
+    for table in parse_result.tables() {
+        relations.insert(QualifiedIdent::from_qualified_name(&table));
+    }
     
     let mut functions = HashSet::new();
     
@@ -55,10 +56,12 @@ pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::
         functions.insert(QualifiedIdent::from_qualified_name(&func));
     }
     
-    // Also extract functions from FuncCall nodes to ensure we catch all function calls
-    for (node, _, _, _) in parse_result.protobuf.nodes() {
-        if let NodeRef::FuncCall(func_call) = node {
-            extract_function_from_func_call(func_call, &mut functions);
+    // Also traverse the entire AST to extract REFERENCES and DEFAULT functions
+    for stmt in &parse_result.protobuf.stmts {
+        if let Some(stmt) = &stmt.stmt {
+            if let Some(node) = &stmt.node {
+                extract_from_node(node, &mut relations, &mut functions);
+            }
         }
     }
     
@@ -66,10 +69,89 @@ pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::
     let types = extract_types_from_ast(&parse_result.protobuf)?;
     
     Ok(Dependencies {
-        relations,
+        relations: relations.into_iter().collect(),
         functions: functions.into_iter().collect(),
         types,
     })
+}
+
+fn extract_from_constraint(
+    constraint: &pg_query::protobuf::Constraint,
+    relations: &mut HashSet<QualifiedIdent>,
+    functions: &mut HashSet<QualifiedIdent>,
+) {
+    use pg_query::protobuf::ConstrType;
+    
+    if constraint.contype == ConstrType::ConstrForeign as i32 {
+        if let Some(pktable) = &constraint.pktable {
+            let table_ident = if !pktable.schemaname.is_empty() {
+                QualifiedIdent::new(Some(pktable.schemaname.clone()), pktable.relname.clone())
+            } else {
+                QualifiedIdent::from_name(pktable.relname.clone())
+            };
+            relations.insert(table_ident);
+        }
+    }
+    // Check if it's a DEFAULT constraint
+    if constraint.contype == ConstrType::ConstrDefault as i32 {
+        if let Some(raw_expr) = &constraint.raw_expr {
+            extract_from_node(raw_expr.node.as_ref().unwrap(), relations, functions);
+        }
+    }
+}
+
+fn extract_from_node(
+    node: &NodeEnum,
+    relations: &mut HashSet<QualifiedIdent>,
+    functions: &mut HashSet<QualifiedIdent>,
+) {
+    
+    match node {
+        NodeEnum::CreateStmt(create_stmt) => {
+            // Extract from table elements (columns, constraints)
+            for table_elt in &create_stmt.table_elts {
+                if let Some(NodeEnum::ColumnDef(col_def)) = &table_elt.node {
+                    // Extract DEFAULT functions
+                    if let Some(raw_default) = &col_def.raw_default {
+                        extract_from_node(raw_default.node.as_ref().unwrap(), relations, functions);
+                    }
+                    
+                    // Extract REFERENCES from column constraints
+                    for constraint in &col_def.constraints {
+                        if let Some(NodeEnum::Constraint(c)) = &constraint.node {
+                            extract_from_constraint(c, relations, functions);
+                        }
+                    }
+                }
+            }
+        }
+        NodeEnum::AlterTableStmt(alter_stmt) => {
+            // Extract from ALTER TABLE commands
+            for cmd in &alter_stmt.cmds {
+                if let Some(NodeEnum::AlterTableCmd(table_cmd)) = &cmd.node {
+                    // Handle ADD CONSTRAINT commands
+                    if let Some(def) = &table_cmd.def {
+                        if let Some(NodeEnum::Constraint(c)) = &def.node {
+                            extract_from_constraint(c, relations, functions);
+                        }
+                    }
+                }
+            }
+        }
+        NodeEnum::FuncCall(func_call) => {
+            extract_function_from_func_call(func_call, functions);
+        }
+        NodeEnum::TypeCast(type_cast) => {
+            if let Some(arg) = &type_cast.arg {
+                extract_from_node(arg.node.as_ref().unwrap(), relations, functions);
+            }
+        }
+        _ => {
+            // For other node types, recursively traverse their children
+            // This is a simplified approach - in a full implementation, we'd need to
+            // handle all node types and their specific child structures
+        }
+    }
 }
 
 fn extract_types_from_ast(parse_result: &pg_query::protobuf::ParseResult) -> Result<Vec<QualifiedIdent>, Box<dyn std::error::Error>> {
@@ -106,6 +188,41 @@ fn extract_types_from_ast(parse_result: &pg_query::protobuf::ParseResult) -> Res
                     if let Some(qualified_type) = extract_type_from_type_name(type_name) {
                         if !is_builtin_type(&qualified_type.name) {
                             types.insert(qualified_type);
+                        }
+                    }
+                }
+            }
+            NodeRef::CreateStmt(create_stmt) => {
+                // Extract types from CREATE TABLE column definitions
+                for table_elt in &create_stmt.table_elts {
+                    if let Some(NodeEnum::ColumnDef(column_def)) = &table_elt.node {
+                        if let Some(type_name) = &column_def.type_name {
+                            if let Some(qualified_type) = extract_type_from_type_name(type_name) {
+                                if !is_builtin_type(&qualified_type.name) {
+                                    types.insert(qualified_type);
+                                }
+                            }
+                        }
+                        
+                        // Note: Constraints are handled separately for REFERENCES and DEFAULT
+                    }
+                }
+            }
+            NodeRef::AlterTableStmt(alter_table) => {
+                // Extract types from ALTER TABLE commands
+                for cmd in &alter_table.cmds {
+                    if let Some(NodeEnum::AlterTableCmd(alter_cmd)) = &cmd.node {
+                        // Handle column definitions in ALTER TABLE
+                        if let Some(def) = &alter_cmd.def {
+                            if let Some(NodeEnum::ColumnDef(column_def)) = &def.node {
+                                if let Some(type_name) = &column_def.type_name {
+                                    if let Some(qualified_type) = extract_type_from_type_name(type_name) {
+                                        if !is_builtin_type(&qualified_type.name) {
+                                            types.insert(qualified_type);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -156,6 +273,7 @@ fn is_builtin_type(type_name: &str) -> bool {
     // This is not exhaustive but covers the most common types
     matches!(type_name.to_lowercase().as_str(),
         "int" | "int2" | "int4" | "int8" | "integer" | "smallint" | "bigint" |
+        "serial" | "smallserial" | "bigserial" | "serial2" | "serial4" | "serial8" |
         "float" | "float4" | "float8" | "real" | "double" | "precision" |
         "numeric" | "decimal" | "money" |
         "char" | "varchar" | "text" | "bpchar" | "character" |
@@ -394,6 +512,7 @@ fn extract_types_from_datum(datum: &Value, types: &mut HashSet<QualifiedIdent>) 
         }
     }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -964,6 +1083,266 @@ mod tests {
             .find(|t| t.name == "order_result")
             .unwrap();
         assert_eq!(order_result.schema, Some("api".to_string()));
+    }
+
+    #[test]
+    fn test_references_and_default_extraction() {
+        let sql = "CREATE TABLE test_table (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            customer_id uuid REFERENCES customers(id) ON DELETE CASCADE,
+            user_id bigint REFERENCES auth.users(id),
+            status text DEFAULT get_default_status(),
+            created_at timestamptz DEFAULT now(),
+            data jsonb DEFAULT '{}'::jsonb
+        );";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Check that DEFAULT function calls are extracted
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"gen_random_uuid"));
+        assert!(function_names.contains(&"get_default_status"));
+        assert!(function_names.contains(&"now"));
+        
+        // Check that REFERENCES tables are extracted
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"test_table")); // The table being created
+        assert!(table_names.contains(&"customers"));
+        assert!(table_names.contains(&"users"));
+        
+        // Check schema qualification for referenced table
+        let users_table = result.relations.iter()
+            .find(|t| t.name == "users")
+            .unwrap();
+        assert_eq!(users_table.schema, Some("auth".to_string()));
+    }
+
+    #[test]
+    fn test_standalone_constraint() {
+        let sql = "
+        CREATE TABLE test_table (id uuid);
+        ALTER TABLE test_table ADD CONSTRAINT fk_ref FOREIGN KEY (id) REFERENCES other_table(id);
+        ";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Check that the referenced table is extracted
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"test_table"));
+        assert!(table_names.contains(&"other_table"));
+    }
+    
+    #[test]
+    fn test_create_table_with_custom_types() {
+        let sql = "
+        CREATE TABLE api.orders (
+            id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+            order_number order_number_type NOT NULL,
+            customer_id uuid REFERENCES customers(id),
+            status order_status DEFAULT 'pending'::order_status,
+            total currency NOT NULL,
+            items order_item[] NOT NULL,
+            shipping_address address,
+            billing_info billing_info,
+            metadata jsonb,
+            created_at timestamptz DEFAULT now(),
+            updated_at timestamptz DEFAULT now()
+        );
+        
+        -- Table with custom type column
+        CREATE TABLE inventory (
+            id serial PRIMARY KEY,
+            sku text NOT NULL,
+            quantity int NOT NULL,
+            location warehouse_location,
+            unit_price currency NOT NULL
+        );
+        ";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Check custom types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"order_number_type"));
+        assert!(type_names.contains(&"order_status"));
+        assert!(type_names.contains(&"currency"));
+        assert!(type_names.contains(&"order_item"));
+        assert!(type_names.contains(&"address"));
+        assert!(type_names.contains(&"billing_info"));
+        assert!(type_names.contains(&"warehouse_location"));
+        
+        // Built-in types should be filtered
+        assert!(!type_names.contains(&"uuid"));
+        assert!(!type_names.contains(&"jsonb"));
+        assert!(!type_names.contains(&"timestamptz"));
+        assert!(!type_names.contains(&"int"));
+        
+        // Check tables from REFERENCES
+        let table_names: Vec<&str> = result.relations.iter().map(|t| t.name.as_str()).collect();
+        assert!(table_names.contains(&"customers")); // From REFERENCES
+        
+        // Check functions from DEFAULT clauses
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"gen_random_uuid"));
+        assert!(function_names.contains(&"now"));
+    }
+
+    #[test]
+    fn test_alter_table_with_custom_types() {
+        let sql = "
+        -- Add column with custom type
+        ALTER TABLE orders ADD COLUMN discount discount_type;
+        
+        -- Add column with default using custom type cast
+        ALTER TABLE customers 
+            ADD COLUMN loyalty_status customer_status DEFAULT 'bronze'::customer_status,
+            ADD COLUMN credit_limit currency DEFAULT (1000, 'USD')::currency;
+        
+        -- Add constraint with custom type
+        ALTER TABLE products 
+            ADD CONSTRAINT valid_price CHECK (price::currency > (0, 'USD')::currency);
+        
+        -- Alter column type
+        ALTER TABLE inventory ALTER COLUMN location TYPE new_warehouse_location;
+        ";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Check custom types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"discount_type"));
+        assert!(type_names.contains(&"customer_status"));
+        assert!(type_names.contains(&"currency"));
+        assert!(type_names.contains(&"new_warehouse_location"));
+    }
+
+    #[test]
+    fn test_create_index_with_custom_types() {
+        let sql = "
+        -- Index with cast expression
+        CREATE INDEX idx_orders_status ON orders ((status::text));
+        
+        -- Index on custom type column
+        CREATE INDEX idx_inventory_location ON inventory (location);
+        
+        -- Partial index with custom type in WHERE clause
+        CREATE INDEX idx_active_orders ON orders (created_at) 
+        WHERE status = 'active'::order_status;
+        
+        -- Expression index with function on custom type
+        CREATE INDEX idx_order_total_usd ON orders ((get_usd_amount(total)));
+        ";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Check types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"order_status"));
+        
+        // Check functions
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"get_usd_amount"));
+    }
+
+    #[test]
+    fn test_create_view_with_custom_types() {
+        let sql = "
+        CREATE VIEW api.order_summary AS
+        SELECT 
+            o.id,
+            o.order_number,
+            o.status::order_status_display AS display_status,
+            o.total,
+            c.name AS customer_name,
+            shipping_cost(o.shipping_address)::currency AS shipping_cost,
+            (SELECT array_agg(item_name::product_name) 
+             FROM unnest(o.items) AS item_name) AS product_names
+        FROM orders o
+        JOIN customers c ON o.customer_id = c.id
+        WHERE o.status != 'cancelled'::order_status;
+        
+        -- Materialized view
+        CREATE MATERIALIZED VIEW inventory_summary AS
+        SELECT 
+            location,
+            COUNT(*)::int AS item_count,
+            SUM(value)::currency AS total_value,
+            aggregate_status(status)::inventory_status AS overall_status
+        FROM inventory
+        GROUP BY location;
+        ";
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Check types
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"order_status_display"));
+        assert!(type_names.contains(&"currency"));
+        assert!(type_names.contains(&"product_name"));
+        assert!(type_names.contains(&"order_status"));
+        assert!(type_names.contains(&"inventory_status"));
+        
+        // Check functions
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"shipping_cost"));
+        assert!(function_names.contains(&"unnest"));
+        assert!(function_names.contains(&"array_agg"));
+        assert!(function_names.contains(&"aggregate_status"));
+        assert!(function_names.contains(&"sum"));
+        assert!(function_names.contains(&"count"));
+    }
+
+    #[test]
+    fn test_ddl_with_mixed_statements() {
+        let sql = "
+        -- Trigger function using custom types
+        CREATE OR REPLACE FUNCTION update_order_status()
+        RETURNS trigger AS $$
+        BEGIN
+            IF NEW.total > get_threshold()::currency THEN
+                NEW.status := 'priority'::order_status;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+        
+        -- Create trigger
+        CREATE TRIGGER check_order_status
+            BEFORE INSERT OR UPDATE ON orders
+            FOR EACH ROW
+            EXECUTE FUNCTION update_order_status();
+        
+        -- Query with custom type and function
+        SELECT notify_admin(id, total) 
+        FROM orders 
+        WHERE total > (10000, 'USD')::currency;
+        ";
+        
+        // Analyze as a single statement batch
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should find types from all parts
+        let type_names: Vec<&str> = result.types.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"currency"));
+        
+        // Should find functions
+        let function_names: Vec<&str> = result.functions.iter().map(|f| f.name.as_str()).collect();
+        assert!(function_names.contains(&"notify_admin"));
+        
+        // For the PL/pgSQL function body, we'd need to use analyze_plpgsql
+        let plpgsql_part = "CREATE OR REPLACE FUNCTION update_order_status()
+        RETURNS trigger AS $$
+        BEGIN
+            IF NEW.total > get_threshold()::currency THEN
+                NEW.status := 'priority'::order_status;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;";
+        
+        let plpgsql_result = analyze_plpgsql(plpgsql_part).unwrap();
+        assert!(plpgsql_result.types.iter().any(|t| t.name == "order_status"));
+        assert!(plpgsql_result.functions.iter().any(|f| f.name == "get_threshold"));
     }
 
     #[test]
