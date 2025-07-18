@@ -1,0 +1,179 @@
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+#[derive(Parser, Clone)]
+#[command(name = "pgmg")]
+#[command(about = "PostgreSQL Migration Manager")]
+#[command(version = "0.1.0")]
+pub struct Cli {
+    /// Increase verbosity level (can be used multiple times)
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub verbose: Option<u8>,
+    
+    #[command(subcommand)]
+    pub command: Commands,
+}
+
+#[derive(Subcommand, Clone, Debug)]
+pub enum Commands {
+    /// Generate a sample configuration file
+    Init,
+    /// Analyze what changes need to be applied
+    Plan {
+        /// Directory containing sequential migration files
+        #[arg(long)]
+        migrations_dir: Option<PathBuf>,
+        
+        /// Directory containing declarative SQL objects (views, functions, types)
+        #[arg(long)]
+        code_dir: Option<PathBuf>,
+        
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
+        
+        /// Output dependency graph in Graphviz DOT format to the specified file
+        #[arg(long)]
+        output_graph: Option<PathBuf>,
+    },
+    
+    /// Apply pending changes
+    Apply {
+        /// Directory containing sequential migration files
+        #[arg(long)]
+        migrations_dir: Option<PathBuf>,
+        
+        /// Directory containing declarative SQL objects (views, functions, types)
+        #[arg(long)]
+        code_dir: Option<PathBuf>,
+        
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
+    },
+    
+    /// Watch for file changes and automatically reload (development mode)
+    Watch {
+        /// Directory containing sequential migration files
+        #[arg(long)]
+        migrations_dir: Option<PathBuf>,
+        
+        /// Directory containing declarative SQL objects (views, functions, types)
+        #[arg(long)]
+        code_dir: Option<PathBuf>,
+        
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
+        
+        /// Debounce duration in milliseconds (default: 500ms)
+        #[arg(long, default_value = "500")]
+        debounce_ms: u64,
+        
+        /// Disable automatic apply after detecting changes
+        #[arg(long)]
+        no_auto_apply: bool,
+    },
+}
+
+impl Cli {
+    pub fn parse_args() -> Self {
+        Self::parse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_plan_command_parsing() {
+        let args = vec![
+            "pgmg",
+            "plan",
+            "--migrations-dir", "/path/to/migrations",
+            "--code-dir", "/path/to/sql",
+            "--connection-string", "postgresql://user:pass@localhost/db"
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        match cli.command {
+            Commands::Plan { migrations_dir, code_dir, connection_string, output_graph } => {
+                assert_eq!(migrations_dir, Some(PathBuf::from("/path/to/migrations")));
+                assert_eq!(code_dir, Some(PathBuf::from("/path/to/sql")));
+                assert_eq!(connection_string, Some("postgresql://user:pass@localhost/db".to_string()));
+                assert_eq!(output_graph, None);
+            }
+            _ => panic!("Expected Plan command"),
+        }
+    }
+
+    #[test]
+    fn test_apply_command_parsing() {
+        let args = vec![
+            "pgmg",
+            "apply",
+            "--code-dir", "/path/to/sql",
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        match cli.command {
+            Commands::Apply { migrations_dir, code_dir, connection_string } => {
+                assert_eq!(migrations_dir, None);
+                assert_eq!(code_dir, Some(PathBuf::from("/path/to/sql")));
+                assert_eq!(connection_string, None);
+            }
+            _ => panic!("Expected Apply command"),
+        }
+    }
+
+    #[test]
+    fn test_watch_command_parsing() {
+        let args = vec![
+            "pgmg",
+            "watch",
+            "--migrations-dir", "/path/to/migrations",
+            "--code-dir", "/path/to/sql",
+            "--connection-string", "postgresql://localhost/db",
+            "--debounce-ms", "1000",
+            "--no-auto-apply"
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        match cli.command {
+            Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply } => {
+                assert_eq!(migrations_dir, Some(PathBuf::from("/path/to/migrations")));
+                assert_eq!(code_dir, Some(PathBuf::from("/path/to/sql")));
+                assert_eq!(connection_string, Some("postgresql://localhost/db".to_string()));
+                assert_eq!(debounce_ms, 1000);
+                assert_eq!(no_auto_apply, true);
+            }
+            _ => panic!("Expected Watch command"),
+        }
+    }
+
+    #[test]
+    fn test_plan_command_with_output_graph() {
+        let args = vec![
+            "pgmg",
+            "plan",
+            "--code-dir", "/path/to/sql",
+            "--output-graph", "/path/to/graph.dot"
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        match cli.command {
+            Commands::Plan { migrations_dir, code_dir, connection_string, output_graph } => {
+                assert_eq!(migrations_dir, None);
+                assert_eq!(code_dir, Some(PathBuf::from("/path/to/sql")));
+                assert_eq!(connection_string, None);
+                assert_eq!(output_graph, Some(PathBuf::from("/path/to/graph.dot")));
+            }
+            _ => panic!("Expected Plan command"),
+        }
+    }
+}
