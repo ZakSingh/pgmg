@@ -1,11 +1,217 @@
 use tokio_postgres::NoTls;
-use pgmg::{analyze_statement, filter_builtins, builtin_catalog::BuiltinCatalog};
+use pgmg::{analyze_statement, filter_builtins, BuiltinCatalog, DependencyGraph};
+use pgmg::cli::{Cli, Commands};
+use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig};
+use pgmg::config::PgmgConfig;
+use pgmg::error::{PgmgError, Result};
+use pgmg::logging;
+use std::path::PathBuf;
+use tracing::{debug, info, warn};
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> color_eyre::Result<()> {
+    // Parse CLI args first to get verbosity level
+    let cli = Cli::parse_args();
+    
+    // Initialize logging and error handling
+    // Verbosity: 0 = warn, 1 = info, 2 = debug, 3+ = trace
+    let verbosity = cli.verbose.unwrap_or(0);
+    logging::init(verbosity)?;
+    
+    // Log startup
+    info!("Starting pgmg v{}", env!("CARGO_PKG_VERSION"));
+    debug!("Command: {:?}", cli.command);
+    
+    // Run the actual command
+    if let Err(e) = run(cli).await {
+        // Use the new error formatting
+        logging::output::error(&pgmg::error::format_error_chain(&e));
+        
+        // Show suggestions if available
+        if let Some(suggestion) = pgmg::error::suggest_fix(&e) {
+            logging::output::info(&suggestion);
+        }
+        
+        std::process::exit(1);
+    }
+    
+    Ok(())
+}
+
+async fn run(cli: Cli) -> Result<()> {
+    
+    // Load configuration file if it exists
+    let config_file = match PgmgConfig::load_from_file() {
+        Ok(config) => {
+            info!("Loaded configuration from pgmg.toml");
+            config
+        }
+        Err(e) => {
+            debug!("No configuration file found: {}", e);
+            None
+        }
+    };
+
+    match cli.command {
+        Commands::Init => {
+            logging::output::step("Generating sample configuration file...");
+            
+            PgmgConfig::write_sample_config()
+                .map_err(|e| PgmgError::Configuration(format!("Failed to write config: {}", e)))?;
+            
+            logging::output::success("Created pgmg.toml.example - rename to pgmg.toml to use");
+            Ok(())
+        }
+        Commands::Plan { migrations_dir, code_dir, connection_string, output_graph } => {
+            logging::output::header("Planning Changes");
+            
+            // Merge CLI args with config file
+            let merged_config = PgmgConfig::merge_with_cli(
+                config_file,
+                migrations_dir,
+                code_dir,
+                connection_string,
+                output_graph,
+            );
+            
+            // Require connection string
+            let conn_str = merged_config.connection_string
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .ok_or_else(|| PgmgError::Configuration(
+                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
+                ))?;
+            
+            // Validate connection string format
+            if !conn_str.starts_with("postgres://") && !conn_str.starts_with("postgresql://") {
+                return Err(PgmgError::InvalidConnectionString(conn_str));
+            }
+            
+            // Log configuration
+            debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
+            if let Some(ref dir) = merged_config.migrations_dir {
+                debug!("Migrations directory: {}", dir.display());
+            }
+            if let Some(ref dir) = merged_config.code_dir {
+                debug!("Code directory: {}", dir.display());
+            }
+            
+            // Execute plan with progress tracking
+            let start = std::time::Instant::now();
+            let plan_result = execute_plan(
+                merged_config.migrations_dir,
+                merged_config.code_dir,
+                conn_str,
+                merged_config.output_graph,
+            ).await?;
+            
+            let elapsed = start.elapsed();
+            info!("Planning completed in {}", logging::format_duration(elapsed));
+            
+            print_plan_summary(&plan_result);
+            Ok(())
+        }
+        
+        Commands::Apply { migrations_dir, code_dir, connection_string } => {
+            logging::output::header("Applying Changes");
+            
+            // Merge CLI args with config file (no output_graph for apply)
+            let merged_config = PgmgConfig::merge_with_cli(
+                config_file,
+                migrations_dir,
+                code_dir,
+                connection_string,
+                None, // apply command doesn't use output_graph
+            );
+            
+            // Log configuration
+            if let Some(ref dir) = merged_config.migrations_dir {
+                debug!("Migrations directory: {}", dir.display());
+            }
+            if let Some(ref dir) = merged_config.code_dir {
+                debug!("Code directory: {}", dir.display());
+            }
+            
+            // Require connection string
+            let conn_str = merged_config.connection_string
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .ok_or_else(|| PgmgError::Configuration(
+                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
+                ))?;
+            
+            // Warn if no directories specified
+            if merged_config.migrations_dir.is_none() && merged_config.code_dir.is_none() {
+                warn!("No migrations or code directory specified - nothing to apply");
+                return Ok(());
+            }
+            
+            // Execute apply with progress tracking
+            let start = std::time::Instant::now();
+            let apply_result = execute_apply(
+                merged_config.migrations_dir,
+                merged_config.code_dir,
+                conn_str,
+            ).await?;
+            
+            let elapsed = start.elapsed();
+            info!("Apply completed in {}", logging::format_duration(elapsed));
+            
+            print_apply_summary(&apply_result);
+            Ok(())
+        }
+        
+        Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply } => {
+            // Merge CLI args with config file
+            let merged_config = PgmgConfig::merge_with_cli(
+                config_file,
+                migrations_dir,
+                code_dir,
+                connection_string,
+                None, // watch command doesn't use output_graph
+            );
+            
+            // Require connection string
+            let conn_str = merged_config.connection_string
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .ok_or_else(|| PgmgError::Configuration(
+                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
+                ))?;
+            
+            // Create watch configuration
+            let watch_config = WatchConfig {
+                migrations_dir: merged_config.migrations_dir,
+                code_dir: merged_config.code_dir,
+                connection_string: conn_str,
+                debounce_duration: std::time::Duration::from_millis(debounce_ms),
+                auto_apply: !no_auto_apply,
+            };
+            
+            // Log configuration
+            debug!("Connection: {}", watch_config.connection_string.replace(|c: char| c == ':' || c == '@', "*"));
+            if let Some(ref dir) = watch_config.migrations_dir {
+                debug!("Migrations directory: {}", dir.display());
+            }
+            if let Some(ref dir) = watch_config.code_dir {
+                debug!("Code directory: {}", dir.display());
+            }
+            debug!("Debounce: {}ms", debounce_ms);
+            debug!("Auto-apply: {}", watch_config.auto_apply);
+            
+            execute_watch(watch_config).await
+        }
+    }
+}
+
+// Keep the demo for testing, but adapt to new error handling
+#[allow(dead_code)]
+async fn demo_sql_analysis() -> Result<()> {
     // Connect to the database.
     let (client, connection) =
-      tokio_postgres::connect("host=localhost user=postgres password=password dbname=postgres", NoTls).await?;
+      tokio_postgres::connect("host=localhost user=postgres password=password dbname=postgres", NoTls)
+        .await
+        .map_err(|e| PgmgError::DatabaseConnection {
+            message: "Failed to connect for demo".to_string(),
+            source: e,
+        })?;
 
     // The connection object performs the actual communication with the database,
     // so spawn it off to run on its own.
@@ -45,7 +251,7 @@ $$;";
     // Analyze the SQL statement
     let dependencies = analyze_statement(sql)?;
     
-    println!("\nRaw dependencies (including built-ins):");
+    println!("Raw dependencies (including built-ins):");
     println!("Relations: {:?}", dependencies.relations);
     println!("Functions: {:?}", dependencies.functions);
     println!("Types: {:?}", dependencies.types);
@@ -61,3 +267,92 @@ $$;";
     Ok(())
 }
 
+#[allow(dead_code)]
+async fn generate_dependency_graph(
+    code_dir: &PathBuf,
+    output_path: &PathBuf,
+) -> Result<()> {
+    use std::fs;
+    
+    println!("  Scanning SQL files in: {:?}", code_dir);
+    
+    // For now, create a simple example graph since we don't have full file scanning yet
+    // In a complete implementation, this would:
+    // 1. Scan the code_dir for .sql files
+    // 2. Parse each file and identify SQL objects
+    // 3. Build the dependency graph
+    // 4. Output to graphviz format
+    
+    // Create a demo dependency graph for illustration
+    let mut demo_objects = Vec::new();
+    
+    // Create some example SQL objects to demonstrate the graph
+    use pgmg::sql::{SqlObject, ObjectType, QualifiedIdent, Dependencies};
+    use std::collections::HashSet;
+    
+    // Example: users table (no dependencies)
+    let users_table = SqlObject::new(
+        ObjectType::View, // Using View as a placeholder since we don't have Table type
+        QualifiedIdent::from_name("users".to_string()),
+        "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)".to_string(),
+        Dependencies {
+            relations: HashSet::new(),
+            functions: HashSet::new(),
+            types: HashSet::new(),
+        },
+        Some(code_dir.join("tables/users.sql")),
+    );
+    
+    // Example: user_stats view (depends on users)
+    let mut user_stats_deps = Dependencies {
+        relations: HashSet::new(),
+        functions: HashSet::new(),
+        types: HashSet::new(),
+    };
+    user_stats_deps.relations.insert(QualifiedIdent::from_name("users".to_string()));
+    
+    let user_stats_view = SqlObject::new(
+        ObjectType::View,
+        QualifiedIdent::from_name("user_stats".to_string()),
+        "CREATE VIEW user_stats AS SELECT COUNT(*) FROM users".to_string(),
+        user_stats_deps,
+        Some(code_dir.join("views/user_stats.sql")),
+    );
+    
+    // Example: calculate_total function (depends on user_stats)
+    let mut calc_total_deps = Dependencies {
+        relations: HashSet::new(),
+        functions: HashSet::new(),
+        types: HashSet::new(),
+    };
+    calc_total_deps.relations.insert(QualifiedIdent::from_name("user_stats".to_string()));
+    
+    let calc_total_func = SqlObject::new(
+        ObjectType::Function,
+        QualifiedIdent::new(Some("api".to_string()), "calculate_total".to_string()),
+        "CREATE FUNCTION api.calculate_total() RETURNS INT AS $$ SELECT COUNT(*) FROM user_stats $$ LANGUAGE SQL".to_string(),
+        calc_total_deps,
+        Some(code_dir.join("functions/calculate_total.sql")),
+    );
+    
+    demo_objects.push(users_table);
+    demo_objects.push(user_stats_view);
+    demo_objects.push(calc_total_func);
+    
+    // Create a simple builtin catalog for filtering
+    let builtin_catalog = BuiltinCatalog::new();
+    
+    // Build the dependency graph
+    let graph = DependencyGraph::build_from_objects(&demo_objects, &builtin_catalog)?;
+    
+    // Generate Graphviz output
+    let graphviz_output = graph.to_graphviz();
+    
+    // Write to file
+    fs::write(output_path, graphviz_output)?;
+    
+    println!("  Generated graph with {} nodes and {} edges", 
+             graph.node_count(), graph.edge_count());
+    
+    Ok(())
+}

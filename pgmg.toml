@@ -1,0 +1,3 @@
+connection_string = "postgres://postgres:password@localhost:5432/postgres"
+migrations_dir = "migrations"
+code_dir = "sql"
