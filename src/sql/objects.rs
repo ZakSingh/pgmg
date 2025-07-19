@@ -10,10 +10,12 @@ pub enum ObjectType {
     View,
     MaterializedView,
     Function,
+    Procedure,
     Type,
     Domain,
     Index,
     Trigger,
+    Comment,
 }
 
 impl fmt::Display for ObjectType {
@@ -23,10 +25,12 @@ impl fmt::Display for ObjectType {
             ObjectType::View => write!(f, "VIEW"),
             ObjectType::MaterializedView => write!(f, "MATERIALIZED VIEW"),
             ObjectType::Function => write!(f, "FUNCTION"),
+            ObjectType::Procedure => write!(f, "PROCEDURE"),
             ObjectType::Type => write!(f, "TYPE"),
             ObjectType::Domain => write!(f, "DOMAIN"),
             ObjectType::Index => write!(f, "INDEX"),
             ObjectType::Trigger => write!(f, "TRIGGER"),
+            ObjectType::Comment => write!(f, "COMMENT"),
         }
     }
 }
@@ -147,10 +151,17 @@ pub fn parse_sql_object(statement: &str) -> Result<Option<ParsedSqlObject>, Box<
                         let qualified_name = extract_function_name_from_list(&func_stmt.funcname)?;
                         let dependencies = extract_dependencies_from_parsed_with_sql(&parsed, statement)?;
                         
+                        // Check if this is actually a procedure (is_procedure field)
+                        let object_type = if func_stmt.is_procedure {
+                            ObjectType::Procedure
+                        } else {
+                            ObjectType::Function
+                        };
+                        
                         return Ok(Some(ParsedSqlObject {
                             statement: statement.to_string(),
                             parsed,
-                            object_type: ObjectType::Function,
+                            object_type,
                             qualified_name,
                             dependencies,
                             trigger_table: None,
@@ -227,6 +238,32 @@ pub fn parse_sql_object(statement: &str) -> Result<Option<ParsedSqlObject>, Box<
                             qualified_name,
                             dependencies,
                             trigger_table,
+                        }));
+                    }
+                    pg_query::NodeEnum::CommentStmt(comment_stmt) => {
+                        // Parse COMMENT ON statements
+                        let (qualified_name, comment_dependencies) = parse_comment_target(comment_stmt)?;
+                        let dependencies = extract_dependencies_from_parsed_with_sql(&parsed, statement)?;
+                        
+                        // Merge comment target dependencies with statement dependencies
+                        let mut merged_deps = dependencies;
+                        for rel in comment_dependencies.relations {
+                            merged_deps.relations.insert(rel);
+                        }
+                        for func in comment_dependencies.functions {
+                            merged_deps.functions.insert(func);
+                        }
+                        for typ in comment_dependencies.types {
+                            merged_deps.types.insert(typ);
+                        }
+                        
+                        return Ok(Some(ParsedSqlObject {
+                            statement: statement.to_string(),
+                            parsed,
+                            object_type: ObjectType::Comment,
+                            qualified_name,
+                            dependencies: merged_deps,
+                            trigger_table: None,
                         }));
                     }
                     _ => {}
@@ -344,6 +381,208 @@ fn normalize_ddl(ddl: &str) -> String {
         .join("\n")
 }
 
+/// Parse a COMMENT statement to extract target object and dependencies
+fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Result<(QualifiedIdent, Dependencies), Box<dyn std::error::Error>> {
+    use pg_query::protobuf::ObjectType as PgObjectType;
+    
+    let mut dependencies = Dependencies::default();
+    
+    match comment_stmt.objtype() {
+        PgObjectType::ObjectTable => {
+            // COMMENT ON TABLE schema.table_name
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::List(list) = node {
+                        let qualified_name = extract_name_from_node_list(&list.items)?;
+                        // Table comments depend on the table
+                        dependencies.relations.insert(qualified_name.clone());
+                        let comment_id = QualifiedIdent::new(
+                            qualified_name.schema.clone(),
+                            format!("table:{}", qualified_name.name)
+                        );
+                        return Ok((comment_id, dependencies));
+                    }
+                }
+            }
+        }
+        PgObjectType::ObjectColumn => {
+            // COMMENT ON COLUMN schema.table.column OR schema.type.field
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::List(list) = node {
+                        let parts = extract_column_parts_from_list(&list.items)?;
+                        let parent_name = QualifiedIdent::new(parts.0, parts.1);
+                        
+                        // For columns, we need to add dependency on both tables and types
+                        // since we can't tell from parsing alone whether it's a table or type
+                        dependencies.relations.insert(parent_name.clone());
+                        dependencies.types.insert(parent_name.clone());
+                        
+                        let comment_id = QualifiedIdent::new(
+                            parent_name.schema.clone(),
+                            format!("column:{}.{}", parent_name.name, parts.2)
+                        );
+                        return Ok((comment_id, dependencies));
+                    }
+                }
+            }
+        }
+        PgObjectType::ObjectFunction => {
+            // COMMENT ON FUNCTION schema.func_name(args)
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::ObjectWithArgs(func_with_args) = node {
+                        let qualified_name = extract_name_from_node_list(&func_with_args.objname)?;
+                        dependencies.functions.insert(qualified_name.clone());
+                        
+                        // Generate function signature for unique identification
+                        let signature = format_function_signature(&qualified_name, &func_with_args.objargs);
+                        let comment_id = QualifiedIdent::new(
+                            qualified_name.schema.clone(),
+                            format!("function:{}", signature)
+                        );
+                        return Ok((comment_id, dependencies));
+                    }
+                }
+            }
+        }
+        PgObjectType::ObjectType => {
+            // COMMENT ON TYPE schema.type_name
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::TypeName(type_name) = node {
+                        let qualified_name = extract_name_from_node_list(&type_name.names)?;
+                        dependencies.types.insert(qualified_name.clone());
+                        let comment_id = QualifiedIdent::new(
+                            qualified_name.schema.clone(),
+                            format!("type:{}", qualified_name.name)
+                        );
+                        return Ok((comment_id, dependencies));
+                    }
+                }
+            }
+        }
+        PgObjectType::ObjectTrigger => {
+            // COMMENT ON TRIGGER trigger_name ON table_name
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::List(list) = node {
+                        // For triggers, parse as [table_parts..., trigger_name]
+                        if list.items.len() >= 2 {
+                            // The trigger name is always the last element
+                            let trigger_name = extract_string_from_node(&list.items[list.items.len() - 1])?;
+                            
+                            // Table name elements are everything except the last
+                            let table_parts: Result<Vec<String>, _> = list.items[..list.items.len() - 1]
+                                .iter()
+                                .map(extract_string_from_node)
+                                .collect();
+                            let table_parts = table_parts?;
+                            
+                            // Parse table name (could be qualified)
+                            let table_qualified = match table_parts.len() {
+                                1 => QualifiedIdent::from_name(table_parts[0].clone()),
+                                2 => QualifiedIdent::new(Some(table_parts[0].clone()), table_parts[1].clone()),
+                                _ => return Err("Invalid table name in trigger comment".into()),
+                            };
+                            
+                            dependencies.relations.insert(table_qualified.clone());
+                            let comment_id = QualifiedIdent::new(
+                                None, // Triggers are not schema-qualified in comments
+                                format!("trigger:{}:{}", trigger_name, table_qualified.name)
+                            );
+                            
+                            return Ok((comment_id, dependencies));
+                        }
+                    }
+                }
+            }
+        }
+        PgObjectType::ObjectDomain => {
+            // COMMENT ON DOMAIN schema.domain_name
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::TypeName(type_name) = node {
+                        let qualified_name = extract_name_from_node_list(&type_name.names)?;
+                        dependencies.types.insert(qualified_name.clone()); // Domains are a type of type
+                        let comment_id = QualifiedIdent::new(
+                            qualified_name.schema.clone(),
+                            format!("domain:{}", qualified_name.name)
+                        );
+                        return Ok((comment_id, dependencies));
+                    }
+                }
+            }
+        }
+        _ => {
+            return Err(format!("Unsupported comment target type: {:?}", comment_stmt.objtype()).into());
+        }
+    }
+    
+    Err("Could not parse comment target".into())
+}
+
+/// Helper to extract column parts (schema, table, column) from a node list
+fn extract_column_parts_from_list(items: &[pg_query::protobuf::Node]) -> Result<(Option<String>, String, String), Box<dyn std::error::Error>> {
+    if items.len() < 2 {
+        return Err("Invalid column reference".into());
+    }
+    
+    // Extract table and column names
+    let table_name = extract_string_from_node(&items[0])?;
+    let column_name = extract_string_from_node(&items[1])?;
+    
+    // Check if there's a schema
+    let (schema, table) = if items.len() == 3 {
+        let schema = extract_string_from_node(&items[0])?;
+        let table = extract_string_from_node(&items[1])?;
+        let column = extract_string_from_node(&items[2])?;
+        return Ok((Some(schema), table, column));
+    } else {
+        (None, table_name)
+    };
+    
+    Ok((schema, table, column_name))
+}
+
+/// Helper to format function signature for unique identification
+fn format_function_signature(qualified_name: &QualifiedIdent, _args: &[pg_query::protobuf::Node]) -> String {
+    let base_name = match &qualified_name.schema {
+        Some(schema) => format!("{}.{}", schema, qualified_name.name),
+        None => qualified_name.name.clone(),
+    };
+    
+    // For now, we'll use a simplified approach without parsing full argument types
+    // In practice, PostgreSQL handles function overloading, but we've blocked that in pgmg
+    format!("{}()", base_name)
+}
+
+/// Helper to extract string value from a node
+fn extract_string_from_node(node: &pg_query::protobuf::Node) -> Result<String, Box<dyn std::error::Error>> {
+    if let Some(node_type) = &node.node {
+        if let pg_query::NodeEnum::String(string_node) = node_type {
+            return Ok(string_node.sval.clone());
+        }
+    }
+    Err("Node is not a string".into())
+}
+
+/// Helper to extract qualified name from a list of nodes
+fn extract_name_from_node_list(items: &[pg_query::protobuf::Node]) -> Result<QualifiedIdent, Box<dyn std::error::Error>> {
+    match items.len() {
+        1 => {
+            let name = extract_string_from_node(&items[0])?;
+            Ok(QualifiedIdent::from_name(name))
+        }
+        2 => {
+            let schema = extract_string_from_node(&items[0])?;
+            let name = extract_string_from_node(&items[1])?;
+            Ok(QualifiedIdent::new(Some(schema), name))
+        }
+        _ => Err("Invalid qualified name".into()),
+    }
+}
+
 /// Calculate hash for DDL statement for change detection
 pub fn calculate_ddl_hash(ddl: &str) -> String {
     let normalized = normalize_ddl_for_hashing(ddl);
@@ -430,6 +669,44 @@ mod tests {
         let obj = result.unwrap();
         assert_eq!(obj.object_type, ObjectType::Function);
         assert_eq!(obj.qualified_name.name, "calculate_total");
+    }
+
+    #[test]
+    fn test_identify_create_procedure() {
+        let sql = r#"
+        CREATE PROCEDURE process_data(batch_size INT) 
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            PERFORM process_batch(batch_size);
+            COMMIT;
+        END;
+        $$;
+        "#;
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Procedure);
+        assert_eq!(obj.qualified_name.name, "process_data");
+    }
+
+    #[test]
+    fn test_identify_qualified_procedure() {
+        let sql = r#"
+        CREATE OR REPLACE PROCEDURE api.update_stats() 
+        LANGUAGE plpgsql AS $$
+        BEGIN
+            UPDATE stats SET last_run = NOW();
+        END;
+        $$;
+        "#;
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Procedure);
+        assert_eq!(obj.qualified_name.name, "update_stats");
+        assert_eq!(obj.qualified_name.schema, Some("api".to_string()));
     }
 
     #[test]
@@ -579,5 +856,200 @@ mod tests {
         let obj = result.unwrap();
         assert_eq!(obj.object_type, ObjectType::Function);
         assert_eq!(obj.qualified_name.name, "process_shipment_cancellation");
+    }
+    
+    #[test]
+    fn test_comment_on_table() {
+        let sql = "COMMENT ON TABLE users IS 'User account information'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "table:users");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the table
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::from_name("users".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_qualified_table() {
+        let sql = "COMMENT ON TABLE api.users IS 'API user table'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "table:users");
+        assert_eq!(obj.qualified_name.schema, Some("api".to_string()));
+        
+        // Should have dependency on the qualified table
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::new(Some("api".to_string()), "users".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_column() {
+        let sql = "COMMENT ON COLUMN users.email IS 'User email address'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "column:users.email");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the table (and potentially type)
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::from_name("users".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_qualified_column() {
+        let sql = "COMMENT ON COLUMN api.users.email IS 'User email in API schema'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "column:users.email");
+        assert_eq!(obj.qualified_name.schema, Some("api".to_string()));
+        
+        // Should have dependency on the qualified table
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::new(Some("api".to_string()), "users".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_type_field() {
+        let sql = "COMMENT ON COLUMN address.street IS 'Street address field'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "column:address.street");
+        
+        // Should have dependency on both relations and types (since we can't distinguish)
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::from_name("address".to_string())));
+        assert!(obj.dependencies.types.contains(&QualifiedIdent::from_name("address".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_function() {
+        let sql = "COMMENT ON FUNCTION get_user_stats() IS 'Calculates user statistics'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "function:get_user_stats()");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the function
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::from_name("get_user_stats".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_qualified_function() {
+        let sql = "COMMENT ON FUNCTION api.get_user_stats() IS 'API function for user stats'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "function:api.get_user_stats()");
+        assert_eq!(obj.qualified_name.schema, Some("api".to_string()));
+        
+        // Should have dependency on the qualified function
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::new(Some("api".to_string()), "get_user_stats".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_type() {
+        let sql = "COMMENT ON TYPE address IS 'Address composite type'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "type:address");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the type
+        assert!(obj.dependencies.types.contains(&QualifiedIdent::from_name("address".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_domain() {
+        let sql = "COMMENT ON DOMAIN email_address IS 'Valid email address domain'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "domain:email_address");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the domain (as a type)
+        assert!(obj.dependencies.types.contains(&QualifiedIdent::from_name("email_address".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_trigger() {
+        let sql = "COMMENT ON TRIGGER update_timestamp ON users IS 'Updates timestamp on row changes'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "trigger:update_timestamp:users");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the table
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::from_name("users".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_qualified_trigger() {
+        let sql = "COMMENT ON TRIGGER update_stats ON api.users IS 'API trigger for stats'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "trigger:update_stats:users");
+        assert!(obj.qualified_name.schema.is_none()); // Triggers themselves are not schema-qualified in comments
+        
+        // Should have dependency on the qualified table
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::new(Some("api".to_string()), "users".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_with_multiline_text() {
+        let sql = r#"COMMENT ON FUNCTION calculate_total(DECIMAL, DECIMAL) IS $$
+        Calculates the total amount including tax.
+        
+        Parameters:
+        - base: Base amount
+        - tax: Tax amount
+        
+        Returns: Total amount
+        $$"#;
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "function:calculate_total()");
+        
+        // Should have dependency on the function
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::from_name("calculate_total".to_string())));
+    }
+    
+    #[test]
+    fn test_non_comment_statement() {
+        let sql = "SELECT * FROM users";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_none()); // Not a DDL statement we track
     }
 }

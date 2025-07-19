@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "pgmg"
 path = "src/main.rs"
 
+[features]
+default = []
+tls = ["tokio-postgres-rustls", "rustls", "webpki-roots", "rustls-pemfile"]
+
 [dependencies]
 tokio = { version = "1.46.1", features = ["full"] }
 tokio-postgres = { version = "0.7.13" }
@@ -34,6 +38,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "fmt"]
 color-eyre = "0.6"
 console = "0.15"
 owo-colors = "4.0"
+tap_parser = "0.1"
+
+# Optional TLS dependencies
+tokio-postgres-rustls = { version = "0.12", optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
+webpki-roots = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

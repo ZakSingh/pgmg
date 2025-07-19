@@ -76,10 +76,10 @@ impl DependencyGraph {
             
             // Add edges for function dependencies
             for dep in &filtered_deps.functions {
-                // Function dependencies should only match functions
+                // Function dependencies can match both functions and procedures
                 if let Some(dep_obj) = objects.iter().find(|o| 
                     &o.qualified_name == dep && 
-                    o.object_type == ObjectType::Function
+                    matches!(o.object_type, ObjectType::Function | ObjectType::Procedure)
                 ) {
                     let dep_ref = ObjectRef {
                         object_type: dep_obj.object_type.clone(),
@@ -237,11 +237,13 @@ impl DependencyGraph {
                 ObjectType::Table => ("lightcyan", "rect"),
                 ObjectType::View => ("lightblue", "box"),
                 ObjectType::MaterializedView => ("darkblue", "box3d"),
-                ObjectType::Function => ("lightgreen", "ellipse"), 
+                ObjectType::Function => ("lightgreen", "ellipse"),
+                ObjectType::Procedure => ("darkgreen", "ellipse"),
                 ObjectType::Type => ("lightyellow", "diamond"),
                 ObjectType::Domain => ("lightcoral", "hexagon"),
                 ObjectType::Index => ("lightgray", "trapezium"),
                 ObjectType::Trigger => ("lightpink", "invtriangle"),
+                ObjectType::Comment => ("lavender", "note"),
             };
 
             // Create unique node ID that includes object type to avoid conflicts

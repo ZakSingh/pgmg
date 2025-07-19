@@ -31,6 +31,13 @@ fn scan_directory_recursive(
             // Recursively scan subdirectories
             scan_directory_recursive(&path, sql_objects, builtin_catalog, _base_path)?;
         } else if path.extension().and_then(|s| s.to_str()) == Some("sql") {
+            // Skip test files - they should not be treated as database objects
+            if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+                if file_name.contains(".test.") {
+                    continue;
+                }
+            }
+            
             // Process .sql files
             if let Err(e) = process_sql_file(&path, sql_objects, builtin_catalog, _base_path) {
                 eprintln!("Warning: Failed to process {}: {}", path.display(), e);
@@ -130,6 +137,47 @@ mod tests {
         
         let objects = scan_sql_files(temp_dir.path(), &builtin_catalog).await.unwrap();
         assert!(objects.is_empty());
+    }
+    
+    #[tokio::test]
+    async fn test_scan_sql_files_excludes_test_files() {
+        let temp_dir = tempdir().unwrap();
+        let code_dir = temp_dir.path();
+        
+        // Create various SQL files
+        fs::write(code_dir.join("create_table.sql"), "CREATE TABLE users (id SERIAL);").unwrap();
+        fs::write(code_dir.join("create_function.sql"), "CREATE FUNCTION get_user() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;").unwrap();
+        fs::write(code_dir.join("users.test.sql"), "BEGIN; SELECT plan(1); SELECT pass('test'); SELECT * FROM finish(); ROLLBACK;").unwrap();
+        fs::write(code_dir.join("another.test.sql"), "BEGIN; SELECT plan(2); SELECT ok(true); SELECT ok(false); SELECT * FROM finish(); ROLLBACK;").unwrap();
+        
+        // Create a subdirectory with more files
+        let sub_dir = code_dir.join("functions");
+        fs::create_dir(&sub_dir).unwrap();
+        fs::write(sub_dir.join("helper.sql"), "CREATE FUNCTION helper() RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;").unwrap();
+        fs::write(sub_dir.join("helper.test.sql"), "BEGIN; SELECT plan(1); SELECT is(helper(), 1); SELECT * FROM finish(); ROLLBACK;").unwrap();
+        
+        let builtin_catalog = BuiltinCatalog::new();
+        let sql_objects = scan_sql_files(code_dir, &builtin_catalog).await.unwrap();
+        
+        // Should have found 3 SQL objects (excluding the 3 test files)
+        assert_eq!(sql_objects.len(), 3);
+        
+        // Verify none of the objects are from test files
+        for obj in &sql_objects {
+            if let Some(source_file) = &obj.source_file {
+                let file_name = source_file.file_name().unwrap().to_str().unwrap();
+                assert!(!file_name.contains(".test."), "Test file {} was incorrectly included", file_name);
+            }
+        }
+        
+        // Verify we found the correct objects
+        let object_names: Vec<String> = sql_objects.iter()
+            .map(|obj| obj.qualified_name.name.clone())
+            .collect();
+        
+        assert!(object_names.contains(&"users".to_string()));
+        assert!(object_names.contains(&"get_user".to_string()));
+        assert!(object_names.contains(&"helper".to_string()));
     }
 
     #[tokio::test]

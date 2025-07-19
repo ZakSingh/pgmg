@@ -3,6 +3,7 @@ mod common;
 use common::{TestEnvironment, assertions::*, fixtures};
 use pgmg::commands::{execute_plan, execute_apply};
 use pgmg::sql::ObjectType;
+use pgmg::config::PgmgConfig;
 use indoc::indoc;
 
 #[tokio::test]
@@ -31,6 +32,7 @@ async fn test_e2e_plan_apply_plan_workflow() -> Result<(), Box<dyn std::error::E
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&apply_result);
@@ -66,6 +68,7 @@ async fn test_e2e_incremental_changes() -> Result<(), Box<dyn std::error::Error>
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&apply1);
@@ -101,6 +104,7 @@ async fn test_e2e_incremental_changes() -> Result<(), Box<dyn std::error::Error>
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&apply2);
@@ -138,6 +142,7 @@ async fn test_e2e_object_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         None,
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_objects_created(&apply1, &["active_users"]);
@@ -155,6 +160,7 @@ async fn test_e2e_object_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         None,
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_objects_updated(&apply2, &["active_users"]);
@@ -167,6 +173,7 @@ async fn test_e2e_object_lifecycle() -> Result<(), Box<dyn std::error::Error>> {
         None,
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_objects_deleted(&apply3, &["active_users"]);
@@ -219,6 +226,7 @@ async fn test_e2e_complex_dependency_chain() -> Result<(), Box<dyn std::error::E
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&apply);
@@ -280,6 +288,7 @@ async fn test_e2e_migration_and_dependent_objects() -> Result<(), Box<dyn std::e
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&apply);
@@ -313,6 +322,7 @@ async fn test_e2e_error_recovery() -> Result<(), Box<dyn std::error::Error>> {
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&apply1);
@@ -328,6 +338,7 @@ async fn test_e2e_error_recovery() -> Result<(), Box<dyn std::error::Error>> {
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await;
     
     assert!(apply2.is_err());
@@ -342,6 +353,7 @@ async fn test_e2e_error_recovery() -> Result<(), Box<dyn std::error::Error>> {
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&apply3);

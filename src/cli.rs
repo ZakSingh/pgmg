@@ -93,6 +93,36 @@ pub enum Commands {
         #[arg(long)]
         force: bool,
     },
+    
+    /// Run pgTAP tests
+    Test {
+        /// Path to test file or directory (searches for *.test.sql files)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+        
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
+        
+        /// Show raw TAP output instead of formatted results
+        #[arg(long)]
+        tap_output: bool,
+        
+        /// Continue running tests after failures
+        #[arg(long)]
+        continue_on_failure: bool,
+    },
+    
+    /// Execute seed SQL files in alphanumeric order
+    Seed {
+        /// Directory containing seed SQL files
+        #[arg(long)]
+        seed_dir: Option<PathBuf>,
+        
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
+    },
 }
 
 impl Cli {
@@ -215,6 +245,68 @@ mod tests {
                 assert_eq!(force, true);
             }
             _ => panic!("Expected Reset command"),
+        }
+    }
+
+    #[test]
+    fn test_test_command_parsing() {
+        let args = vec![
+            "pgmg",
+            "test",
+            "tests/",
+            "--connection-string", "postgresql://localhost/test_db",
+            "--tap-output",
+            "--continue-on-failure"
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        match cli.command {
+            Commands::Test { path, connection_string, tap_output, continue_on_failure } => {
+                assert_eq!(path, Some(PathBuf::from("tests/")));
+                assert_eq!(connection_string, Some("postgresql://localhost/test_db".to_string()));
+                assert_eq!(tap_output, true);
+                assert_eq!(continue_on_failure, true);
+            }
+            _ => panic!("Expected Test command"),
+        }
+    }
+
+    #[test]
+    fn test_seed_command_parsing() {
+        let args = vec![
+            "pgmg",
+            "seed",
+            "--seed-dir", "/path/to/seeds",
+            "--connection-string", "postgresql://localhost/test_db"
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        match cli.command {
+            Commands::Seed { seed_dir, connection_string } => {
+                assert_eq!(seed_dir, Some(PathBuf::from("/path/to/seeds")));
+                assert_eq!(connection_string, Some("postgresql://localhost/test_db".to_string()));
+            }
+            _ => panic!("Expected Seed command"),
+        }
+    }
+
+    #[test]
+    fn test_seed_command_minimal() {
+        let args = vec![
+            "pgmg",
+            "seed",
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        match cli.command {
+            Commands::Seed { seed_dir, connection_string } => {
+                assert_eq!(seed_dir, None);
+                assert_eq!(connection_string, None);
+            }
+            _ => panic!("Expected Seed command"),
         }
     }
 }

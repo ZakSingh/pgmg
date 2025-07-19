@@ -98,10 +98,12 @@ impl<'a> StateManager<'a> {
                 "view" => ObjectType::View,
                 "materialized_view" => ObjectType::MaterializedView,
                 "function" => ObjectType::Function,
+                "procedure" => ObjectType::Procedure,
                 "type" => ObjectType::Type,
                 "domain" => ObjectType::Domain,
                 "index" => ObjectType::Index,
                 "trigger" => ObjectType::Trigger,
+                "comment" => ObjectType::Comment,
                 _ => continue, // Skip unknown types
             };
 
@@ -131,10 +133,12 @@ impl<'a> StateManager<'a> {
             ObjectType::View => "view",
             ObjectType::MaterializedView => "materialized_view",
             ObjectType::Function => "function",
+            ObjectType::Procedure => "procedure",
             ObjectType::Type => "type",
             ObjectType::Domain => "domain",
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
+            ObjectType::Comment => "comment",
         };
 
         let qualified_name = match &object_name.schema {
@@ -166,10 +170,12 @@ impl<'a> StateManager<'a> {
             ObjectType::View => "view",
             ObjectType::MaterializedView => "materialized_view",
             ObjectType::Function => "function",
+            ObjectType::Procedure => "procedure",
             ObjectType::Type => "type",
             ObjectType::Domain => "domain",
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
+            ObjectType::Comment => "comment",
         };
 
         let qualified_name = match &object_name.schema {
@@ -196,10 +202,12 @@ impl<'a> StateManager<'a> {
             ObjectType::View => "view",
             ObjectType::MaterializedView => "materialized_view",
             ObjectType::Function => "function",
+            ObjectType::Procedure => "procedure",
             ObjectType::Type => "type",
             ObjectType::Domain => "domain",
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
+            ObjectType::Comment => "comment",
         };
 
         let qualified_name = match &object_name.schema {
@@ -250,10 +258,12 @@ mod tests {
             ObjectType::View => "view",
             ObjectType::MaterializedView => "materialized_view",
             ObjectType::Function => "function",
+            ObjectType::Procedure => "procedure",
             ObjectType::Type => "type",
             ObjectType::Domain => "domain",
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
+            ObjectType::Comment => "comment",
         };
         
         assert_eq!(type_str, "view");

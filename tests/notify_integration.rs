@@ -8,6 +8,7 @@ fn test_notification_json_format() {
         object_type: "function".to_string(),
         schema: Some("api".to_string()),
         name: "get_user".to_string(),
+        oid: None,
         file: Some("/sql/functions.sql".to_string()),
         span: Some(LineSpan {
             start_line: 42,

@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod logging;
 pub mod notify;
+pub mod plpgsql_check;
 
 // Re-export key public APIs for convenience
 pub use builtin_catalog::BuiltinCatalog;
