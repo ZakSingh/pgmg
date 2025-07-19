@@ -1,6 +1,7 @@
 use tokio_postgres::{Client, Connection, Socket, NoTls, tls::NoTlsStream};
 use std::env;
 
+#[derive(Clone)]
 pub struct DatabaseConfig {
     pub host: String,
     pub port: u16,

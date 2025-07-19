@@ -59,19 +59,47 @@ impl DependencyGraph {
                 builtin_catalog
             );
             
-            // Add edges for all dependencies
-            for dep in filtered_deps.relations.iter()
-                .chain(filtered_deps.functions.iter())
-                .chain(filtered_deps.types.iter()) {
-                
-                // Find matching object in our set
-                if let Some(dep_obj) = objects.iter().find(|o| &o.qualified_name == dep) {
+            // Add edges for relation dependencies
+            for dep in &filtered_deps.relations {
+                // Relations could be tables, views, or materialized views
+                if let Some(dep_obj) = objects.iter().find(|o| 
+                    &o.qualified_name == dep && 
+                    matches!(o.object_type, ObjectType::Table | ObjectType::View | ObjectType::MaterializedView)
+                ) {
                     let dep_ref = ObjectRef {
                         object_type: dep_obj.object_type.clone(),
                         qualified_name: dep_obj.qualified_name.clone(),
                     };
-                    
-                    // Add dependency edge (dep_obj -> obj)
+                    graph.add_edge(dep_ref, obj_ref.clone(), DependencyType::Hard)?;
+                }
+            }
+            
+            // Add edges for function dependencies
+            for dep in &filtered_deps.functions {
+                // Function dependencies should only match functions
+                if let Some(dep_obj) = objects.iter().find(|o| 
+                    &o.qualified_name == dep && 
+                    o.object_type == ObjectType::Function
+                ) {
+                    let dep_ref = ObjectRef {
+                        object_type: dep_obj.object_type.clone(),
+                        qualified_name: dep_obj.qualified_name.clone(),
+                    };
+                    graph.add_edge(dep_ref, obj_ref.clone(), DependencyType::Hard)?;
+                }
+            }
+            
+            // Add edges for type dependencies
+            for dep in &filtered_deps.types {
+                // Type dependencies can be satisfied by types, domains, or views (used as composite types)
+                if let Some(dep_obj) = objects.iter().find(|o| 
+                    &o.qualified_name == dep && 
+                    matches!(o.object_type, ObjectType::Type | ObjectType::Domain | ObjectType::View | ObjectType::Table)
+                ) {
+                    let dep_ref = ObjectRef {
+                        object_type: dep_obj.object_type.clone(),
+                        qualified_name: dep_obj.qualified_name.clone(),
+                    };
                     graph.add_edge(dep_ref, obj_ref.clone(), DependencyType::Hard)?;
                 }
             }
@@ -208,6 +236,7 @@ impl DependencyGraph {
             let (color, shape) = match obj_ref.object_type {
                 ObjectType::Table => ("lightcyan", "rect"),
                 ObjectType::View => ("lightblue", "box"),
+                ObjectType::MaterializedView => ("darkblue", "box3d"),
                 ObjectType::Function => ("lightgreen", "ellipse"), 
                 ObjectType::Type => ("lightyellow", "diamond"),
                 ObjectType::Domain => ("lightcoral", "hexagon"),
@@ -215,9 +244,12 @@ impl DependencyGraph {
                 ObjectType::Trigger => ("lightpink", "invtriangle"),
             };
 
+            // Create unique node ID that includes object type to avoid conflicts
+            let node_id = format!("{}::{}", format!("{:?}", obj_ref.object_type), qualified_name);
+            
             output.push_str(&format!(
                 "  \"{}\" [label=\"{}\\n({})\", fillcolor={}, style=\"filled,rounded\", shape={}];\n",
-                qualified_name,
+                node_id,
                 qualified_name,
                 format!("{:?}", obj_ref.object_type).to_lowercase(),
                 color,
@@ -243,6 +275,10 @@ impl DependencyGraph {
                     Some(schema) => format!("{}.{}", schema, target_obj.qualified_name.name),
                     None => target_obj.qualified_name.name.clone(),
                 };
+                
+                // Create unique node IDs that include object type
+                let source_id = format!("{}::{}", format!("{:?}", source_obj.object_type), source_name);
+                let target_id = format!("{}::{}", format!("{:?}", target_obj.object_type), target_name);
 
                 let edge_style = match edge_data {
                     DependencyType::Hard => "solid",
@@ -251,7 +287,7 @@ impl DependencyGraph {
 
                 output.push_str(&format!(
                     "  \"{}\" -> \"{}\" [style={}];\n",
-                    source_name, target_name, edge_style
+                    source_id, target_id, edge_style
                 ));
             }
         }
@@ -294,6 +330,7 @@ mod tests {
         let ddl = format!("CREATE {} {}", 
             match &object_type {
                 ObjectType::View => "VIEW",
+                ObjectType::MaterializedView => "MATERIALIZED VIEW",
                 ObjectType::Function => "FUNCTION", 
                 ObjectType::Type => "TYPE",
                 _ => "OBJECT",

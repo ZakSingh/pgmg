@@ -62,8 +62,10 @@ fn process_sql_file(
     // Identify objects in each statement
     for statement in statements {
         if let Some(mut object) = identify_sql_object(&statement.sql)? {
-            // Set the file path for the object
+            // Set the file path and line numbers for the object
             object.source_file = Some(file_path.to_path_buf());
+            object.start_line = statement.start_line;
+            object.end_line = statement.end_line;
             sql_objects.push(object);
         }
     }

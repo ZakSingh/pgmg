@@ -1434,6 +1434,7 @@ dependencies = [
  "indoc",
  "notify",
  "once_cell",
+ "owo-colors",
  "petgraph 0.6.5",
  "pg_query",
  "postgres-types",

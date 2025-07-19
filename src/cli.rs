@@ -50,6 +50,10 @@ pub enum Commands {
         /// PostgreSQL connection string
         #[arg(long)]
         connection_string: Option<String>,
+        
+        /// Enable development mode (includes NOTIFY events)
+        #[arg(long)]
+        dev: bool,
     },
     
     /// Watch for file changes and automatically reload (development mode)
@@ -73,6 +77,21 @@ pub enum Commands {
         /// Disable automatic apply after detecting changes
         #[arg(long)]
         no_auto_apply: bool,
+        
+        /// Enable development mode (includes NOTIFY events)
+        #[arg(long)]
+        dev: bool,
+    },
+    
+    /// Reset database (drop and recreate from scratch)
+    Reset {
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
+        
+        /// Skip confirmation prompt (dangerous!)
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -120,10 +139,11 @@ mod tests {
         let cli = Cli::try_parse_from(args).unwrap();
         
         match cli.command {
-            Commands::Apply { migrations_dir, code_dir, connection_string } => {
+            Commands::Apply { migrations_dir, code_dir, connection_string, dev } => {
                 assert_eq!(migrations_dir, None);
                 assert_eq!(code_dir, Some(PathBuf::from("/path/to/sql")));
                 assert_eq!(connection_string, None);
+                assert_eq!(dev, false);
             }
             _ => panic!("Expected Apply command"),
         }
@@ -144,12 +164,13 @@ mod tests {
         let cli = Cli::try_parse_from(args).unwrap();
         
         match cli.command {
-            Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply } => {
+            Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply, dev } => {
                 assert_eq!(migrations_dir, Some(PathBuf::from("/path/to/migrations")));
                 assert_eq!(code_dir, Some(PathBuf::from("/path/to/sql")));
                 assert_eq!(connection_string, Some("postgresql://localhost/db".to_string()));
                 assert_eq!(debounce_ms, 1000);
                 assert_eq!(no_auto_apply, true);
+                assert_eq!(dev, false);
             }
             _ => panic!("Expected Watch command"),
         }
@@ -174,6 +195,26 @@ mod tests {
                 assert_eq!(output_graph, Some(PathBuf::from("/path/to/graph.dot")));
             }
             _ => panic!("Expected Plan command"),
+        }
+    }
+
+    #[test]
+    fn test_reset_command_parsing() {
+        let args = vec![
+            "pgmg",
+            "reset",
+            "--connection-string", "postgresql://localhost/test_db",
+            "--force"
+        ];
+        
+        let cli = Cli::try_parse_from(args).unwrap();
+        
+        match cli.command {
+            Commands::Reset { connection_string, force } => {
+                assert_eq!(connection_string, Some("postgresql://localhost/test_db".to_string()));
+                assert_eq!(force, true);
+            }
+            _ => panic!("Expected Reset command"),
         }
     }
 }
