@@ -2,6 +2,7 @@ mod common;
 
 use common::{TestEnvironment, assertions::*, fixtures};
 use pgmg::commands::execute_apply;
+use pgmg::config::PgmgConfig;
 use indoc::indoc;
 
 #[tokio::test]
@@ -17,6 +18,7 @@ async fn test_apply_new_migrations() -> Result<(), Box<dyn std::error::Error>> {
         Some(env.migrations_dir.clone()),
         None,
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     // Assertions
@@ -48,6 +50,7 @@ async fn test_apply_idempotency() -> Result<(), Box<dyn std::error::Error>> {
         Some(env.migrations_dir.clone()),
         None,
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&result1);
@@ -58,6 +61,7 @@ async fn test_apply_idempotency() -> Result<(), Box<dyn std::error::Error>> {
         Some(env.migrations_dir.clone()),
         None,
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&result2);
@@ -88,6 +92,7 @@ async fn test_apply_creates_sql_objects() -> Result<(), Box<dyn std::error::Erro
         None,
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     // Assertions
@@ -138,6 +143,7 @@ async fn test_apply_updates_modified_objects() -> Result<(), Box<dyn std::error:
         None,
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     // Assertions
@@ -189,6 +195,7 @@ async fn test_apply_deletes_removed_objects() -> Result<(), Box<dyn std::error::
         None,
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     // Assertions
@@ -220,6 +227,7 @@ async fn test_apply_rollback_on_migration_error() -> Result<(), Box<dyn std::err
         Some(env.migrations_dir.clone()),
         None,
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await;
     
     // Should have failed
@@ -252,6 +260,7 @@ async fn test_apply_rollback_on_object_error() -> Result<(), Box<dyn std::error:
         None,
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await;
     
     // Should have failed
@@ -286,6 +295,7 @@ async fn test_apply_with_complex_dependencies() -> Result<(), Box<dyn std::error
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     // Assertions
@@ -320,6 +330,7 @@ async fn test_apply_mixed_migrations_and_objects() -> Result<(), Box<dyn std::er
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     // Assertions
@@ -350,6 +361,7 @@ async fn test_apply_twice_is_idempotent() -> Result<(), Box<dyn std::error::Erro
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&result1);
@@ -361,6 +373,7 @@ async fn test_apply_twice_is_idempotent() -> Result<(), Box<dyn std::error::Erro
         Some(env.migrations_dir.clone()),
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
+        &PgmgConfig::default(),
     ).await?;
     
     assert_apply_successful(&result2);

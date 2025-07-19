@@ -1,7 +1,7 @@
 use tokio_postgres::NoTls;
 use pgmg::{analyze_statement, filter_builtins, BuiltinCatalog, DependencyGraph};
 use pgmg::cli::{Cli, Commands};
-use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig, execute_reset, print_reset_summary};
+use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig, execute_reset, print_reset_summary, execute_test, print_test_summary, execute_seed, print_seed_summary};
 use pgmg::config::PgmgConfig;
 use pgmg::error::{PgmgError, Result};
 use pgmg::logging;
@@ -231,6 +231,98 @@ async fn run(cli: Cli) -> Result<()> {
                 .map_err(|e| PgmgError::Other(format!("Reset failed: {}", e)))?;
             
             print_reset_summary(&result);
+            Ok(())
+        }
+        Commands::Test { path, connection_string, tap_output, continue_on_failure } => {
+            logging::output::header("Running pgTAP Tests");
+            
+            // Get connection string from CLI arg, config file, or environment
+            let conn_str = connection_string
+                .or_else(|| config_file.as_ref().and_then(|c| c.connection_string.clone()))
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .ok_or_else(|| PgmgError::Configuration(
+                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
+                ))?;
+            
+            // Validate connection string format
+            if !conn_str.starts_with("postgres://") && !conn_str.starts_with("postgresql://") {
+                return Err(PgmgError::InvalidConnectionString(conn_str));
+            }
+            
+            // Log configuration (with masked credentials)
+            debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
+            debug!("Test path: {:?}", path);
+            debug!("TAP output: {}", tap_output);
+            debug!("Continue on failure: {}", continue_on_failure);
+            
+            // Execute tests
+            let result = execute_test(path, conn_str, tap_output, continue_on_failure).await
+                .map_err(|e| PgmgError::Other(format!("Test execution failed: {}", e)))?;
+            
+            print_test_summary(&result);
+            
+            // Exit with non-zero code if tests failed
+            if result.tests_failed > 0 {
+                std::process::exit(1);
+            }
+            
+            Ok(())
+        }
+        
+        Commands::Seed { seed_dir, connection_string } => {
+            logging::output::header("Executing Seed Files");
+            
+            // Merge CLI args with config file
+            let merged_config = PgmgConfig::merge_with_cli_seed(
+                config_file,
+                seed_dir,
+                connection_string,
+            );
+            
+            // Require connection string
+            let conn_str = merged_config.connection_string.clone()
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .ok_or_else(|| PgmgError::Configuration(
+                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
+                ))?;
+            
+            // Validate connection string format
+            if !conn_str.starts_with("postgres://") && !conn_str.starts_with("postgresql://") {
+                return Err(PgmgError::InvalidConnectionString(conn_str));
+            }
+            
+            // Require seed directory
+            let seed_directory = merged_config.seed_dir
+                .ok_or_else(|| PgmgError::Configuration(
+                    "No seed directory provided. Use --seed-dir or specify seed_dir in pgmg.toml".to_string()
+                ))?;
+            
+            // Validate seed directory exists
+            if !seed_directory.exists() {
+                return Err(PgmgError::Configuration(
+                    format!("Seed directory does not exist: {}", seed_directory.display())
+                ));
+            }
+            
+            if !seed_directory.is_dir() {
+                return Err(PgmgError::Configuration(
+                    format!("Seed path is not a directory: {}", seed_directory.display())
+                ));
+            }
+            
+            // Log configuration (with masked credentials)
+            debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
+            debug!("Seed directory: {}", seed_directory.display());
+            
+            // Execute seed with progress tracking
+            let start = std::time::Instant::now();
+            let result = execute_seed(seed_directory, conn_str).await
+                .map_err(|e| PgmgError::Other(format!("Seed execution failed: {}", e)))?;
+            
+            let elapsed = start.elapsed();
+            info!("Seed completed in {}", logging::format_duration(elapsed));
+            
+            print_seed_summary(&result);
             Ok(())
         }
     }

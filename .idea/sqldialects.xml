@@ -17,6 +17,8 @@
     <file url="file://$PROJECT_DIR$/migrations/11_wishlist.sql" dialect="PostgreSQL" />
     <file url="file://$PROJECT_DIR$/migrations/13_image.sql" dialect="PostgreSQL" />
     <file url="file://$PROJECT_DIR$/sql/api/account/contact.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/sql/api/get_account_by_id.sql" dialect="PostgreSQL" />
+    <file url="file://$PROJECT_DIR$/sql/api/purchase/orders.sql" dialect="PostgreSQL" />
     <file url="PROJECT" dialect="PostgreSQL" />
   </component>
 </project>

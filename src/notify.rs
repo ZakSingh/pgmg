@@ -7,6 +7,7 @@ pub struct ObjectLoadedNotification {
     pub object_type: String,
     pub schema: Option<String>,
     pub name: String,
+    pub oid: Option<u32>,
     pub file: Option<String>,
     pub span: Option<LineSpan>,
 }
@@ -24,10 +25,12 @@ impl ObjectLoadedNotification {
             ObjectType::View => "view",
             ObjectType::MaterializedView => "materialized_view",
             ObjectType::Function => "function",
+            ObjectType::Procedure => "procedure",
             ObjectType::Type => "type",
             ObjectType::Domain => "domain",
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
+            ObjectType::Comment => "comment",
         }.to_string();
         
         let span = match (obj.start_line, obj.end_line) {
@@ -42,6 +45,7 @@ impl ObjectLoadedNotification {
             object_type,
             schema: obj.qualified_name.schema.clone(),
             name: obj.qualified_name.name.clone(),
+            oid: None,  // Will be set after object creation
             file: obj.source_file.as_ref().map(|p| p.to_string_lossy().to_string()),
             span,
         }
@@ -97,6 +101,7 @@ mod tests {
         assert_eq!(notification.object_type, "function");
         assert_eq!(notification.schema, Some("api".to_string()));
         assert_eq!(notification.name, "get_user");
+        assert_eq!(notification.oid, None);
         assert_eq!(notification.file, Some("/path/to/functions.sql".to_string()));
         assert!(notification.span.is_some());
         
@@ -111,6 +116,7 @@ mod tests {
             object_type: "view".to_string(),
             schema: Some("public".to_string()),
             name: "user_stats".to_string(),
+            oid: None,
             file: Some("/sql/views.sql".to_string()),
             span: Some(LineSpan {
                 start_line: 10,
@@ -142,11 +148,13 @@ mod tests {
         assert_eq!(notification.object_type, "table");
         assert_eq!(notification.schema, None);
         assert_eq!(notification.name, "users");
+        assert_eq!(notification.oid, None);
         assert_eq!(notification.file, None);
         assert_eq!(notification.span, None);
         
         let json = notification.to_json().unwrap();
         assert!(json.contains(r#""schema":null"#));
+        assert!(json.contains(r#""oid":null"#));
         assert!(json.contains(r#""file":null"#));
         assert!(json.contains(r#""span":null"#));
     }

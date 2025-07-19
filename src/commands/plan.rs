@@ -5,6 +5,7 @@ use crate::sql::{SqlObject, ObjectType, objects::calculate_ddl_hash};
 use crate::analysis::{DependencyGraph, ObjectRef};
 use crate::BuiltinCatalog;
 use owo_colors::OwoColorize;
+use tracing::debug;
 
 #[derive(Debug)]
 pub struct PlanResult {
@@ -46,11 +47,7 @@ pub async fn execute_plan(
     let (client, connection) = connect_with_url(&connection_string).await?;
     
     // Spawn connection handler
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("Database connection error: {}", e);
-        }
-    });
+    connection.spawn();
 
     // Initialize state tracking
     let state_manager = StateManager::new(&client);
@@ -86,6 +83,10 @@ pub async fn execute_plan(
     // Step 2: Analyze code directory for object changes
     if let Some(code_dir) = &code_dir {
         let file_objects = scan_sql_files(code_dir, &builtin_catalog).await?;
+        
+        // Check for duplicate function names in files (no overloading allowed)
+        validate_no_function_overloading_in_files(&file_objects)?;
+        
         let db_objects = state_manager.get_tracked_objects().await?;
         
         let mut object_changes = detect_object_changes(&file_objects, &db_objects).await?;
@@ -106,19 +107,19 @@ pub async fn execute_plan(
                 .collect();
             
             if !updated_objects.is_empty() {
-                eprintln!("DEBUG: Looking for objects affected by {} updates", updated_objects.len());
+                debug!("Looking for objects affected by {} updates", updated_objects.len());
                 for obj in &updated_objects {
-                    eprintln!("  - {:?}: {}", obj.object_type, format_qualified_name(&obj.qualified_name));
+                    debug!("  - {:?}: {}", obj.object_type, format_qualified_name(&obj.qualified_name));
                     let deps = graph.dependents_of(obj);
-                    eprintln!("    Direct dependents: {}", deps.len());
+                    debug!("    Direct dependents: {}", deps.len());
                     for dep in &deps {
-                        eprintln!("      -> {:?}: {}", dep.object_type, format_qualified_name(&dep.qualified_name));
+                        debug!("      -> {:?}: {}", dep.object_type, format_qualified_name(&dep.qualified_name));
                     }
                 }
                 
                 // Use the dependency graph we built from file objects to find affected objects
                 let affected_objects = graph.affected_by_changes(&updated_objects);
-                eprintln!("DEBUG: {} pgmg-managed objects affected by changes", affected_objects.len());
+                debug!("{} pgmg-managed objects affected by changes", affected_objects.len());
                 
                 // Add dependent objects that need to be recreated
                 for affected_ref in affected_objects {
@@ -197,10 +198,18 @@ async fn detect_object_changes(
     
     // Create lookup maps
     let mut db_object_map: HashMap<String, &crate::db::ObjectRecord> = HashMap::new();
+    let mut db_functions_by_name: HashMap<String, Vec<&crate::db::ObjectRecord>> = HashMap::new();
+    
     for db_obj in db_objects {
         let key = format!("{:?}:{}", db_obj.object_type, 
             format_qualified_name(&db_obj.object_name));
         db_object_map.insert(key, db_obj);
+        
+        // Also track functions and procedures by name only (for overload detection)
+        if matches!(db_obj.object_type, ObjectType::Function | ObjectType::Procedure) {
+            let func_key = format_qualified_name(&db_obj.object_name);
+            db_functions_by_name.entry(func_key).or_insert_with(Vec::new).push(db_obj);
+        }
     }
     
     let mut file_object_set: HashSet<String> = HashSet::new();
@@ -226,7 +235,21 @@ async fn detect_object_changes(
                 }
             }
             None => {
-                // New object
+                // New object - check for function/procedure overloading
+                if matches!(file_obj.object_type, ObjectType::Function | ObjectType::Procedure) {
+                    let func_name = format_qualified_name(&file_obj.qualified_name);
+                    if let Some(existing_funcs) = db_functions_by_name.get(&func_name) {
+                        if !existing_funcs.is_empty() {
+                            let obj_type = if file_obj.object_type == ObjectType::Function { "Function" } else { "Procedure" };
+                            return Err(format!(
+                                "{} '{}' already exists in the database. pgmg does not support function/procedure overloading. \
+                                Please use a different name or drop the existing function/procedure first.",
+                                obj_type, func_name
+                            ).into());
+                        }
+                    }
+                }
+                
                 changes.push(ChangeOperation::CreateObject {
                     object: file_obj.clone(),
                     reason: "New object not in database".to_string(),
@@ -254,6 +277,38 @@ fn format_qualified_name(qualified_name: &crate::sql::QualifiedIdent) -> String 
         Some(schema) => format!("{}.{}", schema, qualified_name.name),
         None => qualified_name.name.clone(),
     }
+}
+
+/// Validate that no function names are duplicated in the SQL files
+fn validate_no_function_overloading_in_files(file_objects: &[SqlObject]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut function_locations: HashMap<String, Vec<String>> = HashMap::new();
+    
+    // Track all function and procedure names and their locations
+    for obj in file_objects {
+        if matches!(obj.object_type, ObjectType::Function | ObjectType::Procedure) {
+            let func_name = format_qualified_name(&obj.qualified_name);
+            let location = obj.source_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "unknown location".to_string());
+            
+            function_locations.entry(func_name).or_insert_with(Vec::new).push(location);
+        }
+    }
+    
+    // Check for duplicates
+    for (func_name, locations) in function_locations {
+        if locations.len() > 1 {
+            return Err(format!(
+                "Multiple definitions of function/procedure '{}' found in SQL files:\n  - {}\n\
+                pgmg does not support function/procedure overloading. Each function/procedure must have a unique name.",
+                func_name,
+                locations.join("\n  - ")
+            ).into());
+        }
+    }
+    
+    Ok(())
 }
 
 pub fn print_plan_summary(plan: &PlanResult) {

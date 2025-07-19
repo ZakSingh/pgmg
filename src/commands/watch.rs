@@ -1,11 +1,14 @@
-use crate::commands::{execute_plan, execute_apply};
+use crate::commands::{execute_plan, execute_apply, execute_test};
 use crate::config::PgmgConfig;
 use crate::error::{PgmgError, Result};
 use crate::logging::output;
+use crate::sql::{scan_test_files, build_test_dependency_map, TestDependencyMap};
+use crate::analysis::graph::ObjectRef;
+use crate::builtin_catalog::BuiltinCatalog;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info};
 
@@ -140,6 +143,22 @@ pub async fn execute_watch(config: WatchConfig) -> Result<()> {
         if config.auto_apply { "enabled" } else { "disabled" }
     ));
     
+    // Build initial test dependency map
+    let test_dep_map = Arc::new(Mutex::new(None::<TestDependencyMap>));
+    if let Some(ref code_dir) = config.code_dir {
+        output::step("Analyzing test dependencies...");
+        match build_test_dependencies(code_dir).await {
+            Ok(dep_map) => {
+                let test_count = dep_map.tests.len();
+                *test_dep_map.lock().unwrap() = Some(dep_map);
+                output::info(&format!("Found {} test files with dependencies", test_count));
+            }
+            Err(e) => {
+                output::error(&format!("Failed to analyze test dependencies: {}", e));
+            }
+        }
+    }
+    
     // Create shared state for debouncing
     let mut state = WatchState::new();
     
@@ -157,7 +176,7 @@ pub async fn execute_watch(config: WatchConfig) -> Result<()> {
                 if state.should_process(config.debounce_duration) {
                     let paths = state.take_paths();
                     if !paths.is_empty() {
-                        process_changes(&config, paths).await;
+                        process_changes(&config, paths, test_dep_map.clone()).await;
                     }
                 }
             }
@@ -166,13 +185,64 @@ pub async fn execute_watch(config: WatchConfig) -> Result<()> {
 }
 
 /// Process a set of file changes
-async fn process_changes(config: &WatchConfig, paths: HashSet<PathBuf>) {
+async fn process_changes(
+    config: &WatchConfig, 
+    paths: HashSet<PathBuf>,
+    test_dep_map: Arc<Mutex<Option<TestDependencyMap>>>,
+) {
     output::step(&format!("Detected changes in {} file(s)", paths.len()));
+    
+    // Separate test files from database object files
+    let mut test_files = Vec::new();
+    let mut db_files = Vec::new();
     
     for path in &paths {
         info!("  - {}", path.display());
+        
+        if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+            if file_name.contains(".test.") {
+                test_files.push(path.clone());
+            } else {
+                db_files.push(path.clone());
+            }
+        }
     }
     
+    // Process database object changes first (if any)
+    let mut changed_objects = Vec::new();
+    if !db_files.is_empty() {
+        output::step("Processing database object changes...");
+        changed_objects = process_db_changes(config, db_files).await;
+    }
+    
+    // Rebuild test dependency map if any test files changed
+    if !test_files.is_empty() && config.code_dir.is_some() {
+        output::step("Rebuilding test dependency map...");
+        if let Ok(new_map) = build_test_dependencies(config.code_dir.as_ref().unwrap()).await {
+            *test_dep_map.lock().unwrap() = Some(new_map);
+        }
+    }
+    
+    // Run tests for changed test files
+    if !test_files.is_empty() {
+        output::step("Running tests for changed test files...");
+        run_specific_tests(config, test_files).await;
+    }
+    
+    // Run tests affected by changed database objects
+    if !changed_objects.is_empty() {
+        if let Some(ref dep_map) = *test_dep_map.lock().unwrap() {
+            let affected_tests = dep_map.find_tests_for_objects(&changed_objects);
+            if !affected_tests.is_empty() {
+                output::step(&format!("Running {} tests affected by database changes...", affected_tests.len()));
+                run_specific_tests(config, affected_tests).await;
+            }
+        }
+    }
+}
+
+/// Process database object file changes (plan and apply)
+async fn process_db_changes(config: &WatchConfig, _paths: Vec<PathBuf>) -> Vec<ObjectRef> {
     // Run plan
     output::step("Running plan...");
     
@@ -186,8 +256,11 @@ async fn process_changes(config: &WatchConfig, paths: HashSet<PathBuf>) {
             // Check if there are any changes
             if plan_result.changes.is_empty() && plan_result.new_migrations.is_empty() {
                 output::info("No changes detected");
-                return;
+                return Vec::new();
             }
+            
+            // Collect changed objects for test dependency analysis
+            let mut changed_objects = Vec::new();
             
             // Show plan summary
             output::subheader("Changes detected:");
@@ -205,12 +278,21 @@ async fn process_changes(config: &WatchConfig, paths: HashSet<PathBuf>) {
                     match change {
                         crate::commands::plan::ChangeOperation::CreateObject { object, .. } => {
                             println!("  + {:?} {}", object.object_type, object.qualified_name.name);
+                            changed_objects.push(ObjectRef {
+                                object_type: object.object_type.clone(),
+                                qualified_name: object.qualified_name.clone(),
+                            });
                         }
                         crate::commands::plan::ChangeOperation::UpdateObject { object, .. } => {
                             println!("  ~ {:?} {}", object.object_type, object.qualified_name.name);
+                            changed_objects.push(ObjectRef {
+                                object_type: object.object_type.clone(),
+                                qualified_name: object.qualified_name.clone(),
+                            });
                         }
                         crate::commands::plan::ChangeOperation::DeleteObject { object_type, object_name, .. } => {
                             println!("  - {:?} {}", object_type, object_name);
+                            // Deleted objects don't need test runs
                         }
                         crate::commands::plan::ChangeOperation::ApplyMigration { name, .. } => {
                             println!("  > Migration {}", name);
@@ -259,6 +341,9 @@ async fn process_changes(config: &WatchConfig, paths: HashSet<PathBuf>) {
             } else {
                 output::info("Auto-apply is disabled. Run 'pgmg apply' to apply changes.");
             }
+            
+            // Return changed objects
+            changed_objects
         }
         Err(e) => {
             output::error(&format!("Failed to plan changes: {}", e));
@@ -266,8 +351,58 @@ async fn process_changes(config: &WatchConfig, paths: HashSet<PathBuf>) {
             if let Some(suggestion) = crate::error::suggest_fix(&pgmg_error) {
                 output::info(&suggestion);
             }
+            Vec::new()
         }
     }
-    
-    output::info("Watching for changes...");
+}
+
+/// Build test dependency map for the code directory
+async fn build_test_dependencies(code_dir: &Path) -> std::result::Result<TestDependencyMap, Box<dyn std::error::Error>> {
+    let builtin_catalog = BuiltinCatalog::new();
+    let test_files = scan_test_files(code_dir, &builtin_catalog).await?;
+    Ok(build_test_dependency_map(test_files))
+}
+
+/// Run specific test files
+async fn run_specific_tests(config: &WatchConfig, test_files: Vec<PathBuf>) {
+    for test_file in test_files {
+        info!("Running test: {}", test_file.display());
+        
+        match execute_test(
+            Some(test_file.clone()),
+            config.connection_string.clone(),
+            false, // Don't show TAP output in watch mode
+            true,  // Continue on failure
+        ).await {
+            Ok(test_result) => {
+                if test_result.tests_failed == 0 {
+                    output::success(&format!(
+                        "✅ {} - {} tests passed",
+                        test_file.file_name().unwrap_or_default().to_string_lossy(),
+                        test_result.tests_passed
+                    ));
+                } else {
+                    output::error(&format!(
+                        "❌ {} - {} failed, {} passed",
+                        test_file.file_name().unwrap_or_default().to_string_lossy(),
+                        test_result.tests_failed,
+                        test_result.tests_passed
+                    ));
+                    
+                    // Show failures
+                    for file_result in &test_result.test_files {
+                        for failure in &file_result.failures {
+                            println!("    ✗ {}: {}", failure.test_number, failure.description);
+                            if let Some(diagnostic) = &failure.diagnostic {
+                                println!("      {}", diagnostic);
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                output::error(&format!("Failed to run test {}: {}", test_file.display(), e));
+            }
+        }
+    }
 }

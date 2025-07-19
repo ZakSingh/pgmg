@@ -4,6 +4,7 @@ use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_tr
 use crate::commands::plan::{execute_plan, ChangeOperation};
 use crate::config::PgmgConfig;
 use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification};
+use crate::plpgsql_check::{check_modified_functions, display_check_errors};
 use owo_colors::OwoColorize;
 
 #[derive(Debug)]
@@ -25,11 +26,7 @@ pub async fn execute_apply(
     let (mut client, connection) = connect_with_url(&connection_string).await?;
     
     // Spawn connection handler
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("Database connection error: {}", e);
-        }
-    });
+    connection.spawn();
 
     // Initialize state tracking
     let state_manager = StateManager::new(&client);
@@ -79,6 +76,9 @@ pub async fn execute_apply(
         }
     }
 
+    // Track modified objects for plpgsql_check
+    let mut modified_objects: Vec<&SqlObject> = Vec::new();
+    
     // Step 4: Apply object changes based on dependency order
     if !plan_result.changes.is_empty() {
         println!("{} {} {}", "Applying".blue().bold(), plan_result.changes.len().to_string().yellow(), "object changes...".blue().bold());
@@ -211,6 +211,9 @@ pub async fn execute_apply(
                 
                 match apply_create_object(&transaction, object, config).await {
                     Ok(_) => {
+                        // Track modified objects for plpgsql_check
+                        modified_objects.push(object);
+                        
                         if is_update {
                             apply_result.objects_updated.push(format_object_name(object));
                             println!("  {} Recreated {}: {} (updated)", 
@@ -238,6 +241,24 @@ pub async fn execute_apply(
         }
     }
 
+    // Step 4.5: Run plpgsql_check on modified functions if in development mode
+    if apply_result.errors.is_empty() && 
+       config.development_mode.unwrap_or(false) && 
+       config.check_plpgsql.unwrap_or(false) &&
+       !modified_objects.is_empty() {
+        
+        match check_modified_functions(&transaction, &modified_objects).await {
+            Ok(check_errors) => {
+                display_check_errors(&check_errors);
+            }
+            Err(e) => {
+                // Log but don't fail the operation
+                eprintln!("{}: Failed to run plpgsql_check: {}", 
+                    "Warning".yellow().bold(), e);
+            }
+        }
+    }
+    
     // Step 5: Commit or rollback transaction
     if apply_result.errors.is_empty() {
         transaction.commit().await?;
@@ -295,7 +316,13 @@ async fn apply_create_object(
     
     // Emit NOTIFY event if in development mode
     if config.development_mode.unwrap_or(false) && config.emit_notify_events.unwrap_or(false) {
-        let notification = ObjectLoadedNotification::from_sql_object(object);
+        let mut notification = ObjectLoadedNotification::from_sql_object(object);
+        
+        // Try to get the OID of the created object
+        if let Ok(oid) = get_object_oid(client, &object.object_type, &object.qualified_name).await {
+            notification.oid = Some(oid);
+        }
+        
         if let Err(e) = emit_object_loaded_notification(client, &notification).await {
             // Log the error but don't fail the operation
             eprintln!("Warning: Failed to emit NOTIFY event: {}", e);
@@ -343,9 +370,15 @@ async fn apply_delete_object(
     // Parse the qualified name
     let qualified_name = crate::sql::QualifiedIdent::from_qualified_name(object_name);
     
-    // Drop the object
-    let drop_statement = generate_drop_statement(object_type, &qualified_name);
-    client.execute(&drop_statement, &[]).await?;
+    // Handle comment deletion specially - comments can't be dropped, only set to NULL
+    if object_type == &ObjectType::Comment {
+        let comment_null_statement = generate_comment_null_statement(object_name)?;
+        client.execute(&comment_null_statement, &[]).await?;
+    } else {
+        // Drop the object
+        let drop_statement = generate_drop_statement(object_type, &qualified_name);
+        client.execute(&drop_statement, &[]).await?;
+    }
     
     // Remove from state tracking
     remove_object_from_state_in_transaction(client, object_type, &qualified_name).await?;
@@ -354,16 +387,41 @@ async fn apply_delete_object(
 }
 
 
+fn generate_comment_null_statement(comment_identifier: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Parse comment identifiers like:
+    // "table:users" -> "COMMENT ON TABLE users IS NULL"
+    // "column:users.email" -> "COMMENT ON COLUMN users.email IS NULL"  
+    // "function:api.get_user" -> "COMMENT ON FUNCTION api.get_user IS NULL"
+    // "trigger:my_trigger:my_table" -> "COMMENT ON TRIGGER my_trigger ON my_table IS NULL"
+    
+    let parts: Vec<&str> = comment_identifier.split(':').collect();
+    
+    match parts.as_slice() {
+        ["table", name] => Ok(format!("COMMENT ON TABLE {} IS NULL", name)),
+        ["view", name] => Ok(format!("COMMENT ON VIEW {} IS NULL", name)),
+        ["function", name] => Ok(format!("COMMENT ON FUNCTION {} IS NULL", name)),
+        ["type", name] => Ok(format!("COMMENT ON TYPE {} IS NULL", name)),
+        ["domain", name] => Ok(format!("COMMENT ON DOMAIN {} IS NULL", name)),
+        ["column", name] => Ok(format!("COMMENT ON COLUMN {} IS NULL", name)),
+        ["trigger", trigger_name, table_name] => {
+            Ok(format!("COMMENT ON TRIGGER {} ON {} IS NULL", trigger_name, table_name))
+        }
+        _ => Err(format!("Unknown comment identifier format: {}", comment_identifier).into()),
+    }
+}
+
 fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql::QualifiedIdent) -> String {
     let object_type_str = match object_type {
         ObjectType::Table => "TABLE",
         ObjectType::View => "VIEW",
         ObjectType::MaterializedView => "MATERIALIZED VIEW",
         ObjectType::Function => "FUNCTION",
+        ObjectType::Procedure => "PROCEDURE",
         ObjectType::Type => "TYPE",
         ObjectType::Domain => "DOMAIN",
         ObjectType::Index => "INDEX",
         ObjectType::Trigger => "TRIGGER",
+        ObjectType::Comment => "COMMENT",
     };
     
     let full_name = match &qualified_name.schema {
@@ -374,6 +432,10 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
     match object_type {
         ObjectType::Function => {
             // For functions, we need to handle overloading - use CASCADE for simplicity
+            format!("DROP {} IF EXISTS {} CASCADE", object_type_str, full_name)
+        }
+        ObjectType::Procedure => {
+            // For procedures, we also need to handle overloading - use CASCADE for simplicity
             format!("DROP {} IF EXISTS {} CASCADE", object_type_str, full_name)
         }
         ObjectType::Trigger => {
@@ -399,10 +461,12 @@ async fn update_object_hash_in_transaction(
         ObjectType::View => "view",
         ObjectType::MaterializedView => "materialized_view",
         ObjectType::Function => "function",
+        ObjectType::Procedure => "procedure",
         ObjectType::Type => "type",
         ObjectType::Domain => "domain",
         ObjectType::Index => "index",
         ObjectType::Trigger => "trigger",
+        ObjectType::Comment => "comment",
     };
 
     let qualified_name = match &object_name.schema {
@@ -433,10 +497,12 @@ async fn remove_object_from_state_in_transaction(
         ObjectType::View => "view",
         ObjectType::MaterializedView => "materialized_view",
         ObjectType::Function => "function",
+        ObjectType::Procedure => "procedure",
         ObjectType::Type => "type",
         ObjectType::Domain => "domain",
         ObjectType::Index => "index",
         ObjectType::Trigger => "trigger",
+        ObjectType::Comment => "comment",
     };
 
     let qualified_name = match &object_name.schema {
@@ -450,6 +516,76 @@ async fn remove_object_from_state_in_transaction(
     ).await?;
 
     Ok(())
+}
+
+async fn get_object_oid(
+    client: &tokio_postgres::Transaction<'_>,
+    object_type: &ObjectType,
+    qualified_name: &crate::sql::QualifiedIdent,
+) -> Result<u32, Box<dyn std::error::Error>> {
+    let (schema_name, object_name) = match &qualified_name.schema {
+        Some(s) => (s.as_str(), qualified_name.name.as_str()),
+        None => ("public", qualified_name.name.as_str()),
+    };
+    
+    let query = match object_type {
+        ObjectType::Table => {
+            "SELECT c.oid FROM pg_class c 
+             JOIN pg_namespace n ON n.oid = c.relnamespace 
+             WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'r'"
+        }
+        ObjectType::View => {
+            "SELECT c.oid FROM pg_class c 
+             JOIN pg_namespace n ON n.oid = c.relnamespace 
+             WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'v'"
+        }
+        ObjectType::MaterializedView => {
+            "SELECT c.oid FROM pg_class c 
+             JOIN pg_namespace n ON n.oid = c.relnamespace 
+             WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'm'"
+        }
+        ObjectType::Function => {
+            "SELECT p.oid FROM pg_proc p 
+             JOIN pg_namespace n ON n.oid = p.pronamespace 
+             WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind = 'f'"
+        }
+        ObjectType::Procedure => {
+            "SELECT p.oid FROM pg_proc p 
+             JOIN pg_namespace n ON n.oid = p.pronamespace 
+             WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind = 'p'"
+        }
+        ObjectType::Type => {
+            "SELECT t.oid FROM pg_type t 
+             JOIN pg_namespace n ON n.oid = t.typnamespace 
+             WHERE n.nspname = $1 AND t.typname = $2 
+             AND t.typtype IN ('c', 'e')"
+        }
+        ObjectType::Domain => {
+            "SELECT t.oid FROM pg_type t 
+             JOIN pg_namespace n ON n.oid = t.typnamespace 
+             WHERE n.nspname = $1 AND t.typname = $2 
+             AND t.typtype = 'd'"
+        }
+        ObjectType::Index => {
+            "SELECT c.oid FROM pg_class c 
+             JOIN pg_namespace n ON n.oid = c.relnamespace 
+             WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'i'"
+        }
+        ObjectType::Trigger => {
+            // Triggers don't have their own OID in pg_class, they're in pg_trigger
+            // This requires both trigger name and table name, which is complex
+            // For now, we'll return an error for triggers
+            return Err("Trigger OID lookup not yet implemented".into());
+        }
+        ObjectType::Comment => {
+            // Comments don't have OIDs - they're metadata attached to objects
+            return Err("Comment OID lookup not applicable".into());
+        }
+    };
+    
+    let row = client.query_one(query, &[&schema_name, &object_name]).await?;
+    let oid: i32 = row.get(0);
+    Ok(oid as u32)
 }
 
 fn format_object_name(object: &SqlObject) -> String {

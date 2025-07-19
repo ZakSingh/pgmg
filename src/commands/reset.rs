@@ -32,11 +32,7 @@ pub async fn execute_reset(
     let (admin_client, admin_connection) = connect_to_database(&admin_config).await?;
     
     // Spawn connection handler
-    tokio::spawn(async move {
-        if let Err(e) = admin_connection.await {
-            eprintln!("Database connection error: {}", e);
-        }
-    });
+    admin_connection.spawn();
 
     // Step 1: Terminate active connections to the target database
     println!("{} Terminating active connections to database '{}'...", "→".cyan(), database_name);
@@ -57,11 +53,7 @@ pub async fn execute_reset(
     let (target_client, target_connection) = connect_to_database(&target_config).await?;
     
     // Spawn connection handler for target database
-    tokio::spawn(async move {
-        if let Err(e) = target_connection.await {
-            eprintln!("Database connection error: {}", e);
-        }
-    });
+    target_connection.spawn();
 
     // Initialize pgmg state tables
     let state_manager = StateManager::new(&target_client);
