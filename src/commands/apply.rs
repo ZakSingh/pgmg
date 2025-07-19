@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 use crate::db::{StateManager, connect_with_url};
-use crate::sql::{SqlObject, ObjectType, objects::calculate_ddl_hash, splitter::split_sql_file};
+use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file};
 use crate::commands::plan::{execute_plan, ChangeOperation};
-use crate::analysis::ObjectRef;
+use crate::config::PgmgConfig;
+use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification};
+use owo_colors::OwoColorize;
 
 #[derive(Debug)]
 pub struct ApplyResult {
@@ -17,6 +19,7 @@ pub async fn execute_apply(
     migrations_dir: Option<PathBuf>,
     code_dir: Option<PathBuf>,
     connection_string: String,
+    config: &PgmgConfig,
 ) -> Result<ApplyResult, Box<dyn std::error::Error>> {
     // Connect to database
     let (mut client, connection) = connect_with_url(&connection_string).await?;
@@ -49,7 +52,7 @@ pub async fn execute_apply(
     ).await?;
 
     if plan_result.changes.is_empty() && plan_result.new_migrations.is_empty() {
-        println!("No changes to apply. Database is up to date.");
+        println!("{}", "No changes to apply. Database is up to date.".green());
         return Ok(apply_result);
     }
 
@@ -58,18 +61,18 @@ pub async fn execute_apply(
 
     // Step 3: Apply migrations first (they need to be applied in order)
     if !plan_result.new_migrations.is_empty() {
-        println!("Applying {} new migrations...", plan_result.new_migrations.len());
+        println!("{} {} {}", "Applying".blue().bold(), plan_result.new_migrations.len().to_string().yellow(), "new migrations...".blue().bold());
         
         if let Some(ref migrations_dir) = migrations_dir {
             for migration_name in &plan_result.new_migrations {
                 match apply_migration(&transaction, migrations_dir, migration_name).await {
                     Ok(_) => {
                         apply_result.migrations_applied.push(migration_name.clone());
-                        println!("  ✓ Applied migration: {}", migration_name);
+                        println!("  {} Applied migration: {}", "✓".green().bold(), migration_name.cyan());
                     }
                     Err(e) => {
                         apply_result.errors.push(format!("Failed to apply migration {}: {}", migration_name, e));
-                        println!("  ✗ Failed migration: {} - {}", migration_name, e);
+                        println!("  {} Failed migration: {} - {}", "✗".red().bold(), migration_name.cyan(), e.to_string().red());
                     }
                 }
             }
@@ -78,77 +81,157 @@ pub async fn execute_apply(
 
     // Step 4: Apply object changes based on dependency order
     if !plan_result.changes.is_empty() {
-        println!("Applying {} object changes...", plan_result.changes.len());
+        println!("{} {} {}", "Applying".blue().bold(), plan_result.changes.len().to_string().yellow(), "object changes...".blue().bold());
         
-        // Use the dependency graph from the plan result for proper ordering if available
-        // The graph may be None if there are no SQL objects, only migrations
-        let ordered_changes = if let Some(ref dependency_graph) = plan_result.dependency_graph {
-            // Get the creation order from the dependency graph
-            match dependency_graph.creation_order() {
-                Ok(creation_order) => {
-                    // Sort changes according to the dependency order
-                    order_changes_by_dependencies(&plan_result.changes, &creation_order)
-                }
-                Err(e) => {
-                    eprintln!("Warning: Could not determine dependency order: {}. Applying changes in original order.", e);
-                    plan_result.changes.clone()
+        // Separate the changes into phases
+        let (_migrations, non_migrations): (Vec<_>, Vec<_>) = plan_result.changes.iter()
+            .partition(|change| matches!(change, ChangeOperation::ApplyMigration { .. }));
+        
+        let (creates, non_creates): (Vec<_>, Vec<_>) = non_migrations.into_iter()
+            .partition(|change| matches!(change, ChangeOperation::CreateObject { .. }));
+        
+        let (updates, deletes): (Vec<_>, Vec<_>) = non_creates.into_iter()
+            .partition(|change| matches!(change, ChangeOperation::UpdateObject { .. }));
+        
+        // Get dependency order if available
+        let (creation_order, deletion_order) = if let Some(ref dependency_graph) = plan_result.dependency_graph {
+            match (dependency_graph.creation_order(), dependency_graph.deletion_order()) {
+                (Ok(create_ord), Ok(delete_ord)) => (Some(create_ord), Some(delete_ord)),
+                _ => {
+                    eprintln!("Warning: Could not determine dependency order. Applying changes in original order.");
+                    (None, None)
                 }
             }
         } else {
-            // No dependency graph available, use original order
-            plan_result.changes.clone()
+            (None, None)
         };
 
-        // Apply changes in dependency order
-        for change in &ordered_changes {
-            match change {
-                ChangeOperation::ApplyMigration { .. } => {
-                    // Already handled above
-                    continue;
+        // Track if transaction has been aborted
+        let mut transaction_aborted = false;
+
+        // Phase 1: Drop all objects that need updating (in reverse dependency order)
+        if !updates.is_empty() && deletion_order.is_some() {
+            println!("\n{}: {}", "Phase 1".blue().bold(), "Dropping objects for update...".blue());
+            let del_order = deletion_order.unwrap();
+            
+            // Sort updates by deletion order
+            let mut ordered_updates_for_drop = Vec::new();
+            for object_ref in &del_order {
+                if let Some(update) = updates.iter().find(|u| match u {
+                    ChangeOperation::UpdateObject { object, .. } => 
+                        object.object_type == object_ref.object_type &&
+                        object.qualified_name == object_ref.qualified_name,
+                    _ => false,
+                }) {
+                    ordered_updates_for_drop.push(update);
                 }
-                ChangeOperation::CreateObject { object, .. } => {
-                    match apply_create_object(&transaction, object).await {
+            }
+            
+            for change in ordered_updates_for_drop {
+                if transaction_aborted { break; }
+                
+                if let ChangeOperation::UpdateObject { object, .. } = change {
+                    match apply_drop_for_update(&transaction, object).await {
                         Ok(_) => {
-                            apply_result.objects_created.push(format_object_name(object));
-                            println!("  ✓ Created {}: {}", 
-                                format!("{:?}", object.object_type).to_lowercase(),
-                                format_object_name(object)
+                            println!("  {} Dropped {}: {} (for update)", 
+                                "✓".green().bold(),
+                                format!("{:?}", object.object_type).to_lowercase().yellow(),
+                                format_object_name(object).cyan()
                             );
                         }
                         Err(e) => {
-                            apply_result.errors.push(format!("Failed to create {}: {}", format_object_name(object), e));
-                            println!("  ✗ Failed to create {}: {}", format_object_name(object), e);
+                            apply_result.errors.push(format!("Failed to drop {} for update: {}", format_object_name(object), e));
+                            println!("  {} Failed to drop {}: {}", "✗".red().bold(), format_object_name(object).cyan(), e.to_string().red());
+                            transaction_aborted = true;
                         }
                     }
                 }
-                ChangeOperation::UpdateObject { object, .. } => {
-                    match apply_update_object(&transaction, object).await {
-                        Ok(_) => {
-                            apply_result.objects_updated.push(format_object_name(object));
-                            println!("  ✓ Updated {}: {}", 
-                                format!("{:?}", object.object_type).to_lowercase(),
-                                format_object_name(object)
-                            );
-                        }
-                        Err(e) => {
-                            apply_result.errors.push(format!("Failed to update {}: {}", format_object_name(object), e));
-                            println!("  ✗ Failed to update {}: {}", format_object_name(object), e);
-                        }
-                    }
-                }
-                ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+            }
+        }
+        
+        // Phase 2: Delete objects marked for deletion
+        if !deletes.is_empty() && !transaction_aborted {
+            println!("\n{}: {}", "Phase 2".blue().bold(), "Deleting objects...".blue());
+            for change in deletes {
+                if transaction_aborted { break; }
+                
+                if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
                     match apply_delete_object(&transaction, object_type, object_name).await {
                         Ok(_) => {
                             apply_result.objects_deleted.push(object_name.clone());
-                            println!("  ✓ Deleted {}: {}", 
-                                format!("{:?}", object_type).to_lowercase(),
-                                object_name
+                            println!("  {} Deleted {}: {}", 
+                                "✓".green().bold(),
+                                format!("{:?}", object_type).to_lowercase().yellow(),
+                                object_name.cyan()
                             );
                         }
                         Err(e) => {
                             apply_result.errors.push(format!("Failed to delete {}: {}", object_name, e));
-                            println!("  ✗ Failed to delete {}: {}", object_name, e);
+                            println!("  {} Failed to delete {}: {}", "✗".red().bold(), object_name.cyan(), e.to_string().red());
+                            transaction_aborted = true;
                         }
+                    }
+                }
+            }
+        }
+        
+        // Phase 3: Create new objects and recreate updated objects (in dependency order)
+        if !transaction_aborted && (creates.len() + updates.len() > 0) {
+            println!("\n{}: {}", "Phase 3".blue().bold(), "Creating objects...".blue());
+            
+            // Combine creates and updates (which need recreation)
+            let mut all_creates: Vec<(&SqlObject, bool)> = Vec::new();
+            
+            // Add regular creates
+            for change in &creates {
+                if let ChangeOperation::CreateObject { object, .. } = change {
+                    all_creates.push((object, false));
+                }
+            }
+            
+            // Add updates (which need recreation)
+            for change in &updates {
+                if let ChangeOperation::UpdateObject { object, .. } = change {
+                    all_creates.push((object, true));
+                }
+            }
+            
+            // Sort by creation order if available
+            if let Some(ref create_order) = creation_order {
+                all_creates.sort_by_key(|(obj, _)| {
+                    create_order.iter().position(|ref_| 
+                        ref_.object_type == obj.object_type &&
+                        ref_.qualified_name == obj.qualified_name
+                    ).unwrap_or(usize::MAX)
+                });
+            }
+            
+            for (object, is_update) in all_creates {
+                if transaction_aborted { break; }
+                
+                match apply_create_object(&transaction, object, config).await {
+                    Ok(_) => {
+                        if is_update {
+                            apply_result.objects_updated.push(format_object_name(object));
+                            println!("  {} Recreated {}: {} (updated)", 
+                                "✓".green().bold(),
+                                format!("{:?}", object.object_type).to_lowercase().yellow(),
+                                format_object_name(object).cyan()
+                            );
+                        } else {
+                            apply_result.objects_created.push(format_object_name(object));
+                            println!("  {} Created {}: {}", 
+                                "✓".green().bold(),
+                                format!("{:?}", object.object_type).to_lowercase().yellow(),
+                                format_object_name(object).cyan()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let action = if is_update { "recreate" } else { "create" };
+                        apply_result.errors.push(format!("Failed to {} {}: {}", action, format_object_name(object), e));
+                        println!("  {} Failed to {} {}: {}", "✗".red().bold(), action, format_object_name(object).cyan(), e.to_string().red());
+                        transaction_aborted = true;
                     }
                 }
             }
@@ -158,12 +241,12 @@ pub async fn execute_apply(
     // Step 5: Commit or rollback transaction
     if apply_result.errors.is_empty() {
         transaction.commit().await?;
-        println!("All changes applied successfully!");
+        println!("{}", "All changes applied successfully!".green().bold());
     } else {
         transaction.rollback().await?;
-        eprintln!("Rolled back due to {} errors:", apply_result.errors.len());
+        eprintln!("{} {} {}", "Rolled back due to".red().bold(), apply_result.errors.len().to_string().yellow(), "errors:".red().bold());
         for error in &apply_result.errors {
-            eprintln!("  - {}", error);
+            eprintln!("  {} {}", "-".red().bold(), error.red());
         }
         return Err("Apply operation failed - all changes rolled back".into());
     }
@@ -171,58 +254,6 @@ pub async fn execute_apply(
     Ok(apply_result)
 }
 
-/// Order changes according to dependency graph's topological order
-fn order_changes_by_dependencies(
-    changes: &[ChangeOperation], 
-    creation_order: &[ObjectRef]
-) -> Vec<ChangeOperation> {
-    let mut ordered_changes = Vec::new();
-    let mut remaining_changes: Vec<ChangeOperation> = changes.to_vec();
-    
-    // First, add all non-object changes (migrations) to preserve their order
-    let (migrations, object_changes): (Vec<_>, Vec<_>) = remaining_changes.into_iter()
-        .partition(|change| matches!(change, ChangeOperation::ApplyMigration { .. }));
-    
-    ordered_changes.extend(migrations);
-    remaining_changes = object_changes;
-    
-    // Then add object changes in dependency order
-    for object_ref in creation_order {
-        // Find the matching change for this object
-        if let Some(pos) = remaining_changes.iter().position(|change| {
-            match change {
-                ChangeOperation::CreateObject { object, .. } => {
-                    object.object_type == object_ref.object_type &&
-                    object.qualified_name == object_ref.qualified_name
-                }
-                ChangeOperation::UpdateObject { object, .. } => {
-                    object.object_type == object_ref.object_type &&
-                    object.qualified_name == object_ref.qualified_name
-                }
-                ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                    let qualified_name = crate::sql::QualifiedIdent::from_qualified_name(object_name);
-                    object_type == &object_ref.object_type &&
-                    qualified_name == object_ref.qualified_name
-                }
-                _ => false,
-            }
-        }) {
-            ordered_changes.push(remaining_changes.remove(pos));
-        }
-    }
-    
-    // Handle delete operations in reverse dependency order (dependents first)
-    // This ensures we don't violate foreign key constraints
-    let mut delete_changes: Vec<ChangeOperation> = remaining_changes.into_iter()
-        .filter(|change| matches!(change, ChangeOperation::DeleteObject { .. }))
-        .collect();
-    
-    // Reverse the order for deletions
-    delete_changes.reverse();
-    ordered_changes.extend(delete_changes);
-    
-    ordered_changes
-}
 
 async fn apply_migration(
     client: &tokio_postgres::Transaction<'_>,
@@ -253,6 +284,7 @@ async fn apply_migration(
 async fn apply_create_object(
     client: &tokio_postgres::Transaction<'_>,
     object: &SqlObject,
+    config: &PgmgConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Execute the DDL statement
     client.execute(&object.ddl_statement, &[]).await?;
@@ -261,27 +293,45 @@ async fn apply_create_object(
     let ddl_hash = calculate_ddl_hash(&object.ddl_statement);
     update_object_hash_in_transaction(client, &object.object_type, &object.qualified_name, &ddl_hash).await?;
     
+    // Emit NOTIFY event if in development mode
+    if config.development_mode.unwrap_or(false) && config.emit_notify_events.unwrap_or(false) {
+        let notification = ObjectLoadedNotification::from_sql_object(object);
+        if let Err(e) = emit_object_loaded_notification(client, &notification).await {
+            // Log the error but don't fail the operation
+            eprintln!("Warning: Failed to emit NOTIFY event: {}", e);
+        }
+    }
+    
     Ok(())
 }
 
-async fn apply_update_object(
+async fn apply_drop_for_update(
     client: &tokio_postgres::Transaction<'_>,
     object: &SqlObject,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // For updates, we need to drop and recreate
-    // This is a simplified approach - in production you might want more sophisticated handling
-    
-    // Drop the existing object first
-    let drop_statement = generate_drop_statement(&object.object_type, &object.qualified_name);
+    // Just drop the object - creation will happen in a separate phase
+    let drop_statement = if object.object_type == ObjectType::Trigger {
+        // For triggers, we need to extract the table name from the DDL
+        match extract_trigger_table(&object.ddl_statement) {
+            Ok(table_name) => {
+                let trigger_name = match &object.qualified_name.schema {
+                    Some(schema) => format!("{}.{}", schema, object.qualified_name.name),
+                    None => object.qualified_name.name.clone(),
+                };
+                let table_full_name = match &table_name.schema {
+                    Some(schema) => format!("{}.{}", schema, table_name.name),
+                    None => table_name.name.clone(),
+                };
+                format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, table_full_name)
+            }
+            Err(e) => {
+                return Err(format!("Could not extract table name from trigger DDL: {}", e).into());
+            }
+        }
+    } else {
+        generate_drop_statement(&object.object_type, &object.qualified_name)
+    };
     client.execute(&drop_statement, &[]).await?;
-    
-    // Create the new version
-    client.execute(&object.ddl_statement, &[]).await?;
-    
-    // Update state tracking with new hash
-    let ddl_hash = calculate_ddl_hash(&object.ddl_statement);
-    update_object_hash_in_transaction(client, &object.object_type, &object.qualified_name, &ddl_hash).await?;
-    
     Ok(())
 }
 
@@ -303,10 +353,12 @@ async fn apply_delete_object(
     Ok(())
 }
 
+
 fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql::QualifiedIdent) -> String {
     let object_type_str = match object_type {
         ObjectType::Table => "TABLE",
         ObjectType::View => "VIEW",
+        ObjectType::MaterializedView => "MATERIALIZED VIEW",
         ObjectType::Function => "FUNCTION",
         ObjectType::Type => "TYPE",
         ObjectType::Domain => "DOMAIN",
@@ -324,6 +376,12 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
             // For functions, we need to handle overloading - use CASCADE for simplicity
             format!("DROP {} IF EXISTS {} CASCADE", object_type_str, full_name)
         }
+        ObjectType::Trigger => {
+            // Triggers need special handling - they require the table name
+            // We'll need to return both the trigger name and table name
+            // For now, return just the trigger name and we'll handle it specially
+            format!("DROP TRIGGER IF EXISTS {}", full_name)
+        }
         _ => {
             format!("DROP {} IF EXISTS {}", object_type_str, full_name)
         }
@@ -339,6 +397,7 @@ async fn update_object_hash_in_transaction(
     let object_type_str = match object_type {
         ObjectType::Table => "table",
         ObjectType::View => "view",
+        ObjectType::MaterializedView => "materialized_view",
         ObjectType::Function => "function",
         ObjectType::Type => "type",
         ObjectType::Domain => "domain",
@@ -372,6 +431,7 @@ async fn remove_object_from_state_in_transaction(
     let object_type_str = match object_type {
         ObjectType::Table => "table",
         ObjectType::View => "view",
+        ObjectType::MaterializedView => "materialized_view",
         ObjectType::Function => "function",
         ObjectType::Type => "type",
         ObjectType::Domain => "domain",
@@ -400,40 +460,40 @@ fn format_object_name(object: &SqlObject) -> String {
 }
 
 pub fn print_apply_summary(result: &ApplyResult) {
-    println!("\n=== PGMG Apply Summary ===");
+    println!("\n{}", "=== PGMG Apply Summary ===".bold().blue());
     
     if !result.migrations_applied.is_empty() {
-        println!("\nMigrations Applied:");
+        println!("\n{}:", "Migrations Applied".bold().green());
         for migration in &result.migrations_applied {
-            println!("  ✓ {}", migration);
+            println!("  {} {}", "✓".green().bold(), migration.cyan());
         }
     }
     
     if !result.objects_created.is_empty() {
-        println!("\nObjects Created:");
+        println!("\n{}:", "Objects Created".bold().green());
         for object in &result.objects_created {
-            println!("  + {}", object);
+            println!("  {} {}", "+".green().bold(), object.cyan());
         }
     }
     
     if !result.objects_updated.is_empty() {
-        println!("\nObjects Updated:");
+        println!("\n{}:", "Objects Updated".bold().yellow());
         for object in &result.objects_updated {
-            println!("  ~ {}", object);
+            println!("  {} {}", "~".yellow().bold(), object.cyan());
         }
     }
     
     if !result.objects_deleted.is_empty() {
-        println!("\nObjects Deleted:");
+        println!("\n{}:", "Objects Deleted".bold().red());
         for object in &result.objects_deleted {
-            println!("  - {}", object);
+            println!("  {} {}", "-".red().bold(), object.cyan());
         }
     }
     
     if !result.errors.is_empty() {
-        println!("\nErrors:");
+        println!("\n{}:", "Errors".bold().red());
         for error in &result.errors {
-            println!("  ✗ {}", error);
+            println!("  {} {}", "✗".red().bold(), error.red());
         }
     }
     
@@ -443,10 +503,18 @@ pub fn print_apply_summary(result: &ApplyResult) {
                        result.objects_deleted.len();
     
     if total_changes == 0 && result.errors.is_empty() {
-        println!("\nNo changes applied. Database was already up to date.");
+        println!("\n{}", "No changes applied. Database was already up to date.".green());
     } else if result.errors.is_empty() {
-        println!("\n✓ Successfully applied {} changes", total_changes);
+        println!("\n{} {} {}", 
+            "✓".green().bold(), 
+            "Successfully applied".green().bold(), 
+            format!("{} changes", total_changes).yellow()
+        );
     } else {
-        println!("\n✗ Apply failed with {} errors", result.errors.len());
+        println!("\n{} {} {}", 
+            "✗".red().bold(), 
+            "Apply failed with".red().bold(), 
+            format!("{} errors", result.errors.len()).yellow()
+        );
     }
 }

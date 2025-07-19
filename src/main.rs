@@ -1,7 +1,7 @@
 use tokio_postgres::NoTls;
 use pgmg::{analyze_statement, filter_builtins, BuiltinCatalog, DependencyGraph};
 use pgmg::cli::{Cli, Commands};
-use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig};
+use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig, execute_reset, print_reset_summary};
 use pgmg::config::PgmgConfig;
 use pgmg::error::{PgmgError, Result};
 use pgmg::logging;
@@ -75,7 +75,7 @@ async fn run(cli: Cli) -> Result<()> {
             );
             
             // Require connection string
-            let conn_str = merged_config.connection_string
+            let conn_str = merged_config.connection_string.clone()
                 .or_else(|| std::env::var("DATABASE_URL").ok())
                 .ok_or_else(|| PgmgError::Configuration(
                     "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
@@ -111,7 +111,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         
-        Commands::Apply { migrations_dir, code_dir, connection_string } => {
+        Commands::Apply { migrations_dir, code_dir, connection_string, dev } => {
             logging::output::header("Applying Changes");
             
             // Merge CLI args with config file (no output_graph for apply)
@@ -121,7 +121,7 @@ async fn run(cli: Cli) -> Result<()> {
                 code_dir,
                 connection_string,
                 None, // apply command doesn't use output_graph
-            );
+            ).with_dev_mode(dev);
             
             // Log configuration
             if let Some(ref dir) = merged_config.migrations_dir {
@@ -130,9 +130,12 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(ref dir) = merged_config.code_dir {
                 debug!("Code directory: {}", dir.display());
             }
+            if merged_config.development_mode.unwrap_or(false) {
+                info!("Development mode enabled - NOTIFY events will be emitted");
+            }
             
             // Require connection string
-            let conn_str = merged_config.connection_string
+            let conn_str = merged_config.connection_string.clone()
                 .or_else(|| std::env::var("DATABASE_URL").ok())
                 .ok_or_else(|| PgmgError::Configuration(
                     "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
@@ -147,9 +150,10 @@ async fn run(cli: Cli) -> Result<()> {
             // Execute apply with progress tracking
             let start = std::time::Instant::now();
             let apply_result = execute_apply(
-                merged_config.migrations_dir,
-                merged_config.code_dir,
+                merged_config.migrations_dir.clone(),
+                merged_config.code_dir.clone(),
                 conn_str,
+                &merged_config,
             ).await?;
             
             let elapsed = start.elapsed();
@@ -159,7 +163,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         
-        Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply } => {
+        Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply, dev } => {
             // Merge CLI args with config file
             let merged_config = PgmgConfig::merge_with_cli(
                 config_file,
@@ -167,10 +171,10 @@ async fn run(cli: Cli) -> Result<()> {
                 code_dir,
                 connection_string,
                 None, // watch command doesn't use output_graph
-            );
+            ).with_dev_mode(dev);
             
             // Require connection string
-            let conn_str = merged_config.connection_string
+            let conn_str = merged_config.connection_string.clone()
                 .or_else(|| std::env::var("DATABASE_URL").ok())
                 .ok_or_else(|| PgmgError::Configuration(
                     "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
@@ -178,11 +182,12 @@ async fn run(cli: Cli) -> Result<()> {
             
             // Create watch configuration
             let watch_config = WatchConfig {
-                migrations_dir: merged_config.migrations_dir,
-                code_dir: merged_config.code_dir,
+                migrations_dir: merged_config.migrations_dir.clone(),
+                code_dir: merged_config.code_dir.clone(),
                 connection_string: conn_str,
                 debounce_duration: std::time::Duration::from_millis(debounce_ms),
                 auto_apply: !no_auto_apply,
+                pgmg_config: merged_config,
             };
             
             // Log configuration
@@ -193,10 +198,40 @@ async fn run(cli: Cli) -> Result<()> {
             if let Some(ref dir) = watch_config.code_dir {
                 debug!("Code directory: {}", dir.display());
             }
+            if watch_config.pgmg_config.development_mode.unwrap_or(false) {
+                info!("Development mode enabled - NOTIFY events will be emitted");
+            }
             debug!("Debounce: {}ms", debounce_ms);
             debug!("Auto-apply: {}", watch_config.auto_apply);
             
             execute_watch(watch_config).await
+        }
+        Commands::Reset { connection_string, force } => {
+            logging::output::header("Database Reset");
+            
+            // Get connection string from CLI arg, config file, or environment
+            let conn_str = connection_string
+                .or_else(|| config_file.as_ref().and_then(|c| c.connection_string.clone()))
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .ok_or_else(|| PgmgError::Configuration(
+                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
+                ))?;
+            
+            // Validate connection string format
+            if !conn_str.starts_with("postgres://") && !conn_str.starts_with("postgresql://") {
+                return Err(PgmgError::InvalidConnectionString(conn_str));
+            }
+            
+            // Log configuration (with masked credentials)
+            debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
+            debug!("Force mode: {}", force);
+            
+            // Execute reset
+            let result = execute_reset(conn_str, force).await
+                .map_err(|e| PgmgError::Other(format!("Reset failed: {}", e)))?;
+            
+            print_reset_summary(&result);
+            Ok(())
         }
     }
 }

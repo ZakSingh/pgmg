@@ -10,6 +10,7 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod logging;
+pub mod notify;
 
 // Re-export key public APIs for convenience
 pub use builtin_catalog::BuiltinCatalog;

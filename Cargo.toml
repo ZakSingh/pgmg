@@ -33,6 +33,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "fmt"] }
 color-eyre = "0.6"
 console = "0.15"
+owo-colors = "4.0"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

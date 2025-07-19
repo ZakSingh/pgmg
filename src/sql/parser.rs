@@ -10,7 +10,7 @@ pub struct QualifiedIdent {
     pub name: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Dependencies {
     pub relations: HashSet<QualifiedIdent>,
     pub functions: HashSet<QualifiedIdent>,
@@ -44,24 +44,36 @@ impl QualifiedIdent {
 
 pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::Error>> {
     let parse_result = pg_query::parse(sql)?;
+    extract_dependencies_from_parse_result_with_sql(&parse_result.protobuf, Some(sql))
+}
+
+/// Extract dependencies from an already-parsed statement
+pub fn extract_dependencies_from_parse_result(parse_result: &pg_query::protobuf::ParseResult) -> Result<Dependencies, Box<dyn std::error::Error>> {
+    extract_dependencies_from_parse_result_with_sql(parse_result, None)
+}
+
+/// Extract dependencies from an already-parsed statement, with optional original SQL for PL/pgSQL analysis
+pub fn extract_dependencies_from_parse_result_with_sql(parse_result: &pg_query::protobuf::ParseResult, original_sql: Option<&str>) -> Result<Dependencies, Box<dyn std::error::Error>> {
+    // Create a wrapper to use pg_query's built-in extraction methods
+    let parsed_wrapped = pg_query::ParseResult::new(parse_result.clone(), String::new());
     
     // Extract relations using existing pg_query functionality
     let mut relations = HashSet::new();
-    for table in parse_result.tables() {
+    for table in parsed_wrapped.tables() {
         relations.insert(QualifiedIdent::from_qualified_name(&table));
     }
     
     let mut functions = HashSet::new();
     
     // Get functions from pg_query's built-in functionality
-    for func in parse_result.functions() {
+    for func in parsed_wrapped.functions() {
         functions.insert(QualifiedIdent::from_qualified_name(&func));
     }
     
     let mut types = HashSet::new();
     
     // Also traverse the entire AST to extract REFERENCES and DEFAULT functions
-    for stmt in &parse_result.protobuf.stmts {
+    for stmt in &parse_result.stmts {
         if let Some(stmt) = &stmt.stmt {
             if let Some(node) = &stmt.node {
                 extract_from_node_with_types(node, &mut relations, &mut functions, &mut types);
@@ -121,17 +133,19 @@ pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::
                         }
                     } else if is_language_plpgsql_function(create_func) {
                         // For PL/pgSQL functions, analyze the entire SQL statement
-                        // since analyze_plpgsql expects the complete CREATE FUNCTION
-                        match analyze_plpgsql(sql) {
-                            Ok(body_deps) => {
-                                relations.extend(body_deps.relations);
-                                functions.extend(body_deps.functions);
-                                types.extend(body_deps.types);
+                        if let Some(sql) = original_sql {
+                            match analyze_plpgsql(sql) {
+                                Ok(plpgsql_deps) => {
+                                    relations.extend(plpgsql_deps.relations);
+                                    functions.extend(plpgsql_deps.functions);
+                                    types.extend(plpgsql_deps.types);
+                                }
+                                Err(e) => {
+                                    eprintln!("Warning: Failed to analyze PL/pgSQL function: {}", e);
+                                }
                             }
-                            Err(e) => {
-                                // Log the error but don't fail the entire analysis
-                                eprintln!("Warning: Failed to parse PL/pgSQL function: {}", e);
-                            }
+                        } else {
+                            eprintln!("Warning: PL/pgSQL function body analysis requires original SQL text");
                         }
                     }
                 }
@@ -140,7 +154,7 @@ pub fn analyze_statement(sql: &str) -> Result<Dependencies, Box<dyn std::error::
     }
     
     // Extract types from cast expressions at the top level
-    let top_level_types = extract_types_from_ast(&parse_result.protobuf)?;
+    let top_level_types = extract_types_from_ast(parse_result)?;
     for typ in top_level_types {
         types.insert(typ);
     }
@@ -951,6 +965,9 @@ fn extract_type_from_type_name(type_name: &pg_query::protobuf::TypeName) -> Opti
         return None;
     }
     
+    // Note: array_bounds being non-empty indicates this is an array type (e.g., api.order_item[])
+    // We still want to extract the base type dependency
+    
     if name_parts.len() == 1 {
         Some(QualifiedIdent::from_name(name_parts[0].clone()))
     } else if name_parts.len() == 2 {
@@ -1039,16 +1056,18 @@ fn extract_dependencies_from_plpgsql_function(
             || expr_upper.starts_with("UPDATE")
             || expr_upper.starts_with("DELETE")
             || expr_upper.starts_with("WITH") {
-            // It's a SQL statement, analyze it normally
-            if let Ok(deps) = analyze_statement(&expr) {
-                for relation in deps.relations {
-                    relations.insert(relation);
-                }
-                for function in deps.functions {
-                    functions.insert(function);
-                }
-                for typ in deps.types {
-                    types.insert(typ);
+            // It's a SQL statement, analyze it but avoid recursive PL/pgSQL analysis
+            if let Ok(parse_result) = pg_query::parse(&expr) {
+                if let Ok(deps) = extract_dependencies_from_parse_result(&parse_result.protobuf) {
+                    for relation in deps.relations {
+                        relations.insert(relation);
+                    }
+                    for function in deps.functions {
+                        functions.insert(function);
+                    }
+                    for typ in deps.types {
+                        types.insert(typ);
+                    }
                 }
             }
         } else {
@@ -1583,5 +1602,154 @@ mod tests {
         let void_type = QualifiedIdent::from_name("void".to_string());
         assert!(result.types.contains(&int_type));
         assert!(result.types.contains(&void_type));
+    }
+
+    #[test]
+    fn test_composite_type_with_array_field() {
+        // Test that array type dependencies are correctly extracted
+        let sql = r#"
+            CREATE TYPE api.order_shipment AS (
+                shipment_id int,
+                tracking_number text,
+                items api.order_item[]
+            );
+        "#;
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should detect dependency on api.order_item (without the array notation)
+        let order_item_type = QualifiedIdent::new(Some("api".to_string()), "order_item".to_string());
+        assert!(result.types.contains(&order_item_type), 
+            "Failed to extract dependency on api.order_item from array type api.order_item[]. Found types: {:?}", 
+            result.types);
+    }
+
+    #[test]
+    fn test_multiple_array_type_dependencies() {
+        // Test with multiple custom types including arrays
+        let sql = r#"
+            CREATE TYPE api.order_shipment AS (
+                shipment_id           int,
+                tracking_number       text,
+                tracking_url_provider text,
+                shipping_price        currency,
+                status                tracking_status,
+                must_ship_by          timestamptz,
+                shipped_at            timestamptz,
+                delivered_at          timestamptz,
+                is_cancelled          boolean,
+                cancellation_reason   shipment_cancellation_reason,
+                items                 api.order_item[]
+            );
+        "#;
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should detect all custom type dependencies
+        let expected_types = vec![
+            QualifiedIdent::from_name("currency".to_string()),
+            QualifiedIdent::from_name("tracking_status".to_string()),
+            QualifiedIdent::from_name("shipment_cancellation_reason".to_string()),
+            QualifiedIdent::new(Some("api".to_string()), "order_item".to_string()),
+        ];
+        
+        for expected_type in expected_types {
+            assert!(result.types.contains(&expected_type), 
+                "Failed to extract dependency on {:?}. Found types: {:?}", 
+                expected_type, result.types);
+        }
+    }
+
+    #[test]
+    fn test_composite_type_with_enum_fields() {
+        // Test the exact case from the user
+        let sql = r#"
+            CREATE TYPE api.order_item AS (
+                item_id              int,
+                product_id           int,
+                product_name         text,
+                product_image        url,
+                description          text,
+                item_image           url,
+                price                currency,
+                quantity             int,
+                mini_assembly_status assembly_status,
+                mini_painting_status painting_status,
+                mini_content_status  content_status
+            );
+        "#;
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        // Should detect all custom type dependencies
+        let expected_types = vec![
+            QualifiedIdent::from_name("url".to_string()),
+            QualifiedIdent::from_name("currency".to_string()),
+            QualifiedIdent::from_name("assembly_status".to_string()),
+            QualifiedIdent::from_name("painting_status".to_string()),
+            QualifiedIdent::from_name("content_status".to_string()),
+        ];
+        
+        println!("Found types: {:?}", result.types);
+        
+        for expected_type in expected_types {
+            assert!(result.types.contains(&expected_type), 
+                "Failed to extract dependency on {:?}. Found types: {:?}", 
+                expected_type, result.types);
+        }
+    }
+
+    #[test]
+    fn test_identify_both_order_types() {
+        // Test that both types are identified from a file
+        let sql = r#"
+create type api.order_item as (
+    item_id              int,
+    product_id           int,
+    product_name         text,
+    product_image        url,
+    description          text,
+    item_image           url,
+    price                currency,
+    quantity             int,
+    mini_assembly_status assembly_status,
+    mini_painting_status painting_status,
+    mini_content_status  content_status
+);
+
+create type api.order_shipment as (
+    shipment_id           int,
+    tracking_number       text,
+    tracking_url_provider text,
+    shipping_price        currency,
+    status                tracking_status,
+    must_ship_by          timestamptz,
+    shipped_at            timestamptz,
+    delivered_at          timestamptz,
+    is_cancelled          boolean,
+    cancellation_reason   shipment_cancellation_reason,
+    items                 api.order_item[]
+);
+        "#;
+        
+        let statements = crate::sql::splitter::split_sql_file(sql).unwrap();
+        println!("Split into {} statements", statements.len());
+        
+        let mut found_objects = Vec::new();
+        for stmt in statements {
+            println!("Processing statement: {}", &stmt.sql[..50.min(stmt.sql.len())]);
+            if let Some(obj) = crate::sql::objects::identify_sql_object(&stmt.sql).unwrap() {
+                println!("Identified object: {:?} - {:?}", obj.object_type, obj.qualified_name);
+                found_objects.push(obj);
+            }
+        }
+        
+        assert_eq!(found_objects.len(), 2, "Should find both types");
+        
+        let order_item = found_objects.iter().find(|o| o.qualified_name.name == "order_item");
+        let order_shipment = found_objects.iter().find(|o| o.qualified_name.name == "order_shipment");
+        
+        assert!(order_item.is_some(), "Should find api.order_item");
+        assert!(order_shipment.is_some(), "Should find api.order_shipment");
     }
 }

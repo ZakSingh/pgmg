@@ -96,6 +96,7 @@ impl<'a> StateManager<'a> {
             let object_type_str: String = row.get(0);
             let object_type = match object_type_str.as_str() {
                 "view" => ObjectType::View,
+                "materialized_view" => ObjectType::MaterializedView,
                 "function" => ObjectType::Function,
                 "type" => ObjectType::Type,
                 "domain" => ObjectType::Domain,
@@ -128,6 +129,7 @@ impl<'a> StateManager<'a> {
         let object_type_str = match object_type {
             ObjectType::Table => "table",
             ObjectType::View => "view",
+            ObjectType::MaterializedView => "materialized_view",
             ObjectType::Function => "function",
             ObjectType::Type => "type",
             ObjectType::Domain => "domain",
@@ -162,6 +164,7 @@ impl<'a> StateManager<'a> {
         let object_type_str = match object_type {
             ObjectType::Table => "table",
             ObjectType::View => "view",
+            ObjectType::MaterializedView => "materialized_view",
             ObjectType::Function => "function",
             ObjectType::Type => "type",
             ObjectType::Domain => "domain",
@@ -191,6 +194,7 @@ impl<'a> StateManager<'a> {
         let object_type_str = match object_type {
             ObjectType::Table => "table",
             ObjectType::View => "view",
+            ObjectType::MaterializedView => "materialized_view",
             ObjectType::Function => "function",
             ObjectType::Type => "type",
             ObjectType::Domain => "domain",
@@ -244,6 +248,7 @@ mod tests {
         let type_str = match view_type {
             ObjectType::Table => "table",
             ObjectType::View => "view",
+            ObjectType::MaterializedView => "materialized_view",
             ObjectType::Function => "function",
             ObjectType::Type => "type",
             ObjectType::Domain => "domain",

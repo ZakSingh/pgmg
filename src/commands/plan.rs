@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use crate::db::{StateManager, connect_with_url, scan_sql_files, scan_migrations};
 use crate::sql::{SqlObject, ObjectType, objects::calculate_ddl_hash};
-use crate::analysis::DependencyGraph;
+use crate::analysis::{DependencyGraph, ObjectRef};
 use crate::BuiltinCatalog;
+use owo_colors::OwoColorize;
 
 #[derive(Debug)]
 pub struct PlanResult {
@@ -87,12 +88,74 @@ pub async fn execute_plan(
         let file_objects = scan_sql_files(code_dir, &builtin_catalog).await?;
         let db_objects = state_manager.get_tracked_objects().await?;
         
-        let object_changes = detect_object_changes(&file_objects, &db_objects).await?;
-        plan_result.changes.extend(object_changes);
+        let mut object_changes = detect_object_changes(&file_objects, &db_objects).await?;
         
         // Step 3: Build dependency graph for affected objects
         if !file_objects.is_empty() {
             let graph = DependencyGraph::build_from_objects(&file_objects, &builtin_catalog)?;
+            
+            // Step 3.5: Find all pgmg-managed objects affected by changes
+            let updated_objects: Vec<ObjectRef> = object_changes.iter()
+                .filter_map(|change| match change {
+                    ChangeOperation::UpdateObject { object, .. } => Some(ObjectRef {
+                        object_type: object.object_type.clone(),
+                        qualified_name: object.qualified_name.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            
+            if !updated_objects.is_empty() {
+                eprintln!("DEBUG: Looking for objects affected by {} updates", updated_objects.len());
+                for obj in &updated_objects {
+                    eprintln!("  - {:?}: {}", obj.object_type, format_qualified_name(&obj.qualified_name));
+                    let deps = graph.dependents_of(obj);
+                    eprintln!("    Direct dependents: {}", deps.len());
+                    for dep in &deps {
+                        eprintln!("      -> {:?}: {}", dep.object_type, format_qualified_name(&dep.qualified_name));
+                    }
+                }
+                
+                // Use the dependency graph we built from file objects to find affected objects
+                let affected_objects = graph.affected_by_changes(&updated_objects);
+                eprintln!("DEBUG: {} pgmg-managed objects affected by changes", affected_objects.len());
+                
+                // Add dependent objects that need to be recreated
+                for affected_ref in affected_objects {
+                    // Skip objects that are already in the change list
+                    let already_included = object_changes.iter().any(|change| match change {
+                        ChangeOperation::UpdateObject { object, .. } |
+                        ChangeOperation::CreateObject { object, .. } => {
+                            object.object_type == affected_ref.object_type &&
+                            object.qualified_name == affected_ref.qualified_name
+                        }
+                        ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                            let qname = crate::sql::QualifiedIdent::from_qualified_name(object_name);
+                            object_type == &affected_ref.object_type &&
+                            qname == affected_ref.qualified_name
+                        }
+                        _ => false,
+                    });
+                    
+                    if !already_included {
+                        // Find the object in file_objects to get its DDL
+                        if let Some(file_obj) = file_objects.iter().find(|obj| 
+                            obj.object_type == affected_ref.object_type &&
+                            obj.qualified_name == affected_ref.qualified_name
+                        ) {
+                            // Add as an update operation (drop and recreate due to dependency)
+                            object_changes.push(ChangeOperation::UpdateObject {
+                                object: file_obj.clone(),
+                                old_hash: String::new(), // We don't have the old hash, but it's not critical
+                                new_hash: calculate_ddl_hash(&file_obj.ddl_statement),
+                                reason: "Dependency requires recreation".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            
+            plan_result.changes.extend(object_changes);
             
             // Write graph output if requested
             if let Some(output_path) = output_graph {
@@ -194,53 +257,70 @@ fn format_qualified_name(qualified_name: &crate::sql::QualifiedIdent) -> String 
 }
 
 pub fn print_plan_summary(plan: &PlanResult) {
-    println!("\n=== PGMG Plan Summary ===");
+    println!("\n{}", "=== PGMG Plan Summary ===".bold().blue());
     
     if !plan.new_migrations.is_empty() {
-        println!("\nNew Migrations to Apply:");
+        println!("\n{}:", "New Migrations to Apply".bold());
         for migration in &plan.new_migrations {
-            println!("  + {}", migration);
+            println!("  {} {}", "+".green().bold(), migration.cyan());
         }
     }
     
     if !plan.changes.is_empty() {
-        println!("\nObject Changes:");
+        println!("\n{}:", "Object Changes".bold());
         for change in &plan.changes {
             match change {
                 ChangeOperation::CreateObject { object, reason } => {
-                    println!("  + CREATE {} {} ({})", 
-                        format!("{:?}", object.object_type).to_uppercase(),
-                        format_qualified_name(&object.qualified_name),
-                        reason
+                    println!("  {} {} {} {} ({})", 
+                        "+".green().bold(),
+                        "CREATE".green().bold(),
+                        object.object_type.to_string().yellow(),
+                        format_qualified_name(&object.qualified_name).cyan(),
+                        reason.dimmed()
                     );
                 }
                 ChangeOperation::UpdateObject { object, old_hash, new_hash, reason } => {
-                    println!("  ~ UPDATE {} {} ({})", 
-                        format!("{:?}", object.object_type).to_uppercase(),
-                        format_qualified_name(&object.qualified_name),
-                        reason
+                    println!("  {} {} {} {} ({})", 
+                        "~".yellow().bold(),
+                        "UPDATE".yellow().bold(),
+                        object.object_type.to_string().yellow(),
+                        format_qualified_name(&object.qualified_name).cyan(),
+                        reason.dimmed()
                     );
-                    println!("    Old hash: {}...", &old_hash[..8]);
-                    println!("    New hash: {}...", &new_hash[..8]);
+                    if !old_hash.is_empty() && old_hash.len() >= 8 {
+                        println!("    {}: {}...", "Old hash".dimmed(), old_hash[..8].to_string().red());
+                    }
+                    if !new_hash.is_empty() && new_hash.len() >= 8 {
+                        println!("    {}: {}...", "New hash".dimmed(), new_hash[..8].to_string().green());
+                    }
                 }
                 ChangeOperation::DeleteObject { object_type, object_name, reason } => {
-                    println!("  - DELETE {} {} ({})", 
-                        format!("{:?}", object_type).to_uppercase(),
-                        object_name,
-                        reason
+                    println!("  {} {} {} {} ({})", 
+                        "-".red().bold(),
+                        "DELETE".red().bold(),
+                        object_type.to_string().yellow(),
+                        object_name.cyan(),
+                        reason.dimmed()
                     );
                 }
                 ChangeOperation::ApplyMigration { name, .. } => {
-                    println!("  > MIGRATION {} ", name);
+                    println!("  {} {} {}", 
+                        ">".magenta().bold(),
+                        "MIGRATION".magenta().bold(),
+                        name.cyan()
+                    );
                 }
             }
         }
     } else if plan.new_migrations.is_empty() {
-        println!("\nNo changes detected. Database is up to date.");
+        println!("\n{}", "No changes detected. Database is up to date.".green());
     }
     
     if let Some(graph) = &plan.dependency_graph {
-        println!("\nDependency Graph: {} objects, {} dependencies", 
-            graph.node_count(), graph.edge_count());
+        println!("\n{}: {} objects, {} dependencies", 
+            "Dependency Graph".bold(),
+            graph.node_count().to_string().yellow(),
+            graph.edge_count().to_string().yellow()
+        );
     }
 }

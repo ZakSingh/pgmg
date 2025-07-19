@@ -1,4 +1,5 @@
 use crate::commands::{execute_plan, execute_apply};
+use crate::config::PgmgConfig;
 use crate::error::{PgmgError, Result};
 use crate::logging::output;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -16,6 +17,7 @@ pub struct WatchConfig {
     pub connection_string: String,
     pub debounce_duration: Duration,
     pub auto_apply: bool,
+    pub pgmg_config: PgmgConfig,
 }
 
 impl Default for WatchConfig {
@@ -26,6 +28,7 @@ impl Default for WatchConfig {
             connection_string: String::new(),
             debounce_duration: Duration::from_millis(500),
             auto_apply: true,
+            pgmg_config: PgmgConfig::default(),
         }
     }
 }
@@ -224,6 +227,7 @@ async fn process_changes(config: &WatchConfig, paths: HashSet<PathBuf>) {
                     config.migrations_dir.clone(),
                     config.code_dir.clone(),
                     config.connection_string.clone(),
+                    &config.pgmg_config,
                 ).await {
                     Ok(apply_result) => {
                         if apply_result.errors.is_empty() {

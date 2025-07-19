@@ -15,6 +15,12 @@ pub struct PgmgConfig {
     
     /// Path to output dependency graph (for plan command)
     pub output_graph: Option<PathBuf>,
+    
+    /// Enable development mode features
+    pub development_mode: Option<bool>,
+    
+    /// Emit NOTIFY events when objects are loaded (requires development_mode)
+    pub emit_notify_events: Option<bool>,
 }
 
 impl PgmgConfig {
@@ -48,7 +54,21 @@ impl PgmgConfig {
             migrations_dir: cli_migrations_dir.or(base_config.migrations_dir),
             code_dir: cli_code_dir.or(base_config.code_dir),
             output_graph: cli_output_graph.or(base_config.output_graph),
+            development_mode: base_config.development_mode,
+            emit_notify_events: base_config.emit_notify_events,
         }
+    }
+    
+    /// Apply development mode settings from CLI
+    pub fn with_dev_mode(mut self, dev_mode: bool) -> Self {
+        if dev_mode {
+            self.development_mode = Some(true);
+            // Enable notify events by default in dev mode unless explicitly disabled
+            if self.emit_notify_events.is_none() {
+                self.emit_notify_events = Some(true);
+            }
+        }
+        self
     }
     
     /// Create a sample configuration file
@@ -58,6 +78,8 @@ impl PgmgConfig {
             migrations_dir: Some(PathBuf::from("migrations")),
             code_dir: Some(PathBuf::from("sql")),
             output_graph: None,
+            development_mode: Some(false),
+            emit_notify_events: Some(false),
         };
         
         let content = toml::to_string_pretty(&sample_config)?;
@@ -74,6 +96,8 @@ impl Default for PgmgConfig {
             migrations_dir: None,
             code_dir: None,
             output_graph: None,
+            development_mode: None,
+            emit_notify_events: None,
         }
     }
 }
@@ -91,6 +115,8 @@ mod tests {
             migrations_dir: Some(PathBuf::from("migrations")),
             code_dir: Some(PathBuf::from("sql")),
             output_graph: Some(PathBuf::from("graph.dot")),
+            development_mode: Some(true),
+            emit_notify_events: Some(false),
         };
         
         let toml_str = toml::to_string(&config).unwrap();
@@ -100,6 +126,8 @@ mod tests {
         assert_eq!(config.migrations_dir, parsed.migrations_dir);
         assert_eq!(config.code_dir, parsed.code_dir);
         assert_eq!(config.output_graph, parsed.output_graph);
+        assert_eq!(config.development_mode, parsed.development_mode);
+        assert_eq!(config.emit_notify_events, parsed.emit_notify_events);
     }
     
     #[test]
@@ -109,6 +137,8 @@ mod tests {
             migrations_dir: Some(PathBuf::from("config_migrations")),
             code_dir: Some(PathBuf::from("config_sql")),
             output_graph: Some(PathBuf::from("config_graph.dot")),
+            development_mode: Some(false),
+            emit_notify_events: Some(true),
         };
         
         let merged = PgmgConfig::merge_with_cli(
@@ -180,5 +210,25 @@ code_dir = "test_sql"
         
         // Restore original directory
         let _ = env::set_current_dir(original_dir);
+    }
+    
+    #[test]
+    fn test_with_dev_mode() {
+        // Test enabling dev mode
+        let config = PgmgConfig::default().with_dev_mode(true);
+        assert_eq!(config.development_mode, Some(true));
+        assert_eq!(config.emit_notify_events, Some(true));
+        
+        // Test that existing emit_notify_events setting is preserved
+        let mut config_with_notify_false = PgmgConfig::default();
+        config_with_notify_false.emit_notify_events = Some(false);
+        let config_with_notify_false = config_with_notify_false.with_dev_mode(true);
+        assert_eq!(config_with_notify_false.development_mode, Some(true));
+        assert_eq!(config_with_notify_false.emit_notify_events, Some(false));
+        
+        // Test not enabling dev mode
+        let config_no_dev = PgmgConfig::default().with_dev_mode(false);
+        assert_eq!(config_no_dev.development_mode, None);
+        assert_eq!(config_no_dev.emit_notify_events, None);
     }
 }
