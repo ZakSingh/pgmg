@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use crate::db::{StateManager, connect_with_url};
-use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file};
+use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table, extract_function_signature}, splitter::split_sql_file};
 use crate::commands::plan::{execute_plan, ChangeOperation};
 use crate::config::PgmgConfig;
 use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification};
-use crate::plpgsql_check::{check_modified_functions, display_check_errors};
+use crate::plpgsql_check::{check_modified_functions, check_soft_dependent_functions, display_check_errors};
+use crate::error::format_postgres_error_with_details;
 use owo_colors::OwoColorize;
 
 #[derive(Debug)]
@@ -68,8 +69,10 @@ pub async fn execute_apply(
                         println!("  {} Applied migration: {}", "✓".green().bold(), migration_name.cyan());
                     }
                     Err(e) => {
-                        apply_result.errors.push(format!("Failed to apply migration {}: {}", migration_name, e));
-                        println!("  {} Failed migration: {} - {}", "✗".red().bold(), migration_name.cyan(), e.to_string().red());
+                        // The error from apply_migration already contains detailed formatting
+                        apply_result.errors.push(e.to_string());
+                        println!("  {} Failed migration: {}", "✗".red().bold(), migration_name.cyan());
+                        println!("{}", e.to_string().red());
                     }
                 }
             }
@@ -232,8 +235,22 @@ pub async fn execute_apply(
                     }
                     Err(e) => {
                         let action = if is_update { "recreate" } else { "create" };
-                        apply_result.errors.push(format!("Failed to {} {}: {}", action, format_object_name(object), e));
-                        println!("  {} Failed to {} {}: {}", "✗".red().bold(), action, format_object_name(object).cyan(), e.to_string().red());
+                        
+                        // Try to downcast to tokio_postgres::Error for detailed formatting
+                        let detailed_error = if let Some(pg_err) = e.downcast_ref::<tokio_postgres::Error>() {
+                            format_postgres_error_with_details(
+                                &format_object_name(object),
+                                object.source_file.as_deref(),
+                                object.start_line,
+                                &object.ddl_statement,
+                                pg_err
+                            )
+                        } else {
+                            format!("Failed to {} {}: {}", action, format_object_name(object), e)
+                        };
+                        
+                        apply_result.errors.push(detailed_error.clone());
+                        println!("  {} {}", "✗".red().bold(), detailed_error);
                         transaction_aborted = true;
                     }
                 }
@@ -247,6 +264,7 @@ pub async fn execute_apply(
        config.check_plpgsql.unwrap_or(false) &&
        !modified_objects.is_empty() {
         
+        // Check the modified functions themselves
         match check_modified_functions(&transaction, &modified_objects).await {
             Ok(check_errors) => {
                 display_check_errors(&check_errors);
@@ -255,6 +273,25 @@ pub async fn execute_apply(
                 // Log but don't fail the operation
                 eprintln!("{}: Failed to run plpgsql_check: {}", 
                     "Warning".yellow().bold(), e);
+            }
+        }
+        
+        // Also check soft dependents if we have a dependency graph
+        if let Some(ref dependency_graph) = plan_result.dependency_graph {
+            match check_soft_dependent_functions(
+                &transaction, 
+                dependency_graph, 
+                &modified_objects,
+                &plan_result.file_objects
+            ).await {
+                Ok(check_errors) => {
+                    display_check_errors(&check_errors);
+                }
+                Err(e) => {
+                    // Log but don't fail the operation
+                    eprintln!("{}: Failed to check dependent functions: {}", 
+                        "Warning".yellow().bold(), e);
+                }
             }
         }
     }
@@ -287,15 +324,28 @@ async fn apply_migration(
     // Split migration into statements and execute each one
     let statements = split_sql_file(&migration_content)?;
     
-    for statement in statements {
+    for (idx, statement) in statements.iter().enumerate() {
         if !statement.sql.trim().is_empty() {
-            client.execute(&statement.sql, &[]).await?;
+            match client.execute(&statement.sql, &[]).await {
+                Ok(_) => {},
+                Err(e) => {
+                    // Create a detailed error message with context
+                    let detailed_error = format_postgres_error_with_details(
+                        &format!("migration {} (statement {})", migration_name, idx + 1),
+                        Some(&migration_path),
+                        statement.start_line,
+                        &statement.sql,
+                        &e
+                    );
+                    return Err(detailed_error.into());
+                }
+            }
         }
     }
     
     // Record migration as applied in pgmg_migrations table
     client.execute(
-        "INSERT INTO pgmg_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+        "INSERT INTO pgmg.pgmg_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
         &[&migration_name],
     ).await?;
     
@@ -336,27 +386,53 @@ async fn apply_drop_for_update(
     client: &tokio_postgres::Transaction<'_>,
     object: &SqlObject,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Handle special cases for object types that can't be dropped normally
+    if object.object_type == ObjectType::Comment {
+        // Comments can't be dropped, only set to NULL
+        let comment_null_statement = generate_comment_null_statement_from_object(object)?;
+        client.execute(&comment_null_statement, &[]).await?;
+        return Ok(());
+    }
+    
     // Just drop the object - creation will happen in a separate phase
-    let drop_statement = if object.object_type == ObjectType::Trigger {
-        // For triggers, we need to extract the table name from the DDL
-        match extract_trigger_table(&object.ddl_statement) {
-            Ok(table_name) => {
-                let trigger_name = match &object.qualified_name.schema {
-                    Some(schema) => format!("{}.{}", schema, object.qualified_name.name),
-                    None => object.qualified_name.name.clone(),
-                };
-                let table_full_name = match &table_name.schema {
-                    Some(schema) => format!("{}.{}", schema, table_name.name),
-                    None => table_name.name.clone(),
-                };
-                format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, table_full_name)
-            }
-            Err(e) => {
-                return Err(format!("Could not extract table name from trigger DDL: {}", e).into());
+    let drop_statement = match object.object_type {
+        ObjectType::Trigger => {
+            // For triggers, we need to extract the table name from the DDL
+            match extract_trigger_table(&object.ddl_statement) {
+                Ok(table_name) => {
+                    let trigger_name = match &object.qualified_name.schema {
+                        Some(schema) => format!("{}.{}", schema, object.qualified_name.name),
+                        None => object.qualified_name.name.clone(),
+                    };
+                    let table_full_name = match &table_name.schema {
+                        Some(schema) => format!("{}.{}", schema, table_name.name),
+                        None => table_name.name.clone(),
+                    };
+                    format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, table_full_name)
+                }
+                Err(e) => {
+                    return Err(format!("Could not extract table name from trigger DDL: {}", e).into());
+                }
             }
         }
-    } else {
-        generate_drop_statement(&object.object_type, &object.qualified_name)
+        ObjectType::Function | ObjectType::Procedure => {
+            // For functions and procedures, we need the full signature
+            match extract_function_signature(&object.ddl_statement) {
+                Ok(signature) => {
+                    let object_type_str = if object.object_type == ObjectType::Function {
+                        "FUNCTION"
+                    } else {
+                        "PROCEDURE"
+                    };
+                    format!("DROP {} IF EXISTS {}", object_type_str, signature)
+                }
+                Err(_) => {
+                    // Fall back to the simple drop statement
+                    generate_drop_statement(&object.object_type, &object.qualified_name)
+                }
+            }
+        }
+        _ => generate_drop_statement(&object.object_type, &object.qualified_name)
     };
     client.execute(&drop_statement, &[]).await?;
     Ok(())
@@ -387,6 +463,36 @@ async fn apply_delete_object(
 }
 
 
+fn generate_comment_null_statement_from_object(object: &SqlObject) -> Result<String, Box<dyn std::error::Error>> {
+    let comment_identifier = &object.qualified_name.name;
+    
+    // Parse comment identifiers like:
+    // "table:users" -> "COMMENT ON TABLE users IS NULL"
+    // "column:users.email" -> "COMMENT ON COLUMN users.email IS NULL"  
+    // "function:api.get_user" -> "COMMENT ON FUNCTION api.get_user IS NULL"
+    // "trigger:my_trigger:my_table" -> "COMMENT ON TRIGGER my_trigger ON my_table IS NULL"
+    
+    let parts: Vec<&str> = comment_identifier.split(':').collect();
+    
+    match parts.as_slice() {
+        ["table", name] => Ok(format!("COMMENT ON TABLE {} IS NULL", name)),
+        ["view", name] => Ok(format!("COMMENT ON VIEW {} IS NULL", name)),
+        ["function", name] => {
+            // Since pgmg prevents function overloading, we can use the name without parentheses
+            // Remove any trailing () if present in the identifier
+            let func_name = name.trim_end_matches("()");
+            Ok(format!("COMMENT ON FUNCTION {} IS NULL", func_name))
+        }
+        ["type", name] => Ok(format!("COMMENT ON TYPE {} IS NULL", name)),
+        ["domain", name] => Ok(format!("COMMENT ON DOMAIN {} IS NULL", name)),
+        ["column", name] => Ok(format!("COMMENT ON COLUMN {} IS NULL", name)),
+        ["trigger", trigger_name, table_name] => {
+            Ok(format!("COMMENT ON TRIGGER {} ON {} IS NULL", trigger_name, table_name))
+        }
+        _ => Err(format!("Unknown comment identifier format: {}", comment_identifier).into()),
+    }
+}
+
 fn generate_comment_null_statement(comment_identifier: &str) -> Result<String, Box<dyn std::error::Error>> {
     // Parse comment identifiers like:
     // "table:users" -> "COMMENT ON TABLE users IS NULL"
@@ -399,7 +505,11 @@ fn generate_comment_null_statement(comment_identifier: &str) -> Result<String, B
     match parts.as_slice() {
         ["table", name] => Ok(format!("COMMENT ON TABLE {} IS NULL", name)),
         ["view", name] => Ok(format!("COMMENT ON VIEW {} IS NULL", name)),
-        ["function", name] => Ok(format!("COMMENT ON FUNCTION {} IS NULL", name)),
+        ["function", name] => {
+            // Since pgmg prevents function overloading, we can use the name without parentheses
+            let func_name = name.trim_end_matches("()");
+            Ok(format!("COMMENT ON FUNCTION {} IS NULL", func_name))
+        }
         ["type", name] => Ok(format!("COMMENT ON TYPE {} IS NULL", name)),
         ["domain", name] => Ok(format!("COMMENT ON DOMAIN {} IS NULL", name)),
         ["column", name] => Ok(format!("COMMENT ON COLUMN {} IS NULL", name)),
@@ -422,6 +532,8 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
         ObjectType::Index => "INDEX",
         ObjectType::Trigger => "TRIGGER",
         ObjectType::Comment => "COMMENT",
+        ObjectType::CronJob => "CRON_JOB",  // Will be handled specially
+        ObjectType::Aggregate => "AGGREGATE",
     };
     
     let full_name = match &qualified_name.schema {
@@ -431,18 +543,24 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
     
     match object_type {
         ObjectType::Function => {
-            // For functions, we need to handle overloading - use CASCADE for simplicity
-            format!("DROP {} IF EXISTS {} CASCADE", object_type_str, full_name)
+            // pgmg prevents function overloading, so CASCADE is not needed
+            // This ensures safety - unmanaged objects depending on this function will block the drop
+            format!("DROP {} IF EXISTS {}", object_type_str, full_name)
         }
         ObjectType::Procedure => {
-            // For procedures, we also need to handle overloading - use CASCADE for simplicity
-            format!("DROP {} IF EXISTS {} CASCADE", object_type_str, full_name)
+            // pgmg prevents procedure overloading, so CASCADE is not needed
+            // This ensures safety - unmanaged objects depending on this procedure will block the drop
+            format!("DROP {} IF EXISTS {}", object_type_str, full_name)
         }
         ObjectType::Trigger => {
             // Triggers need special handling - they require the table name
             // We'll need to return both the trigger name and table name
             // For now, return just the trigger name and we'll handle it specially
             format!("DROP TRIGGER IF EXISTS {}", full_name)
+        }
+        ObjectType::CronJob => {
+            // For cron jobs, we use cron.unschedule
+            format!("SELECT cron.unschedule('{}')", qualified_name.name)
         }
         _ => {
             format!("DROP {} IF EXISTS {}", object_type_str, full_name)
@@ -467,6 +585,8 @@ async fn update_object_hash_in_transaction(
         ObjectType::Index => "index",
         ObjectType::Trigger => "trigger",
         ObjectType::Comment => "comment",
+        ObjectType::CronJob => "cron_job",
+        ObjectType::Aggregate => "aggregate",
     };
 
     let qualified_name = match &object_name.schema {
@@ -476,7 +596,7 @@ async fn update_object_hash_in_transaction(
 
     client.execute(
         r#"
-        INSERT INTO pgmg_state (object_type, object_name, ddl_hash) 
+        INSERT INTO pgmg.pgmg_state (object_type, object_name, ddl_hash) 
         VALUES ($1, $2, $3)
         ON CONFLICT (object_type, object_name) 
         DO UPDATE SET ddl_hash = $3, last_applied = NOW()
@@ -503,6 +623,8 @@ async fn remove_object_from_state_in_transaction(
         ObjectType::Index => "index",
         ObjectType::Trigger => "trigger",
         ObjectType::Comment => "comment",
+        ObjectType::CronJob => "cron_job",
+        ObjectType::Aggregate => "aggregate",
     };
 
     let qualified_name = match &object_name.schema {
@@ -511,7 +633,7 @@ async fn remove_object_from_state_in_transaction(
     };
 
     client.execute(
-        "DELETE FROM pgmg_state WHERE object_type = $1 AND object_name = $2",
+        "DELETE FROM pgmg.pgmg_state WHERE object_type = $1 AND object_name = $2",
         &[&object_type_str, &qualified_name],
     ).await?;
 
@@ -581,11 +703,20 @@ async fn get_object_oid(
             // Comments don't have OIDs - they're metadata attached to objects
             return Err("Comment OID lookup not applicable".into());
         }
+        ObjectType::CronJob => {
+            // Cron jobs are stored in the cron.job table, not in pg_catalog
+            return Err("Cron job OID lookup not yet implemented".into());
+        }
+        ObjectType::Aggregate => {
+            "SELECT p.oid FROM pg_proc p 
+             JOIN pg_namespace n ON n.oid = p.pronamespace 
+             WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind = 'a'"
+        }
     };
     
     let row = client.query_one(query, &[&schema_name, &object_name]).await?;
-    let oid: i32 = row.get(0);
-    Ok(oid as u32)
+    let oid: u32 = row.get(0);
+    Ok(oid)
 }
 
 fn format_object_name(object: &SqlObject) -> String {

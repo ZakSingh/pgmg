@@ -149,6 +149,40 @@ pub fn extract_dependencies_from_parse_result_with_sql(parse_result: &pg_query::
                         }
                     }
                 }
+                
+                // Check if this is a CREATE AGGREGATE (DefineStmt with kind = OBJECT_AGGREGATE)
+                if let NodeEnum::DefineStmt(define_stmt) = node {
+                    if define_stmt.kind == 2 { // OBJECT_AGGREGATE = 2 in pg_query protobuf
+                        // Extract dependencies from the aggregate definition
+                        for def_elem in &define_stmt.definition {
+                            if let Some(NodeEnum::DefElem(def_elem)) = &def_elem.node {
+                                let defname = &def_elem.defname;
+                                if !defname.is_empty() {
+                                    // Look for sfunc, finalfunc, combinefunc, etc.
+                                    if defname == "sfunc" || defname == "finalfunc" || 
+                                       defname == "combinefunc" || defname == "serialfunc" || 
+                                       defname == "deserialfunc" || defname == "msfunc" ||
+                                       defname == "minvfunc" || defname == "mfinalfunc" {
+                                        if let Some(arg) = &def_elem.arg {
+                                            if let Some(func_name) = extract_function_name_from_node(arg) {
+                                                functions.insert(func_name);
+                                            }
+                                        }
+                                    }
+                                    // Look for stype, finalfunc_extra, etc. (type dependencies)
+                                    else if defname == "stype" || defname == "finalfunc_extra" ||
+                                           defname == "mstype" {
+                                        if let Some(arg) = &def_elem.arg {
+                                            if let Some(type_name) = extract_type_name_from_node(arg) {
+                                                types.insert(type_name);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1181,6 +1215,72 @@ fn extract_types_from_datum(datum: &Value, types: &mut HashSet<QualifiedIdent>) 
                 }
             }
         }
+    }
+}
+
+/// Extract function name from a single node (for CREATE AGGREGATE dependencies)
+fn extract_function_name_from_node(node: &pg_query::protobuf::Node) -> Option<QualifiedIdent> {
+    match &node.node {
+        Some(NodeEnum::String(string_node)) => {
+            // Simple function name
+            Some(QualifiedIdent::from_name(string_node.sval.clone()))
+        }
+        Some(NodeEnum::TypeName(type_name)) => {
+            // Function name stored as TypeName (common in DefineStmt)
+            extract_type_from_type_name(type_name)
+        }
+        Some(NodeEnum::List(list)) => {
+            // Qualified function name (schema.function)
+            let name_parts: Vec<String> = list.items.iter()
+                .filter_map(|item| {
+                    if let Some(NodeEnum::String(s)) = &item.node {
+                        Some(s.sval.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            
+            match name_parts.len() {
+                1 => Some(QualifiedIdent::from_name(name_parts[0].clone())),
+                2 => Some(QualifiedIdent::new(Some(name_parts[0].clone()), name_parts[1].clone())),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract type name from a single node (for CREATE AGGREGATE dependencies)
+fn extract_type_name_from_node(node: &pg_query::protobuf::Node) -> Option<QualifiedIdent> {
+    match &node.node {
+        Some(NodeEnum::String(string_node)) => {
+            // Simple type name
+            Some(QualifiedIdent::from_name(string_node.sval.clone()))
+        }
+        Some(NodeEnum::TypeName(type_name)) => {
+            // Use existing function to extract from TypeName
+            extract_type_from_type_name(type_name)
+        }
+        Some(NodeEnum::List(list)) => {
+            // Qualified type name (schema.type)
+            let name_parts: Vec<String> = list.items.iter()
+                .filter_map(|item| {
+                    if let Some(NodeEnum::String(s)) = &item.node {
+                        Some(s.sval.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            
+            match name_parts.len() {
+                1 => Some(QualifiedIdent::from_name(name_parts[0].clone())),
+                2 => Some(QualifiedIdent::new(Some(name_parts[0].clone()), name_parts[1].clone())),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

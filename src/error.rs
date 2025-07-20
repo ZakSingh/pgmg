@@ -293,3 +293,157 @@ pub fn suggest_fix(err: &PgmgError) -> Option<String> {
         _ => None,
     }
 }
+
+// PostgreSQL error detail extraction
+use tokio_postgres::error::ErrorPosition;
+
+#[derive(Debug)]
+pub struct PostgresErrorDetails {
+    pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    pub position: Option<usize>,
+    pub code: String,
+    pub severity: String,
+}
+
+/// Extract detailed error information from a PostgreSQL error
+pub fn extract_postgres_error_details(err: &tokio_postgres::Error) -> Option<PostgresErrorDetails> {
+    if let Some(db_err) = err.as_db_error() {
+        Some(PostgresErrorDetails {
+            message: db_err.message().to_string(),
+            detail: db_err.detail().map(|s| s.to_string()),
+            hint: db_err.hint().map(|s| s.to_string()),
+            position: db_err.position().and_then(|pos| {
+                match pos {
+                    ErrorPosition::Original(pos) => Some(*pos as usize),
+                    ErrorPosition::Internal { position, .. } => Some(*position as usize),
+                }
+            }),
+            code: db_err.code().code().to_string(),
+            severity: db_err.severity().to_string(),
+        })
+    } else {
+        None
+    }
+}
+
+/// Calculate line and column number from a byte position in text
+pub fn calculate_line_column(text: &str, byte_position: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut column = 1;
+    let mut current_pos = 0;
+    
+    for ch in text.chars() {
+        if current_pos >= byte_position {
+            break;
+        }
+        
+        let char_len = ch.len_utf8();
+        current_pos += char_len;
+        
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    
+    (line, column)
+}
+
+/// Format a PostgreSQL error with enhanced details including line numbers
+pub fn format_postgres_error_with_details(
+    object_name: &str,
+    source_file: Option<&std::path::Path>,
+    start_line: Option<usize>,
+    sql: &str,
+    err: &tokio_postgres::Error,
+) -> String {
+    use owo_colors::OwoColorize;
+    
+    let mut output = format!("Failed to execute SQL for {}", object_name.red());
+    
+    if let Some(details) = extract_postgres_error_details(err) {
+        // Add file location if available
+        if let Some(file) = source_file {
+            output.push_str(&format!("\n  {}: {}", "File".dimmed(), file.display()));
+        }
+        
+        // Add SQL error position
+        if let Some(pos) = details.position {
+            let (line, col) = calculate_line_column(sql, pos - 1); // PostgreSQL positions are 1-based
+            
+            if let (Some(file_line), Some(_)) = (start_line, source_file) {
+                let absolute_line = file_line + line - 1;
+                output.push_str(&format!("\n  {} line {}, column {}", 
+                    "Error at".yellow(), 
+                    absolute_line.to_string().yellow().bold(),
+                    col.to_string().yellow().bold()
+                ));
+            } else {
+                output.push_str(&format!("\n  {} line {}, column {}", 
+                    "Error at SQL".yellow(),
+                    line.to_string().yellow().bold(),
+                    col.to_string().yellow().bold()
+                ));
+            }
+            
+            // Show the problematic line with error marker
+            if let Some(error_line) = sql.lines().nth(line - 1) {
+                output.push_str(&format!("\n  {}", error_line.dimmed()));
+                output.push_str(&format!("\n  {}{}", " ".repeat(col - 1), "^".red().bold()));
+            }
+        }
+        
+        output.push_str(&format!("\n  {}: {}", "Error".red().bold(), details.message));
+        
+        if let Some(detail) = details.detail {
+            output.push_str(&format!("\n  {}: {}", "Detail".yellow(), detail));
+        }
+        
+        if let Some(hint) = details.hint {
+            output.push_str(&format!("\n  {}: {}", "Hint".green(), hint));
+        }
+        
+        output.push_str(&format!("\n  {}: {} ({})", "Code".dimmed(), details.code, details.severity));
+    } else {
+        // Fallback to simple error message
+        output.push_str(&format!(": {}", err));
+    }
+    
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_line_column() {
+        let sql = "SELECT * FROM users\nWHERE id = 1\nAND name = 'test'";
+        
+        // Test position at start
+        assert_eq!(calculate_line_column(sql, 0), (1, 1));
+        
+        // Test position on first line
+        assert_eq!(calculate_line_column(sql, 7), (1, 8)); // at '*'
+        
+        // Test position on second line
+        assert_eq!(calculate_line_column(sql, 20), (2, 1)); // at 'W' in WHERE
+        assert_eq!(calculate_line_column(sql, 25), (2, 6)); // at 'i' in id
+        
+        // Test position on third line
+        assert_eq!(calculate_line_column(sql, 33), (3, 1)); // at 'A' in AND
+    }
+    
+    #[test]
+    fn test_calculate_line_column_with_unicode() {
+        let sql = "SELECT '🎉' FROM table\nWHERE x = 1";
+        
+        // Test position after emoji (4 bytes)
+        assert_eq!(calculate_line_column(sql, 8), (1, 9)); // at '🎉'
+        assert_eq!(calculate_line_column(sql, 12), (1, 10)); // after '🎉'
+    }
+}

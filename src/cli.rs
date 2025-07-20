@@ -56,7 +56,7 @@ pub enum Commands {
         dev: bool,
     },
     
-    /// Watch for file changes and automatically reload (development mode)
+    /// Watch for file changes and automatically reload (always runs in development mode)
     Watch {
         /// Directory containing sequential migration files
         #[arg(long)]
@@ -77,10 +77,6 @@ pub enum Commands {
         /// Disable automatic apply after detecting changes
         #[arg(long)]
         no_auto_apply: bool,
-        
-        /// Enable development mode (includes NOTIFY events)
-        #[arg(long)]
-        dev: bool,
     },
     
     /// Reset database (drop and recreate from scratch)
@@ -122,6 +118,13 @@ pub enum Commands {
         /// PostgreSQL connection string
         #[arg(long)]
         connection_string: Option<String>,
+    },
+    
+    /// Create a new migration file
+    New {
+        /// Directory containing sequential migration files
+        #[arg(long)]
+        migrations_dir: Option<PathBuf>,
     },
 }
 
@@ -194,13 +197,12 @@ mod tests {
         let cli = Cli::try_parse_from(args).unwrap();
         
         match cli.command {
-            Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply, dev } => {
+            Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply } => {
                 assert_eq!(migrations_dir, Some(PathBuf::from("/path/to/migrations")));
                 assert_eq!(code_dir, Some(PathBuf::from("/path/to/sql")));
                 assert_eq!(connection_string, Some("postgresql://localhost/db".to_string()));
                 assert_eq!(debounce_ms, 1000);
                 assert_eq!(no_auto_apply, true);
-                assert_eq!(dev, false);
             }
             _ => panic!("Expected Watch command"),
         }

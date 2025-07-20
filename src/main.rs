@@ -1,7 +1,7 @@
 use tokio_postgres::NoTls;
 use pgmg::{analyze_statement, filter_builtins, BuiltinCatalog, DependencyGraph};
 use pgmg::cli::{Cli, Commands};
-use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig, execute_reset, print_reset_summary, execute_test, print_test_summary, execute_seed, print_seed_summary};
+use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig, execute_reset, print_reset_summary, execute_test, print_test_summary, execute_seed, print_seed_summary, execute_new, print_new_summary};
 use pgmg::config::PgmgConfig;
 use pgmg::error::{PgmgError, Result};
 use pgmg::logging;
@@ -163,7 +163,7 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         
-        Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply, dev } => {
+        Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply } => {
             // Merge CLI args with config file
             let merged_config = PgmgConfig::merge_with_cli(
                 config_file,
@@ -171,7 +171,7 @@ async fn run(cli: Cli) -> Result<()> {
                 code_dir,
                 connection_string,
                 None, // watch command doesn't use output_graph
-            ).with_dev_mode(dev);
+            ).with_dev_mode(true);
             
             // Require connection string
             let conn_str = merged_config.connection_string.clone()
@@ -323,6 +323,31 @@ async fn run(cli: Cli) -> Result<()> {
             info!("Seed completed in {}", logging::format_duration(elapsed));
             
             print_seed_summary(&result);
+            Ok(())
+        }
+        
+        Commands::New { migrations_dir } => {
+            logging::output::header("Creating New Migration");
+            
+            // Merge CLI args with config file
+            let merged_config = PgmgConfig::merge_with_cli_new(
+                config_file,
+                migrations_dir,
+            );
+            
+            // Log configuration
+            if let Some(ref dir) = merged_config.migrations_dir {
+                debug!("Migrations directory: {}", dir.display());
+            }
+            
+            // Execute new migration creation
+            let result = execute_new(
+                merged_config.migrations_dir.clone(),
+                &merged_config,
+            ).await
+                .map_err(|e| PgmgError::Other(format!("Migration creation failed: {}", e)))?;
+            
+            print_new_summary(&result);
             Ok(())
         }
     }

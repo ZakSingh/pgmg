@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use petgraph::{Graph, Direction};
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use crate::sql::{QualifiedIdent, SqlObject, ObjectType};
 use crate::builtin_catalog::BuiltinCatalog;
 
@@ -12,8 +13,14 @@ pub struct ObjectRef {
 
 #[derive(Debug, Clone)]
 pub enum DependencyType {
-    Hard,   // Required dependency (e.g., view depends on table)
-    Soft,   // Optional dependency (could be missing and still work)
+    /// Structural dependency - dependent must be recreated when dependency changes
+    /// Examples: views depending on tables, triggers depending on functions
+    Hard,
+    
+    /// Reference dependency - uses runtime lookup, no recreation needed
+    /// Examples: functions calling other functions (non-ATOMIC)
+    /// These dependencies are tracked for visualization and validation but don't trigger recreation
+    Soft,
 }
 
 #[derive(Debug)]
@@ -85,7 +92,16 @@ impl DependencyGraph {
                         object_type: dep_obj.object_type.clone(),
                         qualified_name: dep_obj.qualified_name.clone(),
                     };
-                    graph.add_edge(dep_ref, obj_ref.clone(), DependencyType::Hard)?;
+                    
+                    // Determine dependency type based on the dependent object type
+                    let dep_type = match &obj.object_type {
+                        // Functions/procedures calling other functions/procedures use runtime lookup
+                        ObjectType::Function | ObjectType::Procedure => DependencyType::Soft,
+                        // Views, triggers, and other objects have structural dependencies
+                        _ => DependencyType::Hard,
+                    };
+                    
+                    graph.add_edge(dep_ref, obj_ref.clone(), dep_type)?;
                 }
             }
             
@@ -182,7 +198,7 @@ impl DependencyGraph {
     }
 
     /// Find all objects that would be affected by changes to the given objects
-    /// (i.e., all transitive dependents)
+    /// (i.e., all transitive dependents through HARD dependencies only)
     pub fn affected_by_changes(&self, changed_objects: &[ObjectRef]) -> Vec<ObjectRef> {
         let mut affected = std::collections::HashSet::new();
         let mut to_visit: Vec<ObjectRef> = changed_objects.to_vec();
@@ -194,8 +210,8 @@ impl DependencyGraph {
             
             affected.insert(obj_ref.clone());
             
-            // Add all direct dependents to visit queue
-            for dependent in self.dependents_of(&obj_ref) {
+            // Only follow HARD dependencies for recreation
+            for dependent in self.hard_dependents_of(&obj_ref) {
                 if !affected.contains(&dependent) {
                     to_visit.push(dependent);
                 }
@@ -206,6 +222,37 @@ impl DependencyGraph {
         affected.into_iter()
             .filter(|obj| !changed_objects.contains(obj))
             .collect()
+    }
+    
+    /// Get dependents of a specific object that have HARD dependencies only
+    fn hard_dependents_of(&self, object_ref: &ObjectRef) -> Vec<ObjectRef> {
+        if let Some(&node_id) = self.node_map.get(object_ref) {
+            // Get all outgoing edges and filter for Hard dependencies
+            self.graph.edges_directed(node_id, Direction::Outgoing)
+                .filter(|edge| matches!(edge.weight(), DependencyType::Hard))
+                .map(|edge| self.graph[edge.target()].clone())
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+    
+    /// Get all dependents including soft dependencies (for visualization and checks)
+    pub fn all_dependents_of(&self, object_ref: &ObjectRef) -> Vec<ObjectRef> {
+        self.dependents_of(object_ref)
+    }
+    
+    /// Get dependents with SOFT dependencies (functions to check but not recreate)
+    pub fn soft_dependents_of(&self, object_ref: &ObjectRef) -> Vec<ObjectRef> {
+        if let Some(&node_id) = self.node_map.get(object_ref) {
+            // Get all outgoing edges and filter for Soft dependencies
+            self.graph.edges_directed(node_id, Direction::Outgoing)
+                .filter(|edge| matches!(edge.weight(), DependencyType::Soft))
+                .map(|edge| self.graph[edge.target()].clone())
+                .collect()
+        } else {
+            vec![]
+        }
     }
 
     /// Get the number of nodes in the graph
@@ -244,6 +291,8 @@ impl DependencyGraph {
                 ObjectType::Index => ("lightgray", "trapezium"),
                 ObjectType::Trigger => ("lightpink", "invtriangle"),
                 ObjectType::Comment => ("lavender", "note"),
+                ObjectType::CronJob => ("orange", "octagon"),
+                ObjectType::Aggregate => ("lightsteelblue", "triangle"),
             };
 
             // Create unique node ID that includes object type to avoid conflicts
@@ -432,6 +481,64 @@ mod tests {
         assert_eq!(affected.len(), 2);
         assert!(affected.iter().any(|obj| obj.qualified_name.name == "user_stats"));
         assert!(affected.iter().any(|obj| obj.qualified_name.name == "user_summary"));
+    }
+
+    #[test]
+    fn test_soft_dependencies_not_affected() {
+        // Test that function-to-function dependencies don't trigger recreation
+        let func1_deps = Dependencies {
+            relations: HashSet::new(),
+            functions: HashSet::new(),
+            types: HashSet::new(),
+        };
+
+        let mut func2_deps = Dependencies {
+            relations: HashSet::new(),
+            functions: HashSet::new(),
+            types: HashSet::new(),
+        };
+        // func2 calls func1
+        func2_deps.functions.insert(QualifiedIdent::from_name("func1".to_string()));
+
+        let mut view_deps = Dependencies {
+            relations: HashSet::new(),
+            functions: HashSet::new(),
+            types: HashSet::new(),
+        };
+        // view uses func1
+        view_deps.functions.insert(QualifiedIdent::from_name("func1".to_string()));
+
+        let objects = vec![
+            create_test_object(ObjectType::Function, "func1", None, func1_deps),
+            create_test_object(ObjectType::Function, "func2", None, func2_deps),
+            create_test_object(ObjectType::View, "view1", None, view_deps),
+        ];
+
+        let builtin_catalog = BuiltinCatalog::new();
+        let graph = DependencyGraph::build_from_objects(&objects, &builtin_catalog).unwrap();
+
+        let func1_ref = ObjectRef::new(
+            ObjectType::Function,
+            QualifiedIdent::from_name("func1".to_string())
+        );
+
+        // Check affected by changes (only hard dependencies)
+        let affected = graph.affected_by_changes(&[func1_ref.clone()]);
+        
+        // Should only include view1 (hard dependency), not func2 (soft dependency)
+        assert_eq!(affected.len(), 1);
+        assert!(affected.iter().any(|obj| obj.qualified_name.name == "view1"));
+        assert!(!affected.iter().any(|obj| obj.qualified_name.name == "func2"));
+        
+        // Check soft dependents
+        let soft_deps = graph.soft_dependents_of(&func1_ref);
+        assert_eq!(soft_deps.len(), 1);
+        assert!(soft_deps.iter().any(|obj| obj.qualified_name.name == "func2"));
+        
+        // Check hard dependents  
+        let hard_deps = graph.hard_dependents_of(&func1_ref);
+        assert_eq!(hard_deps.len(), 1);
+        assert!(hard_deps.iter().any(|obj| obj.qualified_name.name == "view1"));
     }
 
     #[test]
