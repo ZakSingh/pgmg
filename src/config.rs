@@ -109,6 +109,27 @@ impl PgmgConfig {
         }
     }
     
+    /// Merge CLI arguments with config file values for new command
+    /// CLI arguments take precedence over config file values
+    pub fn merge_with_cli_new(
+        config_file: Option<Self>,
+        cli_migrations_dir: Option<PathBuf>,
+    ) -> Self {
+        let base_config = config_file.unwrap_or_default();
+        
+        Self {
+            connection_string: base_config.connection_string,
+            migrations_dir: cli_migrations_dir.or(base_config.migrations_dir),
+            code_dir: base_config.code_dir,
+            seed_dir: base_config.seed_dir,
+            output_graph: base_config.output_graph,
+            development_mode: base_config.development_mode,
+            emit_notify_events: base_config.emit_notify_events,
+            check_plpgsql: base_config.check_plpgsql,
+            tls: base_config.tls,
+        }
+    }
+    
     /// Apply development mode settings from CLI
     pub fn with_dev_mode(mut self, dev_mode: bool) -> Self {
         if dev_mode {

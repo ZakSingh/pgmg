@@ -233,6 +233,7 @@ impl Clone for ContainerInfo {
 // Re-export modules
 pub mod assertions;
 pub mod fixtures;
+pub mod plan_output;
 
 // Add UUID dependency for unique database names
 use uuid;

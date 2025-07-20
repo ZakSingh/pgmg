@@ -41,13 +41,24 @@ pub async fn check_function(
     client: &tokio_postgres::Transaction<'_>,
     function_name: &str,
 ) -> Result<Vec<PlpgsqlCheckResult>, Box<dyn std::error::Error>> {
-    // Query plpgsql_check_function with JSON format
-    let query = format!(
-        "SELECT * FROM plpgsql_check_function('{}', format:='json')",
-        function_name
-    );
+    // Parse the function name to extract schema and name
+    let (schema, name) = if function_name.contains('.') {
+        let parts: Vec<&str> = function_name.splitn(2, '.').collect();
+        (parts[0], parts[1].trim_end_matches("()"))
+    } else {
+        ("public", function_name.trim_end_matches("()"))
+    };
     
-    let rows = client.query(&query, &[]).await?;
+    // Query that finds the function by name and runs plpgsql_check on it
+    let query = "
+        SELECT result::text
+        FROM pg_proc p 
+        JOIN pg_namespace n ON n.oid = p.pronamespace,
+        LATERAL plpgsql_check_function(p.oid, format:='json') AS result
+        WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind IN ('f', 'p')
+    ";
+    
+    let rows = client.query(query, &[&schema, &name]).await?;
     let mut results = Vec::new();
     
     for row in rows {
@@ -116,6 +127,95 @@ pub async fn check_modified_functions(
                     e);
             }
         }
+    }
+    
+    Ok(errors)
+}
+
+/// Check functions that have soft dependencies on modified functions
+/// These are functions that call the modified functions and need validation
+pub async fn check_soft_dependent_functions(
+    client: &tokio_postgres::Transaction<'_>,
+    dependency_graph: &crate::analysis::DependencyGraph,
+    modified_objects: &[&SqlObject],
+    all_file_objects: &[SqlObject],
+) -> Result<Vec<PlpgsqlCheckError>, Box<dyn std::error::Error>> {
+    use crate::analysis::ObjectRef;
+    
+    let mut errors = Vec::new();
+    
+    // Check if extension is available
+    if !is_plpgsql_check_available(client).await? {
+        return Ok(errors);
+    }
+    
+    // Find all soft dependents of modified functions
+    let mut functions_to_check = std::collections::HashSet::new();
+    
+    for modified_obj in modified_objects {
+        if matches!(modified_obj.object_type, ObjectType::Function | ObjectType::Procedure) {
+            let obj_ref = ObjectRef::from(*modified_obj);
+            
+            // Get all soft dependents (functions that call this function)
+            for dependent in dependency_graph.soft_dependents_of(&obj_ref) {
+                if matches!(dependent.object_type, ObjectType::Function | ObjectType::Procedure) {
+                    functions_to_check.insert(dependent);
+                }
+            }
+        }
+    }
+    
+    if functions_to_check.is_empty() {
+        return Ok(errors);
+    }
+    
+    println!("\n{}: Checking {} dependent functions for compatibility...", 
+        "Info".blue().bold(), 
+        functions_to_check.len().to_string().yellow());
+    
+    let num_functions_to_check = functions_to_check.len();
+    
+    // Check each dependent function
+    for func_ref in functions_to_check {
+        // Find the function in file objects to get source info
+        let function = all_file_objects.iter()
+            .find(|obj| obj.object_type == func_ref.object_type && 
+                       obj.qualified_name == func_ref.qualified_name);
+        
+        let func_name = match &func_ref.qualified_name.schema {
+            Some(schema) => format!("{}.{}()", schema, func_ref.qualified_name.name),
+            None => format!("{}()", func_ref.qualified_name.name),
+        };
+        
+        match check_function(client, &func_name).await {
+            Ok(results) => {
+                for result in results {
+                    // Only report errors (not warnings for dependent functions)
+                    if let Some(level) = &result.level {
+                        if level == "error" {
+                            let error = PlpgsqlCheckError {
+                                function_name: func_name.clone(),
+                                source_file: function.and_then(|f| f.source_file.as_ref().map(|p| p.to_string_lossy().to_string())),
+                                source_line: function.and_then(|f| calculate_source_line(f, result.lineno)),
+                                check_result: result,
+                            };
+                            errors.push(error);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Log but don't fail the operation
+                eprintln!("{}: Failed to check dependent function {}: {}", 
+                    "Warning".yellow().bold(), 
+                    func_name.cyan(), 
+                    e);
+            }
+        }
+    }
+    
+    if errors.is_empty() && num_functions_to_check > 0 {
+        println!("  {} All dependent functions remain compatible", "✓".green().bold());
     }
     
     Ok(errors)

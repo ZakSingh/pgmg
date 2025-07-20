@@ -12,6 +12,7 @@ pub struct PlanResult {
     pub changes: Vec<ChangeOperation>,
     pub new_migrations: Vec<String>,
     pub dependency_graph: Option<DependencyGraph>,
+    pub file_objects: Vec<SqlObject>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +60,7 @@ pub async fn execute_plan(
         changes: Vec::new(),
         new_migrations: Vec::new(),
         dependency_graph: None,
+        file_objects: Vec::new(),
     };
 
     // Step 1: Check for new migrations
@@ -90,6 +92,9 @@ pub async fn execute_plan(
         let db_objects = state_manager.get_tracked_objects().await?;
         
         let mut object_changes = detect_object_changes(&file_objects, &db_objects).await?;
+        
+        // Store file objects in the result
+        plan_result.file_objects = file_objects.clone();
         
         // Step 3: Build dependency graph for affected objects
         if !file_objects.is_empty() {
@@ -279,6 +284,39 @@ fn format_qualified_name(qualified_name: &crate::sql::QualifiedIdent) -> String 
     }
 }
 
+/// Parse comment qualified name to extract parent object information
+#[allow(dead_code)]
+fn parse_comment_parent(comment_name: &str) -> Option<(String, String)> {
+    // Comments have format: "object_type:object_name"
+    // e.g., "function:api.create_task()", "table:users", "column:users.id"
+    if let Some(colon_pos) = comment_name.find(':') {
+        let object_type = &comment_name[..colon_pos];
+        let object_name = &comment_name[colon_pos + 1..];
+        Some((object_type.to_string(), object_name.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Extract comment text from DDL statement
+fn extract_comment_text(ddl: &str) -> Option<String> {
+    // Look for IS 'comment text' pattern
+    if let Some(is_pos) = ddl.find(" IS '") {
+        let start = is_pos + 5; // Skip " IS '"
+        if let Some(end_pos) = ddl[start..].find('\'') {
+            return Some(ddl[start..start + end_pos].to_string());
+        }
+    }
+    // Also check for IS "comment text" pattern
+    if let Some(is_pos) = ddl.find(" IS \"") {
+        let start = is_pos + 5; // Skip " IS ""
+        if let Some(end_pos) = ddl[start..].find('"') {
+            return Some(ddl[start..start + end_pos].to_string());
+        }
+    }
+    None
+}
+
 /// Validate that no function names are duplicated in the SQL files
 fn validate_no_function_overloading_in_files(file_objects: &[SqlObject]) -> Result<(), Box<dyn std::error::Error>> {
     let mut function_locations: HashMap<String, Vec<String>> = HashMap::new();
@@ -323,30 +361,72 @@ pub fn print_plan_summary(plan: &PlanResult) {
     
     if !plan.changes.is_empty() {
         println!("\n{}:", "Object Changes".bold());
-        for change in &plan.changes {
+        
+        // Group comments with their parent objects
+        let mut printed_comments = HashSet::new();
+        
+        for (i, change) in plan.changes.iter().enumerate() {
+            // Skip if this comment was already printed with its parent
+            if let Some(obj) = get_object_from_change(change) {
+                if obj.object_type == ObjectType::Comment && printed_comments.contains(&i) {
+                    continue;
+                }
+            }
+            
             match change {
                 ChangeOperation::CreateObject { object, reason } => {
-                    println!("  {} {} {} {} ({})", 
-                        "+".green().bold(),
-                        "CREATE".green().bold(),
-                        object.object_type.to_string().yellow(),
-                        format_qualified_name(&object.qualified_name).cyan(),
-                        reason.dimmed()
-                    );
+                    // Special handling for comments - display them inline with parent
+                    if object.object_type == ObjectType::Comment {
+                        // If this comment should be displayed standalone
+                        println!("  {} {} {} {} ({})", 
+                            "+".green().bold(),
+                            "CREATE".green().bold(),
+                            object.object_type.to_string().yellow(),
+                            format_qualified_name(&object.qualified_name).cyan(),
+                            reason.dimmed()
+                        );
+                    } else {
+                        // Regular object - check if it has an associated comment
+                        println!("  {} {} {} {} ({})", 
+                            "+".green().bold(),
+                            "CREATE".green().bold(),
+                            object.object_type.to_string().yellow(),
+                            format_qualified_name(&object.qualified_name).cyan(),
+                            reason.dimmed()
+                        );
+                        
+                        // Look for associated comment in subsequent changes
+                        print_associated_comments(plan, i, &mut printed_comments, object);
+                    }
                 }
                 ChangeOperation::UpdateObject { object, old_hash, new_hash, reason } => {
-                    println!("  {} {} {} {} ({})", 
-                        "~".yellow().bold(),
-                        "UPDATE".yellow().bold(),
-                        object.object_type.to_string().yellow(),
-                        format_qualified_name(&object.qualified_name).cyan(),
-                        reason.dimmed()
-                    );
-                    if !old_hash.is_empty() && old_hash.len() >= 8 {
-                        println!("    {}: {}...", "Old hash".dimmed(), old_hash[..8].to_string().red());
-                    }
-                    if !new_hash.is_empty() && new_hash.len() >= 8 {
-                        println!("    {}: {}...", "New hash".dimmed(), new_hash[..8].to_string().green());
+                    // Special handling for comments - display them inline with parent
+                    if object.object_type == ObjectType::Comment {
+                        // If this comment should be displayed standalone
+                        println!("  {} {} {} {} ({})", 
+                            "~".yellow().bold(),
+                            "UPDATE".yellow().bold(),
+                            object.object_type.to_string().yellow(),
+                            format_qualified_name(&object.qualified_name).cyan(),
+                            reason.dimmed()
+                        );
+                    } else {
+                        println!("  {} {} {} {} ({})", 
+                            "~".yellow().bold(),
+                            "UPDATE".yellow().bold(),
+                            object.object_type.to_string().yellow(),
+                            format_qualified_name(&object.qualified_name).cyan(),
+                            reason.dimmed()
+                        );
+                        if !old_hash.is_empty() && old_hash.len() >= 8 {
+                            println!("    {}: {}...", "Old hash".dimmed(), old_hash[..8].to_string().red());
+                        }
+                        if !new_hash.is_empty() && new_hash.len() >= 8 {
+                            println!("    {}: {}...", "New hash".dimmed(), new_hash[..8].to_string().green());
+                        }
+                        
+                        // Look for associated comment in subsequent changes
+                        print_associated_comments(plan, i, &mut printed_comments, object);
                     }
                 }
                 ChangeOperation::DeleteObject { object_type, object_name, reason } => {
@@ -377,5 +457,79 @@ pub fn print_plan_summary(plan: &PlanResult) {
             graph.node_count().to_string().yellow(),
             graph.edge_count().to_string().yellow()
         );
+    }
+}
+
+/// Get object from a change operation
+fn get_object_from_change(change: &ChangeOperation) -> Option<&SqlObject> {
+    match change {
+        ChangeOperation::CreateObject { object, .. } => Some(object),
+        ChangeOperation::UpdateObject { object, .. } => Some(object),
+        _ => None,
+    }
+}
+
+/// Print comments associated with an object
+fn print_associated_comments(
+    plan: &PlanResult, 
+    current_index: usize, 
+    printed_comments: &mut HashSet<usize>,
+    parent_object: &SqlObject
+) {
+    // Build expected comment name patterns
+    let object_type_str = match parent_object.object_type {
+        ObjectType::Table => "table",
+        ObjectType::View => "view",
+        ObjectType::MaterializedView => "materialized_view",
+        ObjectType::Function => "function",
+        ObjectType::Procedure => "procedure",
+        ObjectType::Type => "type",
+        ObjectType::Domain => "domain",
+        ObjectType::Index => "index",
+        ObjectType::Trigger => "trigger",
+        ObjectType::Comment => "comment",
+        ObjectType::CronJob => "cron_job",
+        ObjectType::Aggregate => "aggregate",
+    };
+    
+    let parent_name = format_qualified_name(&parent_object.qualified_name);
+    let expected_comment_name = format!("{}:{}", object_type_str, parent_name);
+    
+    // Look for comments in subsequent changes
+    for (j, change) in plan.changes.iter().enumerate().skip(current_index + 1) {
+        if let Some(obj) = get_object_from_change(change) {
+            if obj.object_type == ObjectType::Comment {
+                // Check if this comment belongs to our parent object
+                if obj.qualified_name.name == expected_comment_name ||
+                   obj.qualified_name.name == format!("{}:{}()", object_type_str, parent_name) {
+                    // Mark this comment as printed
+                    printed_comments.insert(j);
+                    
+                    // Extract and display the comment text
+                    if let Some(comment_text) = extract_comment_text(&obj.ddl_statement) {
+                        match change {
+                            ChangeOperation::CreateObject { .. } => {
+                                println!("    {} {}: {}", 
+                                    "└─".dimmed(),
+                                    "COMMENT".green().dimmed(),
+                                    comment_text.italic()
+                                );
+                            }
+                            ChangeOperation::UpdateObject { .. } => {
+                                println!("    {} {}: {}", 
+                                    "└─".dimmed(),
+                                    "COMMENT".yellow().dimmed(),
+                                    comment_text.italic()
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    
+                    // Only one comment per object
+                    break;
+                }
+            }
+        }
     }
 }

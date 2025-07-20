@@ -31,6 +31,8 @@ impl ObjectLoadedNotification {
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
             ObjectType::Comment => "comment",
+            ObjectType::CronJob => "cron_job",
+            ObjectType::Aggregate => "aggregate",
         }.to_string();
         
         let span = match (obj.start_line, obj.end_line) {

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::time::{Duration, Instant};
 use crate::db::connect_with_url;
+use crate::error::format_postgres_error_with_details;
 use owo_colors::OwoColorize;
 // Manual TAP parsing implementation
 
@@ -33,6 +34,8 @@ pub struct TestFailure {
     pub test_number: usize,
     pub description: String,
     pub diagnostic: Option<String>,
+    pub detailed_error: Option<String>,
+    pub sql_context: Option<String>,
 }
 
 pub async fn execute_test(
@@ -208,6 +211,8 @@ async fn run_test_file(
                     test_number: 0,
                     description: "pgTAP extension not available".to_string(),
                     diagnostic: Some(format!("Please install pgTAP extension: {}", e)),
+                    detailed_error: None,
+                    sql_context: None,
                 }],
                 tap_output: format!("# pgTAP extension error: {}", e),
                 duration: start_time.elapsed(),
@@ -229,6 +234,8 @@ async fn run_test_file(
                 test_number: 0,
                 description: "Test contains psql meta-commands".to_string(),
                 diagnostic: Some("pgTAP tests should not contain \\set or \\pset commands when run through pgmg".to_string()),
+                detailed_error: None,
+                sql_context: None,
             }],
             tap_output: "# Error: Test contains psql meta-commands".to_string(),
             duration: start_time.elapsed(),
@@ -270,6 +277,20 @@ SET client_min_messages TO 'INFO';
             output_lines.join("\n")
         }
         Err(e) => {
+            // Try to extract detailed error information
+            let detailed_error = if let Some(_pg_err) = e.as_db_error() {
+                // We have a database error with details
+                format_postgres_error_with_details(
+                    &test_file.file_name().unwrap_or_default().to_string_lossy(),
+                    Some(test_file),
+                    Some(1), // Test files start at line 1
+                    &wrapped_test,
+                    &e
+                )
+            } else {
+                e.to_string()
+            };
+            
             return Ok(TestFileResult {
                 file_path: test_file.to_path_buf(),
                 passed: false,
@@ -281,6 +302,8 @@ SET client_min_messages TO 'INFO';
                     test_number: 0,
                     description: "Test execution failed".to_string(),
                     diagnostic: Some(e.to_string()),
+                    detailed_error: Some(detailed_error),
+                    sql_context: Some(wrapped_test.clone()),
                 }],
                 tap_output: format!("# Test execution failed: {}", e),
                 duration: start_time.elapsed(),
@@ -348,6 +371,8 @@ fn parse_tap_output(tap_output: &str) -> Result<ParsedTapResults, Box<dyn std::e
                 test_number: test_count,
                 description: description.clone(),
                 diagnostic: None,
+                detailed_error: None,
+                sql_context: None,
             });
         } else if line.contains("# SKIP") {
             test_count += 1;
@@ -413,7 +438,15 @@ pub fn print_test_summary(result: &TestResult) {
                 println!("  {} {}", "📁".red(), file_result.file_path.display().to_string().red());
                 for failure in &file_result.failures {
                     println!("    {} Test #{}: {}", "✗".red(), failure.test_number, failure.description);
-                    if let Some(diagnostic) = &failure.diagnostic {
+                    
+                    // Show detailed error if available
+                    if let Some(detailed_error) = &failure.detailed_error {
+                        // The detailed error already includes formatting, so just print it with indentation
+                        for line in detailed_error.lines() {
+                            println!("      {}", line);
+                        }
+                    } else if let Some(diagnostic) = &failure.diagnostic {
+                        // Fall back to simple diagnostic
                         println!("      {}", diagnostic.bright_black());
                     }
                 }

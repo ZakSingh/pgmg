@@ -28,10 +28,18 @@ impl<'a> StateManager<'a> {
 
     /// Initialize the state tracking tables if they don't exist
     pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Create pgmg schema if it doesn't exist
+        self.client.execute(
+            r#"
+            CREATE SCHEMA IF NOT EXISTS pgmg
+            "#,
+            &[],
+        ).await?;
+
         // Create pgmg_migrations table
         self.client.execute(
             r#"
-            CREATE TABLE IF NOT EXISTS pgmg_migrations (
+            CREATE TABLE IF NOT EXISTS pgmg.pgmg_migrations (
                 name TEXT PRIMARY KEY,
                 applied_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
             )
@@ -42,7 +50,7 @@ impl<'a> StateManager<'a> {
         // Create pgmg_state table for object tracking
         self.client.execute(
             r#"
-            CREATE TABLE IF NOT EXISTS pgmg_state (
+            CREATE TABLE IF NOT EXISTS pgmg.pgmg_state (
                 object_type TEXT NOT NULL,
                 object_name TEXT NOT NULL,
                 ddl_hash TEXT NOT NULL,
@@ -59,7 +67,7 @@ impl<'a> StateManager<'a> {
     /// Get all applied migrations
     pub async fn get_applied_migrations(&self) -> Result<Vec<MigrationRecord>, Box<dyn std::error::Error>> {
         let rows = self.client.query(
-            "SELECT name, applied_at FROM pgmg_migrations ORDER BY applied_at",
+            "SELECT name, applied_at FROM pgmg.pgmg_migrations ORDER BY applied_at",
             &[],
         ).await?;
 
@@ -77,7 +85,7 @@ impl<'a> StateManager<'a> {
     /// Record a migration as applied
     pub async fn record_migration(&self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
         self.client.execute(
-            "INSERT INTO pgmg_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
+            "INSERT INTO pgmg.pgmg_migrations (name) VALUES ($1) ON CONFLICT (name) DO NOTHING",
             &[&name],
         ).await?;
 
@@ -87,7 +95,7 @@ impl<'a> StateManager<'a> {
     /// Get all tracked objects with their current hashes
     pub async fn get_tracked_objects(&self) -> Result<Vec<ObjectRecord>, Box<dyn std::error::Error>> {
         let rows = self.client.query(
-            "SELECT object_type, object_name, ddl_hash, last_applied FROM pgmg_state ORDER BY object_name",
+            "SELECT object_type, object_name, ddl_hash, last_applied FROM pgmg.pgmg_state ORDER BY object_name",
             &[],
         ).await?;
 
@@ -95,6 +103,7 @@ impl<'a> StateManager<'a> {
         for row in rows {
             let object_type_str: String = row.get(0);
             let object_type = match object_type_str.as_str() {
+                "table" => ObjectType::Table,
                 "view" => ObjectType::View,
                 "materialized_view" => ObjectType::MaterializedView,
                 "function" => ObjectType::Function,
@@ -104,6 +113,7 @@ impl<'a> StateManager<'a> {
                 "index" => ObjectType::Index,
                 "trigger" => ObjectType::Trigger,
                 "comment" => ObjectType::Comment,
+                "cron_job" => ObjectType::CronJob,
                 _ => continue, // Skip unknown types
             };
 
@@ -139,6 +149,8 @@ impl<'a> StateManager<'a> {
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
             ObjectType::Comment => "comment",
+            ObjectType::CronJob => "cron_job",
+            ObjectType::Aggregate => "aggregate",
         };
 
         let qualified_name = match &object_name.schema {
@@ -148,7 +160,7 @@ impl<'a> StateManager<'a> {
 
         self.client.execute(
             r#"
-            INSERT INTO pgmg_state (object_type, object_name, ddl_hash) 
+            INSERT INTO pgmg.pgmg_state (object_type, object_name, ddl_hash) 
             VALUES ($1, $2, $3)
             ON CONFLICT (object_type, object_name) 
             DO UPDATE SET ddl_hash = $3, last_applied = NOW()
@@ -176,6 +188,8 @@ impl<'a> StateManager<'a> {
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
             ObjectType::Comment => "comment",
+            ObjectType::CronJob => "cron_job",
+            ObjectType::Aggregate => "aggregate",
         };
 
         let qualified_name = match &object_name.schema {
@@ -184,7 +198,7 @@ impl<'a> StateManager<'a> {
         };
 
         self.client.execute(
-            "DELETE FROM pgmg_state WHERE object_type = $1 AND object_name = $2",
+            "DELETE FROM pgmg.pgmg_state WHERE object_type = $1 AND object_name = $2",
             &[&object_type_str, &qualified_name],
         ).await?;
 
@@ -208,6 +222,8 @@ impl<'a> StateManager<'a> {
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
             ObjectType::Comment => "comment",
+            ObjectType::CronJob => "cron_job",
+            ObjectType::Aggregate => "aggregate",
         };
 
         let qualified_name = match &object_name.schema {
@@ -216,7 +232,7 @@ impl<'a> StateManager<'a> {
         };
 
         let rows = self.client.query(
-            "SELECT ddl_hash FROM pgmg_state WHERE object_type = $1 AND object_name = $2",
+            "SELECT ddl_hash FROM pgmg.pgmg_state WHERE object_type = $1 AND object_name = $2",
             &[&object_type_str, &qualified_name],
         ).await?;
 
@@ -230,7 +246,7 @@ impl<'a> StateManager<'a> {
     /// Get names of all applied migrations
     pub async fn get_applied_migration_names(&self) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
         let rows = self.client.query(
-            "SELECT name FROM pgmg_migrations",
+            "SELECT name FROM pgmg.pgmg_migrations",
             &[],
         ).await?;
 
@@ -264,6 +280,8 @@ mod tests {
             ObjectType::Index => "index",
             ObjectType::Trigger => "trigger",
             ObjectType::Comment => "comment",
+            ObjectType::CronJob => "cron_job",
+            ObjectType::Aggregate => "aggregate",
         };
         
         assert_eq!(type_str, "view");

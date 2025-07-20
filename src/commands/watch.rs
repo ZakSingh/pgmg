@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 
 /// Configuration for the watch command
 #[derive(Debug)]
@@ -325,8 +325,10 @@ async fn process_db_changes(config: &WatchConfig, _paths: Vec<PathBuf>) -> Vec<O
                                 "Apply completed with {} error(s)",
                                 apply_result.errors.len()
                             ));
+                            // Display each error with proper formatting preserved
                             for error in &apply_result.errors {
-                                error!("  Apply failed: {}", error);
+                                // The error already includes detailed formatting from apply command
+                                println!("\n{}", error);
                             }
                         }
                     }
@@ -393,7 +395,15 @@ async fn run_specific_tests(config: &WatchConfig, test_files: Vec<PathBuf>) {
                     for file_result in &test_result.test_files {
                         for failure in &file_result.failures {
                             println!("    ✗ {}: {}", failure.test_number, failure.description);
-                            if let Some(diagnostic) = &failure.diagnostic {
+                            
+                            // Show detailed error if available
+                            if let Some(detailed_error) = &failure.detailed_error {
+                                // The detailed error already includes formatting, so just print it with indentation
+                                for line in detailed_error.lines() {
+                                    println!("      {}", line);
+                                }
+                            } else if let Some(diagnostic) = &failure.diagnostic {
+                                // Fall back to simple diagnostic
                                 println!("      {}", diagnostic);
                             }
                         }

@@ -4,6 +4,14 @@ use crate::sql::parser::{Dependencies, QualifiedIdent};
 use sha2::{Sha256, Digest};
 use pg_query;
 
+/// Operations that can be performed on cron jobs
+#[derive(Debug)]
+enum CronOperation {
+    Schedule { job_name: String, command: String },
+    #[allow(dead_code)]
+    Unschedule { job_name: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ObjectType {
     Table,
@@ -16,6 +24,8 @@ pub enum ObjectType {
     Index,
     Trigger,
     Comment,
+    CronJob,
+    Aggregate,
 }
 
 impl fmt::Display for ObjectType {
@@ -31,6 +41,8 @@ impl fmt::Display for ObjectType {
             ObjectType::Index => write!(f, "INDEX"),
             ObjectType::Trigger => write!(f, "TRIGGER"),
             ObjectType::Comment => write!(f, "COMMENT"),
+            ObjectType::CronJob => write!(f, "CRON JOB"),
+            ObjectType::Aggregate => write!(f, "AGGREGATE"),
         }
     }
 }
@@ -266,6 +278,60 @@ pub fn parse_sql_object(statement: &str) -> Result<Option<ParsedSqlObject>, Box<
                             trigger_table: None,
                         }));
                     }
+                    pg_query::NodeEnum::SelectStmt(_) => {
+                        // Check if this is a cron.schedule() or cron.unschedule() call
+                        if let Some(cron_info) = parse_cron_call_from_statement(statement)? {
+                            match cron_info {
+                                CronOperation::Schedule { job_name, command } => {
+                                    // Get base dependencies (includes cron.schedule)
+                                    let mut dependencies = extract_dependencies_from_parsed_with_sql(&parsed, statement)?;
+                                    
+                                    // Parse command dependencies
+                                    let command_deps = parse_cron_command_dependencies(&command);
+                                    
+                                    // Merge command dependencies
+                                    dependencies.relations.extend(command_deps.relations);
+                                    dependencies.functions.extend(command_deps.functions);
+                                    dependencies.types.extend(command_deps.types);
+                                    
+                                    // Remove cron.schedule from dependencies (it's not a real dependency)
+                                    dependencies.functions.remove(&QualifiedIdent::new(Some("cron".to_string()), "schedule".to_string()));
+                                    
+                                    return Ok(Some(ParsedSqlObject {
+                                        statement: statement.to_string(),
+                                        parsed,
+                                        object_type: ObjectType::CronJob,
+                                        qualified_name: QualifiedIdent::from_name(job_name),
+                                        dependencies,
+                                        trigger_table: None,
+                                    }));
+                                }
+                                CronOperation::Unschedule { job_name: _ } => {
+                                    // For unschedule, we don't create a parsed object
+                                    // This will be handled by the drop detection logic
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
+                    pg_query::NodeEnum::DefineStmt(define_stmt) => {
+                        // Handle CREATE AGGREGATE statements
+                        if define_stmt.kind == 2 { // OBJECT_AGGREGATE = 2 in pg_query protobuf
+                            if !define_stmt.defnames.is_empty() {
+                                let qualified_name = extract_defname(&define_stmt.defnames)?;
+                                let dependencies = extract_dependencies_from_parsed_with_sql(&parsed, statement)?;
+                                
+                                return Ok(Some(ParsedSqlObject {
+                                    statement: statement.to_string(),
+                                    parsed,
+                                    object_type: ObjectType::Aggregate,
+                                    qualified_name,
+                                    dependencies,
+                                    trigger_table: None,
+                                }));
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -317,6 +383,11 @@ fn extract_function_name_from_list(names: &[pg_query::protobuf::Node]) -> Result
         2 => Ok(QualifiedIdent::new(Some(parts[0].clone()), parts[1].clone())),
         _ => Err("Invalid name structure".into())
     }
+}
+
+/// Extract qualified name from a DefineStmt defname list
+fn extract_defname(defname: &[pg_query::protobuf::Node]) -> Result<QualifiedIdent, Box<dyn std::error::Error>> {
+    extract_function_name_from_list(defname)
 }
 
 /// Extract dependencies from an already-parsed statement with original SQL for PL/pgSQL analysis
@@ -371,6 +442,77 @@ pub fn extract_trigger_table(statement: &str) -> Result<QualifiedIdent, Box<dyn 
     }
 }
 
+/// Extract function signature from CREATE FUNCTION statement
+pub fn extract_function_signature(statement: &str) -> Result<String, Box<dyn std::error::Error>> {
+    // Parse the DDL to extract the full function signature
+    let parsed = pg_query::parse(statement)?;
+    
+    for stmt in &parsed.protobuf.stmts {
+        if let Some(stmt) = &stmt.stmt {
+            if let Some(node) = &stmt.node {
+                if let pg_query::NodeEnum::CreateFunctionStmt(func_stmt) = node {
+                    // Extract function name
+                    let qualified_name = extract_function_name_from_list(&func_stmt.funcname)?;
+                    let full_name = format_qualified_name(&qualified_name);
+                    
+                    // Extract parameter types
+                    let param_types: Vec<String> = func_stmt.parameters.iter()
+                        .filter_map(|param| {
+                            if let Some(pg_query::NodeEnum::FunctionParameter(fp)) = &param.node {
+                                // Only include input parameters (exclude OUT parameters)
+                                if fp.mode() != pg_query::protobuf::FunctionParameterMode::FuncParamOut &&
+                                   fp.mode() != pg_query::protobuf::FunctionParameterMode::FuncParamTable {
+                                    if let Some(arg_type) = &fp.arg_type {
+                                        return extract_type_name(arg_type);
+                                    }
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+                    
+                    // Return full signature
+                    if param_types.is_empty() {
+                        return Ok(format!("{}()", full_name));
+                    } else {
+                        return Ok(format!("{}({})", full_name, param_types.join(", ")));
+                    }
+                }
+            }
+        }
+    }
+    
+    Err("Could not extract function signature from statement".into())
+}
+
+/// Helper to extract type name from TypeName node
+fn extract_type_name(type_name: &pg_query::protobuf::TypeName) -> Option<String> {
+    // Extract the type name from the names list
+    let parts: Vec<String> = type_name.names.iter()
+        .filter_map(|node| {
+            if let Some(pg_query::NodeEnum::String(s)) = &node.node {
+                Some(s.sval.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    if parts.is_empty() {
+        return None;
+    }
+    
+    // Join parts with dots for qualified types
+    let base_type = parts.join(".");
+    
+    // Check if it's an array type
+    if type_name.array_bounds.len() > 0 {
+        Some(format!("{}[]", base_type))
+    } else {
+        Some(base_type)
+    }
+}
+
 /// Normalize DDL statement for consistent processing
 fn normalize_ddl(ddl: &str) -> String {
     // Remove extra whitespace and normalize formatting
@@ -397,8 +539,8 @@ fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Resul
                         // Table comments depend on the table
                         dependencies.relations.insert(qualified_name.clone());
                         let comment_id = QualifiedIdent::new(
-                            qualified_name.schema.clone(),
-                            format!("table:{}", qualified_name.name)
+                            None,
+                            format!("table:{}", format_qualified_name(&qualified_name))
                         );
                         return Ok((comment_id, dependencies));
                     }
@@ -419,8 +561,8 @@ fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Resul
                         dependencies.types.insert(parent_name.clone());
                         
                         let comment_id = QualifiedIdent::new(
-                            parent_name.schema.clone(),
-                            format!("column:{}.{}", parent_name.name, parts.2)
+                            None,
+                            format!("column:{}.{}", format_qualified_name(&parent_name), parts.2)
                         );
                         return Ok((comment_id, dependencies));
                     }
@@ -438,7 +580,7 @@ fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Resul
                         // Generate function signature for unique identification
                         let signature = format_function_signature(&qualified_name, &func_with_args.objargs);
                         let comment_id = QualifiedIdent::new(
-                            qualified_name.schema.clone(),
+                            None,
                             format!("function:{}", signature)
                         );
                         return Ok((comment_id, dependencies));
@@ -454,8 +596,8 @@ fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Resul
                         let qualified_name = extract_name_from_node_list(&type_name.names)?;
                         dependencies.types.insert(qualified_name.clone());
                         let comment_id = QualifiedIdent::new(
-                            qualified_name.schema.clone(),
-                            format!("type:{}", qualified_name.name)
+                            None,
+                            format!("type:{}", format_qualified_name(&qualified_name))
                         );
                         return Ok((comment_id, dependencies));
                     }
@@ -489,7 +631,7 @@ fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Resul
                             dependencies.relations.insert(table_qualified.clone());
                             let comment_id = QualifiedIdent::new(
                                 None, // Triggers are not schema-qualified in comments
-                                format!("trigger:{}:{}", trigger_name, table_qualified.name)
+                                format!("trigger:{}:{}", trigger_name, format_qualified_name(&table_qualified))
                             );
                             
                             return Ok((comment_id, dependencies));
@@ -506,8 +648,25 @@ fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Resul
                         let qualified_name = extract_name_from_node_list(&type_name.names)?;
                         dependencies.types.insert(qualified_name.clone()); // Domains are a type of type
                         let comment_id = QualifiedIdent::new(
-                            qualified_name.schema.clone(),
-                            format!("domain:{}", qualified_name.name)
+                            None,
+                            format!("domain:{}", format_qualified_name(&qualified_name))
+                        );
+                        return Ok((comment_id, dependencies));
+                    }
+                }
+            }
+        }
+        PgObjectType::ObjectView => {
+            // COMMENT ON VIEW schema.view_name
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::List(list) = node {
+                        let qualified_name = extract_name_from_node_list(&list.items)?;
+                        // View comments depend on the view
+                        dependencies.relations.insert(qualified_name.clone());
+                        let comment_id = QualifiedIdent::new(
+                            None,
+                            format!("view:{}", format_qualified_name(&qualified_name))
                         );
                         return Ok((comment_id, dependencies));
                     }
@@ -547,14 +706,17 @@ fn extract_column_parts_from_list(items: &[pg_query::protobuf::Node]) -> Result<
 
 /// Helper to format function signature for unique identification
 fn format_function_signature(qualified_name: &QualifiedIdent, _args: &[pg_query::protobuf::Node]) -> String {
-    let base_name = match &qualified_name.schema {
-        Some(schema) => format!("{}.{}", schema, qualified_name.name),
-        None => qualified_name.name.clone(),
-    };
-    
     // For now, we'll use a simplified approach without parsing full argument types
     // In practice, PostgreSQL handles function overloading, but we've blocked that in pgmg
-    format!("{}()", base_name)
+    format!("{}()", format_qualified_name(qualified_name))
+}
+
+/// Helper to format a qualified name
+fn format_qualified_name(qualified_name: &QualifiedIdent) -> String {
+    match &qualified_name.schema {
+        Some(schema) => format!("{}.{}", schema, qualified_name.name),
+        None => qualified_name.name.clone(),
+    }
 }
 
 /// Helper to extract string value from a node
@@ -580,6 +742,174 @@ fn extract_name_from_node_list(items: &[pg_query::protobuf::Node]) -> Result<Qua
             Ok(QualifiedIdent::new(Some(schema), name))
         }
         _ => Err("Invalid qualified name".into()),
+    }
+}
+
+/// Parse a statement to check if it's a cron.schedule() or cron.unschedule() call
+fn parse_cron_call_from_statement(statement: &str) -> Result<Option<CronOperation>, Box<dyn std::error::Error>> {
+    // Parse the statement to get the AST
+    let parsed = pg_query::parse(statement)?;
+    
+    // Look for SELECT statements or direct function calls
+    for stmt in &parsed.protobuf.stmts {
+        if let Some(stmt) = &stmt.stmt {
+            match &stmt.node {
+                Some(pg_query::NodeEnum::SelectStmt(select)) => {
+                    // Check target list for function calls
+                    for target in &select.target_list {
+                        if let Some(pg_query::NodeEnum::ResTarget(res_target)) = &target.node {
+                            if let Some(val) = &res_target.val {
+                                if let Some(pg_query::NodeEnum::FuncCall(func_call)) = &val.node {
+                                    // Check if this is cron.schedule or cron.unschedule
+                                    if let Some(op) = parse_cron_function_call(func_call)? {
+                                        return Ok(Some(op));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(pg_query::NodeEnum::CallStmt(call)) => {
+                    // Handle CALL statements (though cron typically uses SELECT)
+                    if let Some(func_call) = &call.funccall {
+                        if let Some(op) = parse_cron_function_call(func_call)? {
+                            return Ok(Some(op));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    
+    Ok(None)
+}
+
+/// Parse a cron function call and return the operation type
+fn parse_cron_function_call(func_call: &pg_query::protobuf::FuncCall) -> Result<Option<CronOperation>, Box<dyn std::error::Error>> {
+    // Extract function name parts
+    let parts: Vec<String> = func_call.funcname.iter()
+        .filter_map(|node| {
+            if let Some(pg_query::NodeEnum::String(s)) = &node.node {
+                Some(s.sval.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    
+    // Check if it's cron.schedule or cron.unschedule
+    let is_schedule = match parts.as_slice() {
+        [schema, func] if schema == "cron" => {
+            match func.as_str() {
+                "schedule" => Some(true),
+                "unschedule" => Some(false),
+                _ => None,
+            }
+        }
+        [func] => {
+            // Might be in search path
+            match func.as_str() {
+                "schedule" => Some(true),
+                "unschedule" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    
+    match is_schedule {
+        Some(true) => {
+            // Extract job name and command from arguments
+            if let Some((job_name, command)) = extract_cron_schedule_args(func_call)? {
+                Ok(Some(CronOperation::Schedule { job_name, command }))
+            } else {
+                Ok(None)
+            }
+        }
+        Some(false) => {
+            // Extract job name from first argument
+            if let Some(job_name) = extract_cron_job_name(func_call)? {
+                Ok(Some(CronOperation::Unschedule { job_name }))
+            } else {
+                Ok(None)
+            }
+        }
+        None => Ok(None),
+    }
+}
+
+/// Extract arguments from cron.schedule function call
+fn extract_cron_schedule_args(func_call: &pg_query::protobuf::FuncCall) -> Result<Option<(String, String)>, Box<dyn std::error::Error>> {
+    // cron.schedule expects 3 arguments: job_name, schedule, command
+    if func_call.args.len() < 3 {
+        return Ok(None);
+    }
+    
+    // Extract job name (1st argument)
+    let job_name = match extract_string_from_const_node(&func_call.args[0]) {
+        Some(name) => name,
+        None => return Ok(None),
+    };
+    
+    // Skip schedule (2nd argument) - we don't need it for dependencies
+    
+    // Extract command (3rd argument)
+    let command = match extract_string_from_const_node(&func_call.args[2]) {
+        Some(cmd) => cmd,
+        None => return Ok(None),
+    };
+    
+    Ok(Some((job_name, command)))
+}
+
+/// Extract job name from cron.unschedule function call (first argument)
+fn extract_cron_job_name(func_call: &pg_query::protobuf::FuncCall) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    // The first argument should be the job name (a string constant)
+    if let Some(first_arg) = func_call.args.first() {
+        // Try to extract the string value from the argument
+        if let Some(job_name) = extract_string_from_const_node(first_arg) {
+            return Ok(Some(job_name));
+        }
+    }
+    Ok(None)
+}
+
+/// Helper to extract string value from a constant node (handles AConst wrapping)
+fn extract_string_from_const_node(node: &pg_query::protobuf::Node) -> Option<String> {
+    match &node.node {
+        Some(pg_query::NodeEnum::AConst(a_const)) => {
+            // For AConst, we need to check if it contains a String
+            // Based on protobuf structure, val should be an oneof field
+            match &a_const.val {
+                Some(pg_query::protobuf::a_const::Val::Sval(string_val)) => {
+                    Some(string_val.sval.clone())
+                }
+                _ => None,
+            }
+        }
+        Some(pg_query::NodeEnum::String(string_val)) => {
+            // Direct string node
+            Some(string_val.sval.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Parse dependencies from a cron command string (e.g., "CALL jobs.update_stats()")
+fn parse_cron_command_dependencies(command: &str) -> Dependencies {
+    // Try to parse the command as SQL
+    match crate::sql::parser::analyze_statement(command) {
+        Ok(deps) => deps,
+        Err(e) => {
+            // If parsing fails, log a warning and return empty dependencies
+            eprintln!("Warning: Failed to parse cron command '{}': {}", command, e);
+            Dependencies {
+                relations: std::collections::HashSet::new(),
+                functions: std::collections::HashSet::new(),
+                types: std::collections::HashSet::new(),
+            }
+        }
     }
 }
 
@@ -629,6 +959,29 @@ mod tests {
         assert_eq!(obj.object_type, ObjectType::Table);
         assert_eq!(obj.qualified_name.name, "orders");
         assert_eq!(obj.qualified_name.schema, Some("schema1".to_string()));
+    }
+
+    #[test]
+    fn test_extract_function_signature() {
+        // Test function without parameters
+        let sql = "CREATE FUNCTION test_func() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql";
+        let signature = extract_function_signature(sql).unwrap();
+        assert_eq!(signature, "test_func()");
+        
+        // Test function with parameters
+        let sql = r#"CREATE FUNCTION api.create_stripe_event(
+            p_event_id   text,
+            p_event_type text,
+            p_payload    jsonb,
+            p_object_id  text default null
+        ) RETURNS void LANGUAGE sql AS $$ SELECT 1; $$"#;
+        let signature = extract_function_signature(sql).unwrap();
+        assert_eq!(signature, "api.create_stripe_event(text, text, jsonb, text)");
+        
+        // Test function with schema and multiple parameters
+        let sql = "CREATE FUNCTION myschema.calculate(a integer, b numeric) RETURNS numeric LANGUAGE sql AS $$ SELECT $1 + $2; $$";
+        let signature = extract_function_signature(sql).unwrap();
+        assert_eq!(signature, "myschema.calculate(pg_catalog.int4, pg_catalog.numeric)");
     }
 
     #[test]
@@ -787,6 +1140,142 @@ mod tests {
     }
     
     #[test]
+    fn test_identify_cron_schedule() {
+        let sql = "SELECT cron.schedule('cleanup_old_data', '0 3 * * *', 'CALL cleanup_old_data()');";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::CronJob);
+        assert_eq!(obj.qualified_name.name, "cleanup_old_data");
+        assert!(obj.qualified_name.schema.is_none());
+    }
+    
+    #[test]
+    fn test_identify_cron_schedule_with_schema() {
+        let sql = "SELECT cron.schedule('vacuum_job', '30 2 * * *', 'VACUUM ANALYZE api.events;');";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::CronJob);
+        assert_eq!(obj.qualified_name.name, "vacuum_job");
+        // Note: The job name doesn't have a schema, even if the command references a schema
+        assert!(obj.qualified_name.schema.is_none());
+    }
+    
+    #[test]
+    fn test_identify_cron_unschedule() {
+        // cron.unschedule should not create a parsed object
+        let sql = "SELECT cron.unschedule('cleanup_old_data');";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_none()); // Unschedule doesn't create an object
+    }
+    
+    #[test]
+    fn test_cron_schedule_dependencies() {
+        let sql = "SELECT cron.schedule('update_stats', '0 * * * *', 'CALL jobs.update_user_stats()');";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::CronJob);
+        assert_eq!(obj.qualified_name.name, "update_stats");
+        
+        // Should extract dependency on the procedure being called
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::new(
+            Some("jobs".to_string()),
+            "update_user_stats".to_string()
+        )));
+        
+        // Should NOT include cron.schedule as a dependency
+        assert!(!obj.dependencies.functions.contains(&QualifiedIdent::new(
+            Some("cron".to_string()),
+            "schedule".to_string()
+        )));
+    }
+    
+    #[test]
+    fn test_cron_schedule_vacuum_dependencies() {
+        let sql = "SELECT cron.schedule('vacuum_events', '0 2 * * *', 'VACUUM ANALYZE api.events');";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::CronJob);
+        assert_eq!(obj.qualified_name.name, "vacuum_events");
+        
+        // Should extract dependency on the table being vacuumed
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::new(
+            Some("api".to_string()),
+            "events".to_string()
+        )));
+    }
+    
+    #[test]
+    fn test_cron_schedule_select_function_dependencies() {
+        let sql = "SELECT cron.schedule('refresh_cache', '*/15 * * * *', 'SELECT public.refresh_materialized_views()');";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::CronJob);
+        assert_eq!(obj.qualified_name.name, "refresh_cache");
+        
+        // Should extract dependency on the function being called
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::new(
+            Some("public".to_string()),
+            "refresh_materialized_views".to_string()
+        )));
+    }
+    
+    #[test]
+    fn test_cron_schedule_delete_dependencies() {
+        let sql = "SELECT cron.schedule('cleanup_logs', '0 1 * * *', 'DELETE FROM logs WHERE created_at < now() - interval ''30 days''');";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::CronJob);
+        assert_eq!(obj.qualified_name.name, "cleanup_logs");
+        
+        // Should extract dependency on the table being deleted from
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::from_name("logs".to_string())));
+    }
+    
+    #[test]
+    fn test_cron_schedule_update_dependencies() {
+        let sql = "SELECT cron.schedule('update_counts', '0 * * * *', 'UPDATE stats SET last_updated = now()');";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::CronJob);
+        assert_eq!(obj.qualified_name.name, "update_counts");
+        
+        // Should extract dependency on the table being updated
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::from_name("stats".to_string())));
+    }
+    
+    #[test]
+    fn test_cron_schedule_invalid_command() {
+        // Test with invalid SQL in command - should still create the cron job
+        let sql = "SELECT cron.schedule('bad_job', '0 * * * *', 'NOT VALID SQL SYNTAX');";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::CronJob);
+        assert_eq!(obj.qualified_name.name, "bad_job");
+        
+        // Should have no dependencies (parsing failed)
+        assert!(obj.dependencies.relations.is_empty());
+        assert!(obj.dependencies.functions.is_empty());
+        assert!(obj.dependencies.types.is_empty());
+    }
+    
+    #[test]
     fn test_identify_create_materialized_view() {
         let sql = r#"
         CREATE MATERIALIZED VIEW product_summary AS
@@ -881,8 +1370,8 @@ mod tests {
         assert!(result.is_some());
         let obj = result.unwrap();
         assert_eq!(obj.object_type, ObjectType::Comment);
-        assert_eq!(obj.qualified_name.name, "table:users");
-        assert_eq!(obj.qualified_name.schema, Some("api".to_string()));
+        assert_eq!(obj.qualified_name.name, "table:api.users");
+        assert!(obj.qualified_name.schema.is_none());
         
         // Should have dependency on the qualified table
         assert!(obj.dependencies.relations.contains(&QualifiedIdent::new(Some("api".to_string()), "users".to_string())));
@@ -911,8 +1400,8 @@ mod tests {
         assert!(result.is_some());
         let obj = result.unwrap();
         assert_eq!(obj.object_type, ObjectType::Comment);
-        assert_eq!(obj.qualified_name.name, "column:users.email");
-        assert_eq!(obj.qualified_name.schema, Some("api".to_string()));
+        assert_eq!(obj.qualified_name.name, "column:api.users.email");
+        assert!(obj.qualified_name.schema.is_none());
         
         // Should have dependency on the qualified table
         assert!(obj.dependencies.relations.contains(&QualifiedIdent::new(Some("api".to_string()), "users".to_string())));
@@ -957,7 +1446,7 @@ mod tests {
         let obj = result.unwrap();
         assert_eq!(obj.object_type, ObjectType::Comment);
         assert_eq!(obj.qualified_name.name, "function:api.get_user_stats()");
-        assert_eq!(obj.qualified_name.schema, Some("api".to_string()));
+        assert!(obj.qualified_name.schema.is_none());
         
         // Should have dependency on the qualified function
         assert!(obj.dependencies.functions.contains(&QualifiedIdent::new(Some("api".to_string()), "get_user_stats".to_string())));
@@ -1016,7 +1505,7 @@ mod tests {
         assert!(result.is_some());
         let obj = result.unwrap();
         assert_eq!(obj.object_type, ObjectType::Comment);
-        assert_eq!(obj.qualified_name.name, "trigger:update_stats:users");
+        assert_eq!(obj.qualified_name.name, "trigger:update_stats:api.users");
         assert!(obj.qualified_name.schema.is_none()); // Triggers themselves are not schema-qualified in comments
         
         // Should have dependency on the qualified table
@@ -1051,5 +1540,43 @@ mod tests {
         let result = identify_sql_object(sql).unwrap();
         
         assert!(result.is_none()); // Not a DDL statement we track
+    }
+    
+    #[test]
+    fn test_identify_create_aggregate() {
+        let sql = r#"CREATE AGGREGATE sum(currency) (
+            sfunc = currency_sum_sfunc,
+            stype = currency,
+            parallel = safe
+        );"#;
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Aggregate);
+        assert_eq!(obj.qualified_name.name, "sum");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the state function
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::from_name("currency_sum_sfunc".to_string())));
+    }
+    
+    #[test]
+    fn test_identify_qualified_aggregate() {
+        let sql = r#"CREATE AGGREGATE public.array_agg_comp(anyelement) (
+            sfunc = array_comp_sfunc,
+            stype = anyarray,
+            initcond = '{}'
+        );"#;
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Aggregate);
+        assert_eq!(obj.qualified_name.name, "array_agg_comp");
+        assert_eq!(obj.qualified_name.schema, Some("public".to_string()));
+        
+        // Should have dependency on the state function
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::from_name("array_comp_sfunc".to_string())));
     }
 }
