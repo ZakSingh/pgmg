@@ -61,6 +61,34 @@ impl<'a> StateManager<'a> {
             &[],
         ).await?;
 
+        // Create indexes for performance optimization
+        // Index on object_type for filtering queries by type
+        self.client.execute(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_pgmg_state_object_type 
+            ON pgmg.pgmg_state (object_type)
+            "#,
+            &[],
+        ).await?;
+
+        // Index on last_applied for time-based queries
+        self.client.execute(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_pgmg_state_last_applied 
+            ON pgmg.pgmg_state (last_applied)
+            "#,
+            &[],
+        ).await?;
+
+        // Index on migrations applied_at for chronological queries
+        self.client.execute(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_pgmg_migrations_applied_at 
+            ON pgmg.pgmg_migrations (applied_at)
+            "#,
+            &[],
+        ).await?;
+
         Ok(())
     }
 

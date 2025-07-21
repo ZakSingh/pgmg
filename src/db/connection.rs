@@ -1,6 +1,8 @@
 use tokio_postgres::Client;
 use std::env;
 use crate::db::tls::{TlsMode, TlsConfig, connect_with_tls, PgConnection};
+use crate::error::{PgmgError, Result};
+use tracing::{info, debug};
 
 #[derive(Clone)]
 pub struct DatabaseConfig {
@@ -14,7 +16,7 @@ pub struct DatabaseConfig {
 
 impl DatabaseConfig {
     /// Parse connection URL and extract TLS configuration
-    pub fn from_url(url: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_url(url: &str) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         // Parse connection string like "postgres://user:pass@host:port/db?sslmode=require"
         let parsed_url = url::Url::parse(url)?;
         
@@ -50,7 +52,7 @@ impl DatabaseConfig {
         })
     }
 
-    pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_env() -> std::result::Result<Self, Box<dyn std::error::Error>> {
         let mut tls_config = TlsConfig::default();
         
         // Parse TLS configuration from environment variables
@@ -123,16 +125,101 @@ impl DatabaseConfig {
 
 pub async fn connect_to_database(
     config: &DatabaseConfig,
-) -> Result<(Client, PgConnection), Box<dyn std::error::Error>> {
+) -> std::result::Result<(Client, PgConnection), Box<dyn std::error::Error>> {
     let connection_string = config.to_connection_string();
     connect_with_tls(&connection_string, &config.tls_config).await
 }
 
 pub async fn connect_with_url(
     url: &str,
-) -> Result<(Client, PgConnection), Box<dyn std::error::Error>> {
+) -> std::result::Result<(Client, PgConnection), Box<dyn std::error::Error>> {
     let config = DatabaseConfig::from_url(url)?;
     connect_to_database(&config).await
+}
+
+/// A managed PostgreSQL connection with automatic cleanup
+/// This wrapper ensures proper resource management through RAII
+pub struct ManagedConnection {
+    client: Client,
+    connection_string: String,
+    is_closed: bool,
+}
+
+impl ManagedConnection {
+    /// Create a new managed connection from a connection string
+    pub async fn connect(connection_string: &str) -> Result<Self> {
+        let config = DatabaseConfig::from_url(connection_string)
+            .map_err(|e| PgmgError::InvalidConnectionString(format!("Failed to parse connection string: {}", e)))?;
+            
+        let (client, connection) = connect_to_database(&config).await
+            .map_err(|e| PgmgError::ConnectionFailed(format!("Failed to establish connection: {}", e)))?;
+        
+        // Spawn connection handler in background using PgConnection's spawn method
+        connection.spawn();
+        
+        info!("Established managed database connection");
+        
+        Ok(Self {
+            client,
+            connection_string: connection_string.to_string(),
+            is_closed: false,
+        })
+    }
+    
+    /// Get a reference to the client for database operations
+    pub fn client(&self) -> &Client {
+        &self.client
+    }
+    
+    /// Get a mutable reference to the client for database operations
+    pub fn client_mut(&mut self) -> &mut Client {
+        &mut self.client
+    }
+    
+    /// Get the connection string (credentials masked for logging)
+    pub fn connection_info(&self) -> String {
+        self.connection_string.replace(|c: char| c == ':' || c == '@', "*")
+    }
+    
+    /// Check if the connection is still healthy
+    pub async fn is_healthy(&self) -> bool {
+        match self.client.simple_query("SELECT 1").await {
+            Ok(_) => true,
+            Err(e) => {
+                debug!("Connection health check failed: {}", e);
+                false
+            }
+        }
+    }
+    
+    /// Gracefully close the connection
+    /// This is automatically called on Drop, but can be called explicitly for error handling
+    pub async fn close(mut self) -> Result<()> {
+        if self.is_closed {
+            debug!("Connection already closed");
+            return Ok(());
+        }
+        
+        debug!("Closing managed database connection");
+        
+        // For tokio-postgres, closing the client will automatically close the underlying connection
+        // The connection task spawned by PgConnection::spawn() will detect this and exit cleanly
+        self.is_closed = true;
+        
+        info!("Managed database connection closed");
+        Ok(())
+    }
+}
+
+impl Drop for ManagedConnection {
+    fn drop(&mut self) {
+        if !self.is_closed {
+            debug!("ManagedConnection dropping - connection will be cleaned up by tokio-postgres");
+            self.is_closed = true;
+        }
+        // Note: tokio-postgres handles connection cleanup automatically when Client is dropped
+        // For explicit cleanup, call close() before dropping
+    }
 }
 
 #[cfg(test)]

@@ -4,15 +4,24 @@ use owo_colors::OwoColorize;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlpgsqlCheckResult {
+    #[serde(rename = "functionid")]
     pub functionid: Option<String>,
-    pub lineno: Option<i32>,
-    pub position: Option<i32>,
-    pub sqlstate: Option<String>,
-    pub message: Option<String>,
-    pub detail: Option<String>,
-    pub hint: Option<String>,
+    #[serde(rename = "level")]
     pub level: Option<String>,
+    #[serde(rename = "message")]
+    pub message: Option<String>,
+    #[serde(rename = "sqlState")]
+    pub sqlstate: Option<String>,
+    #[serde(rename = "detail")]
+    pub detail: Option<String>,
+    #[serde(rename = "hint")]
+    pub hint: Option<String>,
+    #[serde(rename = "context")]
     pub context: Option<String>,
+    #[serde(rename = "lineno")]
+    pub lineno: Option<i32>,
+    #[serde(rename = "position")]
+    pub position: Option<i32>,
 }
 
 #[derive(Debug)]
@@ -64,8 +73,16 @@ pub async fn check_function(
     for row in rows {
         // The JSON is returned as a single column
         if let Ok(json_str) = row.try_get::<_, String>(0) {
-            if let Ok(check_result) = serde_json::from_str::<PlpgsqlCheckResult>(&json_str) {
-                results.push(check_result);
+            // Parse the JSON wrapper structure
+            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                // Extract issues array from the wrapper
+                if let Some(issues) = json_value.get("issues").and_then(|v| v.as_array()) {
+                    for issue in issues {
+                        if let Ok(check_result) = serde_json::from_value::<PlpgsqlCheckResult>(issue.clone()) {
+                            results.push(check_result);
+                        }
+                    }
+                }
             }
         }
     }

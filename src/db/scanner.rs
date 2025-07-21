@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use crate::sql::{SqlObject, splitter::split_sql_file, objects::identify_sql_object};
 use crate::BuiltinCatalog;
+use pg_query;
 
 /// Scan a directory for .sql files and parse them into SQL objects
 pub async fn scan_sql_files(
@@ -74,10 +75,97 @@ fn process_sql_file(
             object.start_line = statement.start_line;
             object.end_line = statement.end_line;
             sql_objects.push(object);
+        } else {
+            // Log warning for unprocessable statements
+            warn_unprocessable_statement(file_path, &statement)?;
         }
     }
     
     Ok(())
+}
+
+/// Analyze and warn about unprocessable SQL statements
+fn warn_unprocessable_statement(
+    file_path: &Path,
+    statement: &crate::sql::splitter::SqlStatement,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let relative_path = file_path.strip_prefix(std::env::current_dir().unwrap_or_default())
+        .unwrap_or(file_path);
+    
+    let statement_type = identify_statement_type(&statement.sql);
+    let sql_preview = create_sql_preview(&statement.sql);
+    
+    let line_info = if let Some(start) = statement.start_line {
+        if let Some(end) = statement.end_line {
+            if start == end {
+                format!("line {}", start)
+            } else {
+                format!("lines {}-{}", start, end)
+            }
+        } else {
+            format!("line {}", start)
+        }
+    } else {
+        "unknown line".to_string()
+    };
+    
+    tracing::warn!(
+        "Skipping unprocessable {} statement in {} ({}): {}",
+        statement_type,
+        relative_path.display(),
+        line_info,
+        sql_preview
+    );
+    
+    Ok(())
+}
+
+/// Identify the type of SQL statement for warning messages
+fn identify_statement_type(sql: &str) -> &'static str {
+    let trimmed = sql.trim().to_uppercase();
+    
+    // Try to parse with pg_query first to distinguish parse failures
+    match pg_query::parse(sql) {
+        Err(_) => "malformed",
+        Ok(_) => {
+            // Statement parsed successfully but pgmg doesn't handle it
+            if trimmed.starts_with("UPDATE") {
+                "UPDATE"
+            } else if trimmed.starts_with("DELETE") {
+                "DELETE"
+            } else if trimmed.starts_with("INSERT") {
+                "INSERT"
+            } else if trimmed.starts_with("SELECT") {
+                "SELECT"
+            } else if trimmed.starts_with("ALTER") {
+                "ALTER"
+            } else if trimmed.starts_with("DROP") {
+                "DROP"
+            } else if trimmed.starts_with("GRANT") || trimmed.starts_with("REVOKE") {
+                "permission"
+            } else if trimmed.starts_with("SET") {
+                "SET"
+            } else if trimmed.starts_with("TRUNCATE") {
+                "TRUNCATE"
+            } else if trimmed.starts_with("ANALYZE") || trimmed.starts_with("VACUUM") {
+                "maintenance"
+            } else if trimmed.starts_with("BEGIN") || trimmed.starts_with("COMMIT") || trimmed.starts_with("ROLLBACK") {
+                "transaction"
+            } else {
+                "unsupported"
+            }
+        }
+    }
+}
+
+/// Create a preview of the SQL statement for warning messages
+fn create_sql_preview(sql: &str) -> String {
+    let trimmed = sql.trim();
+    if trimmed.len() <= 80 {
+        trimmed.to_string()
+    } else {
+        format!("{}...", &trimmed[..77])
+    }
 }
 
 /// Scan migrations directory for migration files

@@ -32,6 +32,9 @@ pub struct TestEnvironment {
 impl TestEnvironment {
     /// Create a new test environment with isolated database
     pub async fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        // Register cleanup handlers on first use
+        register_cleanup_handlers();
+        
         // Ensure container is started
         let container_info = ensure_container_started().await?;
         
@@ -192,9 +195,34 @@ impl TestEnvironment {
 
 impl Drop for TestEnvironment {
     fn drop(&mut self) {
-        // Drop test database when test environment is dropped
-        // This happens automatically when TempDir is dropped
-        // The database cleanup is handled by container restart between test runs
+        // Clean up test database when test environment is dropped
+        let database_name = self.database_name.clone();
+        let container_info = CONTAINER_INFO.clone();
+        
+        tokio::spawn(async move {
+            let info_guard = container_info.lock().await;
+            if let Some(info) = info_guard.as_ref() {
+                    let admin_conn_string = format!(
+                        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+                        info.host_port
+                    );
+                    
+                    if let Ok((admin_client, admin_connection)) = 
+                        tokio_postgres::connect(&admin_conn_string, NoTls).await {
+                        
+                        tokio::spawn(async move {
+                            if let Err(e) = admin_connection.await {
+                                eprintln!("Cleanup admin connection error: {}", e);
+                            }
+                        });
+                        
+                        // Drop the test database
+                        let _ = admin_client
+                            .execute(&format!("DROP DATABASE IF EXISTS {}", database_name), &[])
+                            .await;
+                    }
+                }
+        });
     }
 }
 
@@ -208,6 +236,7 @@ async fn ensure_container_started() -> Result<ContainerInfo, Box<dyn std::error:
             .with_env_var(("POSTGRES_PASSWORD", "postgres"))
             .with_env_var(("POSTGRES_USER", "postgres"))
             .with_env_var(("POSTGRES_DB", "postgres"));
+            // Note: testcontainers automatically cleans up containers when dropped
         
         let container = DOCKER_CLIENT.run(postgres_image);
         let host_port = container.get_host_port_ipv4(5432);
@@ -228,6 +257,60 @@ impl Clone for ContainerInfo {
             host_port: self.host_port,
         }
     }
+}
+
+/// Stop the shared PostgreSQL container (called on test completion)
+pub async fn cleanup_shared_container() {
+    let mut container_guard = CONTAINER.lock().await;
+    let mut info_guard = CONTAINER_INFO.lock().await;
+    
+    if let Some(container) = container_guard.take() {
+        // The container will be stopped and removed when dropped
+        drop(container);
+        *info_guard = None;
+        println!("Cleaned up shared PostgreSQL container");
+    }
+}
+
+/// Clean up all test resources - call this at the end of test suites
+/// This is automatically called by cleanup handlers but can be called explicitly
+pub async fn cleanup_all() {
+    cleanup_shared_container().await;
+}
+
+/// Register cleanup handlers to ensure containers are stopped
+pub fn register_cleanup_handlers() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    
+    INIT.call_once(|| {
+        // Register cleanup for normal program termination
+        let _ = std::panic::set_hook(Box::new(|_| {
+            // Try to cleanup on panic (best effort)
+            std::thread::spawn(|| {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                rt.block_on(cleanup_shared_container());
+            }).join().ok();
+        }));
+        
+        // Register cleanup for SIGINT/SIGTERM
+        #[cfg(unix)]
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            
+            let running = Arc::new(AtomicBool::new(true));
+            
+            ctrlc::set_handler(move || {
+                if running.load(Ordering::SeqCst) {
+                    running.store(false, Ordering::SeqCst);
+                    let rt = tokio::runtime::Runtime::new().unwrap();
+                    rt.block_on(cleanup_shared_container());
+                    std::process::exit(0);
+                }
+            }).expect("Error setting Ctrl-C handler");
+        }
+    });
 }
 
 // Re-export modules
