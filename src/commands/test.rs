@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::time::{Duration, Instant};
 use crate::db::connect_with_url;
+use crate::commands::check::execute_check;
+use crate::plpgsql_check::display_check_errors;
 use crate::error::format_postgres_error_with_details;
 use owo_colors::OwoColorize;
 // Manual TAP parsing implementation
@@ -42,7 +44,15 @@ pub async fn execute_test(
     path: Option<PathBuf>,
     connection_string: String,
     tap_output: bool,
-    continue_on_failure: bool,
+) -> Result<TestResult, Box<dyn std::error::Error>> {
+    execute_test_with_options(path, connection_string, tap_output, true).await
+}
+
+pub async fn execute_test_with_options(
+    path: Option<PathBuf>,
+    connection_string: String,
+    tap_output: bool,
+    show_immediate_results: bool,
 ) -> Result<TestResult, Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     
@@ -54,6 +64,25 @@ pub async fn execute_test(
     }
     
     println!("{} Found {} test file(s)", "→".cyan(), test_files.len());
+    
+    // Run pgmg check first to provide helpful diagnostics
+    println!("\n{} Running plpgsql_check before tests...", "→".cyan());
+    match execute_check(connection_string.clone(), None, false).await {
+        Ok(check_result) => {
+            if check_result.errors_found > 0 {
+                println!("{} Found {} error(s) in PL/pgSQL functions", "⚠".yellow(), check_result.errors_found);
+                display_check_errors(&check_result.check_errors);
+                println!(); // Add blank line after check errors
+            } else if check_result.warnings_found > 0 {
+                println!("{} Found {} warning(s) in PL/pgSQL functions", "⚠".yellow(), check_result.warnings_found);
+            } else {
+                println!("{} All PL/pgSQL functions passed checks", "✓".green());
+            }
+        }
+        Err(e) => {
+            println!("{} plpgsql_check not available or failed: {}", "⚠".yellow(), e);
+        }
+    }
     
     // Connect to database
     let (client, connection) = connect_with_url(&connection_string).await?;
@@ -72,7 +101,12 @@ pub async fn execute_test(
     
     // Run each test file
     for test_file in test_files {
-        println!("\n{} Running {}", "→".cyan(), test_file.display().to_string().bright_blue());
+        // Display relative path from current directory
+        let display_path = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| test_file.strip_prefix(cwd).ok())
+            .unwrap_or(&test_file);
+        println!("\n{} Running {}", "→".cyan(), display_path.display().to_string().bright_blue());
         
         let file_result = run_test_file(&client, &test_file, tap_output).await?;
         
@@ -81,18 +115,20 @@ pub async fn execute_test(
         total_failed += file_result.failed_count;
         total_skipped += file_result.skipped_count;
         
-        // Print immediate results
-        if file_result.passed {
-            println!("  {} {} tests passed", "✓".green(), file_result.test_count);
-        } else {
-            println!("  {} {} tests failed", "✗".red(), file_result.failed_count);
-            if !continue_on_failure {
-                test_results.push(file_result);
-                break;
+        // Print immediate results if requested
+        if show_immediate_results {
+            if file_result.passed {
+                println!("  {} {} tests passed", "✓".green(), file_result.test_count);
+            } else {
+                println!("  {} {} tests failed", "✗".red(), file_result.failed_count);
             }
         }
         
         test_results.push(file_result);
+        
+        // Clean up any aborted transaction before next test file
+        // This ensures each test file starts with a clean connection state
+        let _ = client.simple_query("ROLLBACK").await;
     }
     
     let duration = start_time.elapsed();
@@ -111,19 +147,8 @@ fn discover_test_files(path: Option<PathBuf>) -> Result<Vec<PathBuf>, Box<dyn st
     let search_path = match path {
         Some(p) => p,
         None => {
-            // Try common test directories
-            let candidates = vec!["sql", "tests", "test", "."];
-            let mut found_path = None;
-            
-            for candidate in candidates {
-                let path = PathBuf::from(candidate);
-                if path.exists() {
-                    found_path = Some(path);
-                    break;
-                }
-            }
-            
-            found_path.unwrap_or_else(|| PathBuf::from("."))
+            // When no path is specified (--all flag), search entire project from current directory
+            PathBuf::from(".")
         }
     };
     
@@ -277,16 +302,68 @@ SET client_min_messages TO 'INFO';
             output_lines.join("\n")
         }
         Err(e) => {
-            // Try to extract detailed error information
+            // Extract detailed error information using the same formatting as apply command
             let detailed_error = if let Some(_pg_err) = e.as_db_error() {
                 // We have a database error with details
-                format_postgres_error_with_details(
-                    &test_file.file_name().unwrap_or_default().to_string_lossy(),
-                    Some(test_file),
-                    Some(1), // Test files start at line 1
-                    &wrapped_test,
-                    &e
-                )
+                use crate::error::{extract_postgres_error_details, calculate_line_column};
+                use owo_colors::OwoColorize;
+                
+                if let Some(details) = extract_postgres_error_details(&e) {
+                    let mut output = format!("Failed to execute SQL for {}", 
+                        test_file.file_name().unwrap_or_default().to_string_lossy().red());
+                    
+                    // Add file location
+                    output.push_str(&format!("\n  {}: {}", "File".dimmed(), test_file.display()));
+                    
+                    // If we have an error position, calculate it relative to the wrapped content
+                    // then adjust for the original test content
+                    if let Some(pos) = details.position {
+                        // Calculate position in wrapped content
+                        let (wrapped_line, col) = calculate_line_column(&wrapped_test, pos - 1);
+                        
+                        // The wrapper adds 4 lines before the actual test content
+                        let wrapper_lines = 4;
+                        
+                        if wrapped_line > wrapper_lines {
+                            let actual_line = wrapped_line - wrapper_lines;
+                            
+                            output.push_str(&format!("\n  {} line {}, column {}", 
+                                "Error at".yellow(), 
+                                actual_line.to_string().yellow().bold(),
+                                col.to_string().yellow().bold()
+                            ));
+                            
+                            // Show the problematic line from the original test content
+                            if let Some(error_line) = test_content.lines().nth(actual_line - 1) {
+                                output.push_str(&format!("\n  {}", error_line.dimmed()));
+                                output.push_str(&format!("\n  {}{}", " ".repeat(col - 1), "^".red().bold()));
+                            }
+                        } else {
+                            // Error is in the wrapper part, just show the position
+                            output.push_str(&format!("\n  {} SQL setup, line {}, column {}", 
+                                "Error at".yellow(),
+                                wrapped_line.to_string().yellow().bold(),
+                                col.to_string().yellow().bold()
+                            ));
+                        }
+                    }
+                    
+                    output.push_str(&format!("\n  {}: {}", "Error".red().bold(), details.message));
+                    
+                    if let Some(detail) = details.detail {
+                        output.push_str(&format!("\n  {}: {}", "Detail".yellow(), detail));
+                    }
+                    
+                    if let Some(hint) = details.hint {
+                        output.push_str(&format!("\n  {}: {}", "Hint".green(), hint));
+                    }
+                    
+                    output.push_str(&format!("\n  {}: {} ({})", "Code".dimmed(), details.code, details.severity));
+                    
+                    output
+                } else {
+                    e.to_string()
+                }
             } else {
                 e.to_string()
             };
@@ -303,7 +380,7 @@ SET client_min_messages TO 'INFO';
                     description: "Test execution failed".to_string(),
                     diagnostic: Some(e.to_string()),
                     detailed_error: Some(detailed_error),
-                    sql_context: Some(wrapped_test.clone()),
+                    sql_context: Some(test_content.clone()), // Store original test content
                 }],
                 tap_output: format!("# Test execution failed: {}", e),
                 duration: start_time.elapsed(),
@@ -348,10 +425,15 @@ fn parse_tap_output(tap_output: &str) -> Result<ParsedTapResults, Box<dyn std::e
     let mut skipped_count = 0;
     let mut failures = Vec::new();
     
-    // Parse TAP output manually since we need simple parsing
-    for line in tap_output.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let lines: Vec<&str> = tap_output.lines().collect();
+    let mut i = 0;
+    
+    // Parse TAP output manually, capturing diagnostic information
+    while i < lines.len() {
+        let line = lines[i].trim();
+        
+        if line.is_empty() {
+            i += 1;
             continue;
         }
         
@@ -367,10 +449,44 @@ fn parse_tap_output(tap_output: &str) -> Result<ParsedTapResults, Box<dyn std::e
             failed_count += 1;
             let description = extract_test_description(line);
             println!("    {} {}", "✗".red(), description.red());
+            
+            // Look ahead for diagnostic information
+            let mut diagnostic_lines = Vec::new();
+            let mut j = i + 1;
+            
+            while j < lines.len() {
+                let next_line = lines[j].trim();
+                if next_line.starts_with('#') {
+                    // Capture diagnostic lines but skip the leading '#'
+                    let diag_content = if next_line.len() > 1 {
+                        next_line[1..].trim().to_string()
+                    } else {
+                        String::new()
+                    };
+                    
+                    if !diag_content.is_empty() {
+                        diagnostic_lines.push(diag_content);
+                    }
+                    j += 1;
+                } else if next_line.starts_with("ok ") || next_line.starts_with("not ok ") || 
+                         next_line.contains("# SKIP") || next_line.is_empty() {
+                    // Next test or empty line, stop collecting diagnostics
+                    break;
+                } else {
+                    j += 1;
+                }
+            }
+            
+            let diagnostic = if diagnostic_lines.is_empty() {
+                None
+            } else {
+                Some(diagnostic_lines.join("\n"))
+            };
+            
             failures.push(TestFailure {
                 test_number: test_count,
                 description: description.clone(),
-                diagnostic: None,
+                diagnostic,
                 detailed_error: None,
                 sql_context: None,
             });
@@ -380,6 +496,8 @@ fn parse_tap_output(tap_output: &str) -> Result<ParsedTapResults, Box<dyn std::e
             let description = extract_test_description(line);
             println!("    {} {} {}", "↷".yellow(), "SKIP".yellow(), description.bright_black());
         }
+        
+        i += 1;
     }
     
     Ok(ParsedTapResults {
@@ -435,19 +553,50 @@ pub fn print_test_summary(result: &TestResult) {
         println!("{}", "Failed Tests:".red().bold());
         for file_result in &result.test_files {
             if !file_result.passed {
-                println!("  {} {}", "📁".red(), file_result.file_path.display().to_string().red());
+                // Display relative path from current directory
+                let display_path = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| file_result.file_path.strip_prefix(cwd).ok())
+                    .unwrap_or(&file_result.file_path);
+                println!("  {} {}", "📁".red(), display_path.display().to_string().red());
+                
                 for failure in &file_result.failures {
                     println!("    {} Test #{}: {}", "✗".red(), failure.test_number, failure.description);
                     
-                    // Show detailed error if available
+                    // Show detailed error if available (SQL execution errors)
                     if let Some(detailed_error) = &failure.detailed_error {
                         // The detailed error already includes formatting, so just print it with indentation
                         for line in detailed_error.lines() {
                             println!("      {}", line);
                         }
                     } else if let Some(diagnostic) = &failure.diagnostic {
-                        // Fall back to simple diagnostic
-                        println!("      {}", diagnostic.bright_black());
+                        // Show pgtap diagnostic information with proper formatting
+                        println!("      {}: {}", "Diagnostic".yellow().bold(), "");
+                        for diag_line in diagnostic.lines() {
+                            if diag_line.trim().is_empty() {
+                                continue;
+                            }
+                            
+                            // Format specific pgtap diagnostic patterns
+                            if diag_line.contains("Failed test") {
+                                println!("        {}: {}", "Test".dimmed(), diag_line.replace("Failed test", "").trim().trim_matches('"').yellow());
+                            } else if diag_line.contains("got:") || diag_line.contains("Got:") {
+                                let got_value = diag_line.split(':').nth(1).unwrap_or("").trim();
+                                println!("        {}: {}", "Got".red().bold(), got_value.red());
+                            } else if diag_line.contains("expected:") || diag_line.contains("Expected:") {
+                                let expected_value = diag_line.split(':').nth(1).unwrap_or("").trim();
+                                println!("        {}: {}", "Expected".green().bold(), expected_value.green());
+                            } else if diag_line.contains("DETAIL:") {
+                                let detail = diag_line.replace("DETAIL:", "").trim().to_string();
+                                println!("        {}: {}", "Detail".yellow(), detail);
+                            } else if diag_line.contains("HINT:") {
+                                let hint = diag_line.replace("HINT:", "").trim().to_string();
+                                println!("        {}: {}", "Hint".green(), hint);
+                            } else {
+                                // Generic diagnostic line
+                                println!("        {}", diag_line.bright_black());
+                            }
+                        }
                     }
                 }
             }

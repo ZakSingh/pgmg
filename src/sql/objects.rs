@@ -588,6 +588,25 @@ fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Resul
                 }
             }
         }
+        PgObjectType::ObjectProcedure => {
+            // COMMENT ON PROCEDURE schema.proc_name(args)
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::ObjectWithArgs(proc_with_args) = node {
+                        let qualified_name = extract_name_from_node_list(&proc_with_args.objname)?;
+                        dependencies.functions.insert(qualified_name.clone());
+                        
+                        // Generate procedure signature for unique identification
+                        let signature = format_function_signature(&qualified_name, &proc_with_args.objargs);
+                        let comment_id = QualifiedIdent::new(
+                            None,
+                            format!("procedure:{}", signature)
+                        );
+                        return Ok((comment_id, dependencies));
+                    }
+                }
+            }
+        }
         PgObjectType::ObjectType => {
             // COMMENT ON TYPE schema.type_name
             if let Some(object) = &comment_stmt.object {
@@ -667,6 +686,23 @@ fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Resul
                         let comment_id = QualifiedIdent::new(
                             None,
                             format!("view:{}", format_qualified_name(&qualified_name))
+                        );
+                        return Ok((comment_id, dependencies));
+                    }
+                }
+            }
+        }
+        PgObjectType::ObjectMatview => {
+            // COMMENT ON MATERIALIZED VIEW schema.matview_name
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::List(list) = node {
+                        let qualified_name = extract_name_from_node_list(&list.items)?;
+                        // Materialized view comments depend on the materialized view
+                        dependencies.relations.insert(qualified_name.clone());
+                        let comment_id = QualifiedIdent::new(
+                            None,
+                            format!("materialized_view:{}", format_qualified_name(&qualified_name))
                         );
                         return Ok((comment_id, dependencies));
                     }
@@ -1535,6 +1571,36 @@ mod tests {
     }
     
     #[test]
+    fn test_comment_on_materialized_view() {
+        let sql = "COMMENT ON MATERIALIZED VIEW product_search_index IS 'Full-text search index for products'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "materialized_view:product_search_index");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the materialized view
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::from_name("product_search_index".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_qualified_materialized_view() {
+        let sql = "COMMENT ON MATERIALIZED VIEW api.product_search_index IS 'API search index'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "materialized_view:api.product_search_index");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the qualified materialized view
+        assert!(obj.dependencies.relations.contains(&QualifiedIdent::new(Some("api".to_string()), "product_search_index".to_string())));
+    }
+    
+    #[test]
     fn test_non_comment_statement() {
         let sql = "SELECT * FROM users";
         let result = identify_sql_object(sql).unwrap();
@@ -1578,5 +1644,68 @@ mod tests {
         
         // Should have dependency on the state function
         assert!(obj.dependencies.functions.contains(&QualifiedIdent::from_name("array_comp_sfunc".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_procedure() {
+        let sql = "COMMENT ON PROCEDURE process_data() IS 'Processes batch data'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "procedure:process_data()");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the procedure
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::from_name("process_data".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_qualified_procedure() {
+        let sql = "COMMENT ON PROCEDURE jobs.cancel_expired_shipments() IS 'Cancels expired shipments'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "procedure:jobs.cancel_expired_shipments()");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the qualified procedure
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::new(Some("jobs".to_string()), "cancel_expired_shipments".to_string())));
+    }
+    
+    #[test]
+    fn test_comment_on_procedure_with_parameters() {
+        let sql = "COMMENT ON PROCEDURE api.update_user_status(uuid, text) IS 'Updates user status with audit'";
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "procedure:api.update_user_status()");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the qualified procedure
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::new(Some("api".to_string()), "update_user_status".to_string())));
+    }
+    
+    #[test]
+    fn test_real_procedure_comment_from_codebase() {
+        let sql = r#"comment on procedure jobs.cancel_expired_shipments() is $$
+    Find any shipments that are past their `must_ship_by` date and dispatch events
+    to request Shippo label refunds.
+$$"#;
+        let result = identify_sql_object(sql).unwrap();
+        
+        assert!(result.is_some());
+        let obj = result.unwrap();
+        assert_eq!(obj.object_type, ObjectType::Comment);
+        assert_eq!(obj.qualified_name.name, "procedure:jobs.cancel_expired_shipments()");
+        assert!(obj.qualified_name.schema.is_none());
+        
+        // Should have dependency on the qualified procedure
+        assert!(obj.dependencies.functions.contains(&QualifiedIdent::new(Some("jobs".to_string()), "cancel_expired_shipments".to_string())));
     }
 }

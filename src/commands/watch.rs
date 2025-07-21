@@ -1,4 +1,4 @@
-use crate::commands::{execute_plan, execute_apply, execute_test};
+use crate::commands::{execute_plan, execute_apply, execute_test_with_options};
 use crate::config::PgmgConfig;
 use crate::error::{PgmgError, Result};
 use crate::logging::output;
@@ -150,8 +150,15 @@ pub async fn execute_watch(config: WatchConfig) -> Result<()> {
         match build_test_dependencies(code_dir).await {
             Ok(dep_map) => {
                 let test_count = dep_map.tests.len();
-                *test_dep_map.lock().unwrap() = Some(dep_map);
-                output::info(&format!("Found {} test files with dependencies", test_count));
+                match test_dep_map.lock() {
+                    Ok(mut guard) => {
+                        *guard = Some(dep_map);
+                        output::info(&format!("Found {} test files with dependencies", test_count));
+                    }
+                    Err(e) => {
+                        output::error(&format!("Mutex poisoned while updating test dependencies: {}", e));
+                    }
+                }
             }
             Err(e) => {
                 output::error(&format!("Failed to analyze test dependencies: {}", e));
@@ -218,8 +225,17 @@ async fn process_changes(
     // Rebuild test dependency map if any test files changed
     if !test_files.is_empty() && config.code_dir.is_some() {
         output::step("Rebuilding test dependency map...");
-        if let Ok(new_map) = build_test_dependencies(config.code_dir.as_ref().unwrap()).await {
-            *test_dep_map.lock().unwrap() = Some(new_map);
+        if let Some(ref code_dir) = config.code_dir {
+            if let Ok(new_map) = build_test_dependencies(code_dir).await {
+                match test_dep_map.lock() {
+                    Ok(mut guard) => {
+                        *guard = Some(new_map);
+                    }
+                    Err(e) => {
+                        output::error(&format!("Mutex poisoned while rebuilding test dependencies: {}", e));
+                    }
+                }
+            }
         }
     }
     
@@ -231,11 +247,18 @@ async fn process_changes(
     
     // Run tests affected by changed database objects
     if !changed_objects.is_empty() {
-        if let Some(ref dep_map) = *test_dep_map.lock().unwrap() {
-            let affected_tests = dep_map.find_tests_for_objects(&changed_objects);
-            if !affected_tests.is_empty() {
-                output::step(&format!("Running {} tests affected by database changes...", affected_tests.len()));
-                run_specific_tests(config, affected_tests).await;
+        match test_dep_map.lock() {
+            Ok(guard) => {
+                if let Some(ref dep_map) = *guard {
+                    let affected_tests = dep_map.find_tests_for_objects(&changed_objects);
+                    if !affected_tests.is_empty() {
+                        output::step(&format!("Running {} tests affected by database changes...", affected_tests.len()));
+                        run_specific_tests(config, affected_tests).await;
+                    }
+                }
+            }
+            Err(e) => {
+                output::error(&format!("Mutex poisoned while checking test dependencies: {}", e));
             }
         }
     }
@@ -370,23 +393,29 @@ async fn run_specific_tests(config: &WatchConfig, test_files: Vec<PathBuf>) {
     for test_file in test_files {
         info!("Running test: {}", test_file.display());
         
-        match execute_test(
+        match execute_test_with_options(
             Some(test_file.clone()),
             config.connection_string.clone(),
             false, // Don't show TAP output in watch mode
-            true,  // Continue on failure
+            false, // Don't show immediate results (we'll show our own)
         ).await {
             Ok(test_result) => {
+                // Display relative path from current directory
+                let display_path = std::env::current_dir()
+                    .ok()
+                    .and_then(|cwd| test_file.strip_prefix(cwd).ok())
+                    .unwrap_or(&test_file);
+                    
                 if test_result.tests_failed == 0 {
                     output::success(&format!(
-                        "✅ {} - {} tests passed",
-                        test_file.file_name().unwrap_or_default().to_string_lossy(),
+                        "✓ {} - {} tests passed",
+                        display_path.display(),
                         test_result.tests_passed
                     ));
                 } else {
                     output::error(&format!(
                         "❌ {} - {} failed, {} passed",
-                        test_file.file_name().unwrap_or_default().to_string_lossy(),
+                        display_path.display(),
                         test_result.tests_failed,
                         test_result.tests_passed
                     ));

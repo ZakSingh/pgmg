@@ -104,9 +104,10 @@ pub enum Commands {
         #[arg(long)]
         tap_output: bool,
         
-        /// Continue running tests after failures
+        
+        /// Run all tests in the project (searches all directories)
         #[arg(long)]
-        continue_on_failure: bool,
+        all: bool,
     },
     
     /// Execute seed SQL files in alphanumeric order
@@ -125,6 +126,21 @@ pub enum Commands {
         /// Directory containing sequential migration files
         #[arg(long)]
         migrations_dir: Option<PathBuf>,
+    },
+    
+    /// Run plpgsql_check on all user-defined functions
+    Check {
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
+        
+        /// Only check specific schema(s)
+        #[arg(long)]
+        schema: Option<Vec<String>>,
+        
+        /// Hide warnings and only show errors
+        #[arg(long)]
+        errors_only: bool,
     },
 }
 
@@ -257,18 +273,17 @@ mod tests {
             "test",
             "tests/",
             "--connection-string", "postgresql://localhost/test_db",
-            "--tap-output",
-            "--continue-on-failure"
+            "--tap-output"
         ];
         
         let cli = Cli::try_parse_from(args).unwrap();
         
         match cli.command {
-            Commands::Test { path, connection_string, tap_output, continue_on_failure } => {
+            Commands::Test { path, connection_string, tap_output, all } => {
                 assert_eq!(path, Some(PathBuf::from("tests/")));
                 assert_eq!(connection_string, Some("postgresql://localhost/test_db".to_string()));
                 assert_eq!(tap_output, true);
-                assert_eq!(continue_on_failure, true);
+                assert_eq!(all, false);
             }
             _ => panic!("Expected Test command"),
         }

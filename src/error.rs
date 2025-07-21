@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use thiserror::Error;
+use std::env;
 
 /// Main error type for pgmg
 #[derive(Error, Debug)]
@@ -118,6 +119,36 @@ pub enum PgmgError {
         message: String,
     },
 
+    // Resource Management Errors
+    #[error("Mutex poisoned: {0}")]
+    MutexPoisoned(String),
+    
+    #[error("Connection management failed: {0}")]
+    ConnectionFailed(String),
+    
+    #[error("Lock acquisition failed: {0}")]
+    LockFailed(String),
+    
+    #[error("Resource cleanup failed: {0}")]
+    CleanupFailed(String),
+    
+    // Directory Management Errors
+    #[error("Failed to change directory to {path}: {message}")]
+    DirectoryChange {
+        path: PathBuf,
+        message: String,
+    },
+    
+    #[error("Failed to restore directory: {0}")]
+    DirectoryRestore(String),
+    
+    // State Consistency Errors
+    #[error("State inconsistency detected: {0}")]
+    StateInconsistent(String),
+    
+    #[error("Transaction failed: {0}")]
+    TransactionFailed(String),
+    
     // General Errors
     #[error("Operation cancelled by user")]
     Cancelled,
@@ -331,23 +362,29 @@ pub fn extract_postgres_error_details(err: &tokio_postgres::Error) -> Option<Pos
 /// Calculate line and column number from a byte position in text
 pub fn calculate_line_column(text: &str, byte_position: usize) -> (usize, usize) {
     let mut line = 1;
-    let mut column = 1;
-    let mut current_pos = 0;
+    let mut line_start_byte = 0;
     
-    for ch in text.chars() {
-        if current_pos >= byte_position {
+    // Find the line containing the byte position
+    for (i, ch) in text.char_indices() {
+        if i >= byte_position {
             break;
         }
         
-        let char_len = ch.len_utf8();
-        current_pos += char_len;
-        
         if ch == '\n' {
             line += 1;
-            column = 1;
-        } else {
-            column += 1;
+            line_start_byte = i + ch.len_utf8();
         }
+    }
+    
+    // Calculate column by counting characters from start of line to error position
+    let mut column = 1;
+    let line_text = &text[line_start_byte..];
+    
+    for (i, _ch) in line_text.char_indices() {
+        if line_start_byte + i >= byte_position {
+            break;
+        }
+        column += 1;
     }
     
     (line, column)
@@ -445,5 +482,137 @@ mod tests {
         // Test position after emoji (4 bytes)
         assert_eq!(calculate_line_column(sql, 8), (1, 9)); // at '🎉'
         assert_eq!(calculate_line_column(sql, 12), (1, 10)); // after '🎉'
+    }
+    
+    #[test]
+    fn test_calculate_line_column_real_world_example() {
+        // Test case from user's example: error on the 'dhl'::carrier_code
+        let sql = "SELECT 'dhl'::carrier_code FROM shipments";
+        
+        // Position at 'd' in 'dhl'
+        assert_eq!(calculate_line_column(sql, 8), (1, 9));
+        
+        // Position at :: cast operator
+        assert_eq!(calculate_line_column(sql, 13), (1, 14));
+        
+        // Position at 'c' in carrier_code
+        assert_eq!(calculate_line_column(sql, 15), (1, 16));
+    }
+}
+
+/// A RAII guard for safely changing the current working directory
+/// This ensures the directory is always restored when the guard is dropped
+pub struct DirectoryGuard {
+    original_dir: PathBuf,
+    changed: bool,
+}
+
+impl DirectoryGuard {
+    /// Change to a new directory, saving the current directory for restoration
+    pub fn change_to(new_dir: impl Into<PathBuf>) -> Result<Self> {
+        let new_path = new_dir.into();
+        
+        // Get the current directory before changing
+        let original_dir = env::current_dir()
+            .map_err(|e| PgmgError::DirectoryChange {
+                path: new_path.clone(),
+                message: format!("Failed to get current directory: {}", e),
+            })?;
+        
+        // Change to the new directory
+        env::set_current_dir(&new_path)
+            .map_err(|e| PgmgError::DirectoryChange {
+                path: new_path,
+                message: format!("Failed to change directory: {}", e),
+            })?;
+        
+        Ok(Self {
+            original_dir,
+            changed: true,
+        })
+    }
+    
+    /// Get the original directory that will be restored
+    pub fn original_dir(&self) -> &PathBuf {
+        &self.original_dir
+    }
+    
+    /// Manually restore the original directory
+    /// This is automatically called on Drop, but can be called explicitly for error handling
+    pub fn restore(mut self) -> Result<()> {
+        if self.changed {
+            env::set_current_dir(&self.original_dir)
+                .map_err(|e| PgmgError::DirectoryRestore(format!(
+                    "Failed to restore directory to {}: {}", 
+                    self.original_dir.display(), 
+                    e
+                )))?;
+            self.changed = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DirectoryGuard {
+    fn drop(&mut self) {
+        if self.changed {
+            if let Err(e) = env::set_current_dir(&self.original_dir) {
+                eprintln!("Warning: Failed to restore directory to {}: {}", 
+                         self.original_dir.display(), e);
+                // We can't return an error from Drop, so we just log the issue
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod directory_guard_tests {
+    use super::*;
+    use tempfile::tempdir;
+    
+    #[test]
+    fn test_directory_guard_restores_on_drop() {
+        let original = env::current_dir().unwrap().canonicalize().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let temp_path = temp_dir.path().canonicalize().unwrap();
+        
+        {
+            let _guard = DirectoryGuard::change_to(&temp_path).unwrap();
+            assert_eq!(env::current_dir().unwrap().canonicalize().unwrap(), temp_path);
+        } // guard is dropped here
+        
+        assert_eq!(env::current_dir().unwrap().canonicalize().unwrap(), original);
+        
+        // Keep temp_dir alive until end of test
+        drop(temp_dir);
+    }
+    
+    #[test]
+    fn test_directory_guard_manual_restore() {
+        let original = env::current_dir().unwrap().canonicalize().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let temp_path = temp_dir.path().canonicalize().unwrap();
+        
+        let guard = DirectoryGuard::change_to(&temp_path).unwrap();
+        assert_eq!(env::current_dir().unwrap().canonicalize().unwrap(), temp_path);
+        
+        guard.restore().unwrap();
+        assert_eq!(env::current_dir().unwrap().canonicalize().unwrap(), original);
+        
+        // Keep temp_dir alive until end of test
+        drop(temp_dir);
+    }
+    
+    #[test]
+    fn test_directory_guard_original_dir() {
+        let original = env::current_dir().unwrap();
+        let temp_dir = tempdir().unwrap();
+        let temp_path = temp_dir.path().to_path_buf();
+        
+        let guard = DirectoryGuard::change_to(&temp_path).unwrap();
+        assert_eq!(guard.original_dir(), &original);
+        
+        // Keep temp_dir alive until end of test
+        drop(temp_dir);
     }
 }

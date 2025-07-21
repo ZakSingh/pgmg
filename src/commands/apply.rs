@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use crate::db::{StateManager, connect_with_url};
+use std::time::Duration;
+use crate::db::{StateManager, connect_with_url, AdvisoryLockManager, AdvisoryLockError};
 use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table, extract_function_signature}, splitter::split_sql_file};
 use crate::commands::plan::{execute_plan, ChangeOperation};
 use crate::config::PgmgConfig;
@@ -7,6 +8,7 @@ use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification};
 use crate::plpgsql_check::{check_modified_functions, check_soft_dependent_functions, display_check_errors};
 use crate::error::format_postgres_error_with_details;
 use owo_colors::OwoColorize;
+use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct ApplyResult {
@@ -23,14 +25,72 @@ pub async fn execute_apply(
     connection_string: String,
     config: &PgmgConfig,
 ) -> Result<ApplyResult, Box<dyn std::error::Error>> {
+    execute_apply_with_lock_management(migrations_dir, code_dir, connection_string, config).await
+}
+
+/// Execute apply with advisory lock management
+async fn execute_apply_with_lock_management(
+    migrations_dir: Option<PathBuf>,
+    code_dir: Option<PathBuf>,
+    connection_string: String,
+    config: &PgmgConfig,
+) -> Result<ApplyResult, Box<dyn std::error::Error>> {
     // Connect to database
     let (mut client, connection) = connect_with_url(&connection_string).await?;
     
     // Spawn connection handler
     connection.spawn();
 
+    // Acquire advisory lock to prevent concurrent apply operations
+    let mut lock_manager = AdvisoryLockManager::new(&connection_string);
+    
+    // Try to acquire lock with 30-second timeout
+    match lock_manager.acquire_lock(&client, Duration::from_secs(30)).await {
+        Ok(()) => {
+            info!("Acquired concurrency lock for apply operation");
+        }
+        Err(AdvisoryLockError::Timeout { timeout_seconds }) => {
+            return Err(format!(
+                "Could not acquire lock for apply operation after {} seconds.\n\
+                Another pgmg apply process may be running against this database.\n\
+                If you're sure no other process is running, the lock may be stale and will be cleaned up when that session ends.",
+                timeout_seconds
+            ).into());
+        }
+        Err(e) => {
+            return Err(format!("Failed to acquire advisory lock: {}", e).into());
+        }
+    }
+
+    // Execute the apply operation
+    let apply_result = execute_apply_internal(
+        migrations_dir,
+        code_dir,
+        connection_string,
+        config,
+        &mut client,
+    ).await;
+
+    // Always attempt to release the lock
+    if let Err(e) = lock_manager.release_lock(&client).await {
+        warn!("Failed to release advisory lock: {}", e);
+        // Don't fail the operation if lock release fails - it will be cleaned up by PostgreSQL
+    }
+
+    apply_result
+}
+
+/// Internal apply function that runs with the lock already acquired
+async fn execute_apply_internal(
+    migrations_dir: Option<PathBuf>,
+    code_dir: Option<PathBuf>,
+    connection_string: String,
+    config: &PgmgConfig,
+    client: &mut tokio_postgres::Client,
+) -> Result<ApplyResult, Box<dyn std::error::Error>> {
+
     // Initialize state tracking
-    let state_manager = StateManager::new(&client);
+    let state_manager = StateManager::new(client);
     state_manager.initialize().await?;
 
     let mut apply_result = ApplyResult {
@@ -115,11 +175,11 @@ pub async fn execute_apply(
         // Phase 1: Drop all objects that need updating (in reverse dependency order)
         if !updates.is_empty() && deletion_order.is_some() {
             println!("\n{}: {}", "Phase 1".blue().bold(), "Dropping objects for update...".blue());
-            let del_order = deletion_order.unwrap();
+            let del_order = deletion_order.as_ref().expect("deletion_order was checked to be Some");
             
             // Sort updates by deletion order
             let mut ordered_updates_for_drop = Vec::new();
-            for object_ref in &del_order {
+            for object_ref in del_order {
                 if let Some(update) = updates.iter().find(|u| match u {
                     ChangeOperation::UpdateObject { object, .. } => 
                         object.object_type == object_ref.object_type &&
@@ -471,12 +531,14 @@ fn generate_comment_null_statement_from_object(object: &SqlObject) -> Result<Str
     // "column:users.email" -> "COMMENT ON COLUMN users.email IS NULL"  
     // "function:api.get_user" -> "COMMENT ON FUNCTION api.get_user IS NULL"
     // "trigger:my_trigger:my_table" -> "COMMENT ON TRIGGER my_trigger ON my_table IS NULL"
+    // "aggregate:my_aggregate" -> "COMMENT ON AGGREGATE my_aggregate IS NULL"
     
     let parts: Vec<&str> = comment_identifier.split(':').collect();
     
     match parts.as_slice() {
         ["table", name] => Ok(format!("COMMENT ON TABLE {} IS NULL", name)),
         ["view", name] => Ok(format!("COMMENT ON VIEW {} IS NULL", name)),
+        ["materialized_view", name] => Ok(format!("COMMENT ON MATERIALIZED VIEW {} IS NULL", name)),
         ["function", name] => {
             // Since pgmg prevents function overloading, we can use the name without parentheses
             // Remove any trailing () if present in the identifier
@@ -489,6 +551,11 @@ fn generate_comment_null_statement_from_object(object: &SqlObject) -> Result<Str
         ["trigger", trigger_name, table_name] => {
             Ok(format!("COMMENT ON TRIGGER {} ON {} IS NULL", trigger_name, table_name))
         }
+        ["aggregate", name] => {
+            // Since pgmg prevents aggregate overloading, we can use the name without parentheses
+            let agg_name = name.trim_end_matches("()");
+            Ok(format!("COMMENT ON AGGREGATE {} IS NULL", agg_name))
+        }
         _ => Err(format!("Unknown comment identifier format: {}", comment_identifier).into()),
     }
 }
@@ -499,12 +566,14 @@ fn generate_comment_null_statement(comment_identifier: &str) -> Result<String, B
     // "column:users.email" -> "COMMENT ON COLUMN users.email IS NULL"  
     // "function:api.get_user" -> "COMMENT ON FUNCTION api.get_user IS NULL"
     // "trigger:my_trigger:my_table" -> "COMMENT ON TRIGGER my_trigger ON my_table IS NULL"
+    // "aggregate:my_aggregate" -> "COMMENT ON AGGREGATE my_aggregate IS NULL"
     
     let parts: Vec<&str> = comment_identifier.split(':').collect();
     
     match parts.as_slice() {
         ["table", name] => Ok(format!("COMMENT ON TABLE {} IS NULL", name)),
         ["view", name] => Ok(format!("COMMENT ON VIEW {} IS NULL", name)),
+        ["materialized_view", name] => Ok(format!("COMMENT ON MATERIALIZED VIEW {} IS NULL", name)),
         ["function", name] => {
             // Since pgmg prevents function overloading, we can use the name without parentheses
             let func_name = name.trim_end_matches("()");
@@ -515,6 +584,11 @@ fn generate_comment_null_statement(comment_identifier: &str) -> Result<String, B
         ["column", name] => Ok(format!("COMMENT ON COLUMN {} IS NULL", name)),
         ["trigger", trigger_name, table_name] => {
             Ok(format!("COMMENT ON TRIGGER {} ON {} IS NULL", trigger_name, table_name))
+        }
+        ["aggregate", name] => {
+            // Since pgmg prevents aggregate overloading, we can use the name without parentheses
+            let agg_name = name.trim_end_matches("()");
+            Ok(format!("COMMENT ON AGGREGATE {} IS NULL", agg_name))
         }
         _ => Err(format!("Unknown comment identifier format: {}", comment_identifier).into()),
     }

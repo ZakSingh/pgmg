@@ -1,7 +1,7 @@
 use tokio_postgres::NoTls;
 use pgmg::{analyze_statement, filter_builtins, BuiltinCatalog, DependencyGraph};
 use pgmg::cli::{Cli, Commands};
-use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig, execute_reset, print_reset_summary, execute_test, print_test_summary, execute_seed, print_seed_summary, execute_new, print_new_summary};
+use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig, execute_reset, print_reset_summary, execute_test, print_test_summary, execute_seed, print_seed_summary, execute_new, print_new_summary, execute_check, print_check_summary};
 use pgmg::config::PgmgConfig;
 use pgmg::error::{PgmgError, Result};
 use pgmg::logging;
@@ -233,7 +233,7 @@ async fn run(cli: Cli) -> Result<()> {
             print_reset_summary(&result);
             Ok(())
         }
-        Commands::Test { path, connection_string, tap_output, continue_on_failure } => {
+        Commands::Test { path, connection_string, tap_output, all } => {
             logging::output::header("Running pgTAP Tests");
             
             // Get connection string from CLI arg, config file, or environment
@@ -249,14 +249,26 @@ async fn run(cli: Cli) -> Result<()> {
                 return Err(PgmgError::InvalidConnectionString(conn_str));
             }
             
+            // Handle --all flag
+            let test_path = if all {
+                if path.is_some() {
+                    return Err(PgmgError::Configuration(
+                        "Cannot specify both PATH and --all flag".to_string()
+                    ));
+                }
+                None // Will search entire project
+            } else {
+                path
+            };
+            
             // Log configuration (with masked credentials)
             debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
-            debug!("Test path: {:?}", path);
+            debug!("Test path: {:?}", test_path);
             debug!("TAP output: {}", tap_output);
-            debug!("Continue on failure: {}", continue_on_failure);
+            debug!("Run all tests: {}", all);
             
             // Execute tests
-            let result = execute_test(path, conn_str, tap_output, continue_on_failure).await
+            let result = execute_test(test_path, conn_str, tap_output).await
                 .map_err(|e| PgmgError::Other(format!("Test execution failed: {}", e)))?;
             
             print_test_summary(&result);
@@ -348,6 +360,43 @@ async fn run(cli: Cli) -> Result<()> {
                 .map_err(|e| PgmgError::Other(format!("Migration creation failed: {}", e)))?;
             
             print_new_summary(&result);
+            Ok(())
+        }
+        
+        Commands::Check { connection_string, schema, errors_only } => {
+            logging::output::header("Checking Functions with plpgsql_check");
+            
+            // Get connection string from CLI, env, or config
+            let conn_str = connection_string
+                .or(config_file.and_then(|c| c.connection_string))
+                .or_else(|| std::env::var("DATABASE_URL").ok())
+                .ok_or_else(|| PgmgError::Configuration(
+                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
+                ))?;
+            
+            // Validate connection string format
+            if !conn_str.starts_with("postgres://") && !conn_str.starts_with("postgresql://") {
+                return Err(PgmgError::InvalidConnectionString(conn_str));
+            }
+            
+            // Log configuration
+            debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
+            if let Some(ref schemas) = schema {
+                debug!("Schemas: {:?}", schemas);
+            }
+            debug!("Errors only: {}", errors_only);
+            
+            // Execute check
+            let result = execute_check(conn_str, schema, errors_only).await
+                .map_err(|e| PgmgError::Other(format!("Check failed: {}", e)))?;
+            
+            print_check_summary(&result);
+            
+            // Exit with non-zero code if errors found
+            if result.errors_found > 0 {
+                std::process::exit(1);
+            }
+            
             Ok(())
         }
     }
