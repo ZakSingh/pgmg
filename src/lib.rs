@@ -4,6 +4,7 @@
 pub mod builtin_catalog;
 pub mod sql;
 pub mod analysis;
+#[cfg(feature = "cli")]
 pub mod cli;
 pub mod db;
 pub mod commands;
@@ -12,6 +13,7 @@ pub mod error;
 pub mod logging;
 pub mod notify;
 pub mod plpgsql_check;
+pub mod output;
 
 // Re-export key public APIs for convenience
 pub use builtin_catalog::BuiltinCatalog;
@@ -20,3 +22,6 @@ pub use analysis::{DependencyGraph, ObjectRef, DependencyType};
 pub use db::{StateManager, DatabaseConfig, connect_to_database, connect_with_url, scan_sql_files, scan_migrations};
 pub use config::PgmgConfig;
 pub use error::{PgmgError, Result, ErrorContext};
+
+// Re-export library-friendly command functions
+pub use commands::apply::{apply_migrations, apply_migrations_with_options, ApplyResult};

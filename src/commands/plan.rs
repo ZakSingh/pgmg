@@ -4,6 +4,7 @@ use crate::db::{StateManager, connect_with_url, scan_sql_files, scan_migrations}
 use crate::sql::{SqlObject, ObjectType, objects::calculate_ddl_hash};
 use crate::analysis::{DependencyGraph, ObjectRef};
 use crate::BuiltinCatalog;
+#[cfg(feature = "cli")]
 use owo_colors::OwoColorize;
 use tracing::debug;
 
@@ -86,8 +87,8 @@ pub async fn execute_plan(
     if let Some(code_dir) = &code_dir {
         let file_objects = scan_sql_files(code_dir, &builtin_catalog).await?;
         
-        // Check for duplicate function names in files (no overloading allowed)
-        validate_no_function_overloading_in_files(&file_objects)?;
+        // Check for duplicate object names in files
+        validate_no_duplicate_objects_in_files(&file_objects)?;
         
         let db_objects = state_manager.get_tracked_objects().await?;
         
@@ -97,8 +98,84 @@ pub async fn execute_plan(
         plan_result.file_objects = file_objects.clone();
         
         // Step 3: Build dependency graph for affected objects
-        if !file_objects.is_empty() {
-            let graph = DependencyGraph::build_from_objects(&file_objects, &builtin_catalog)?;
+        if !file_objects.is_empty() || !object_changes.is_empty() {
+            // First, identify deleted objects to get their stored dependencies
+            let deleted_objects: Vec<(ObjectType, String)> = object_changes.iter()
+                .filter_map(|change| match change {
+                    ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                        Some((object_type.clone(), object_name.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            
+            // Get stored dependencies for deleted objects
+            let deleted_object_deps = if !deleted_objects.is_empty() {
+                state_manager.get_deleted_object_dependencies(&deleted_objects).await?
+            } else {
+                Vec::new()
+            };
+            
+            // Convert deleted objects with dependencies to SqlObjects for graph building
+            let mut all_objects_for_graph = file_objects.clone();
+            for (obj_type, obj_name, deps) in deleted_object_deps {
+                // Create a minimal SqlObject for deleted objects
+                let deleted_obj = SqlObject::new(
+                    obj_type,
+                    obj_name,
+                    String::new(), // Empty DDL for deleted objects
+                    deps,
+                    None, // No file path for deleted objects
+                );
+                all_objects_for_graph.push(deleted_obj);
+            }
+            
+            // Build graph from both file objects and deleted objects with stored dependencies
+            let graph = DependencyGraph::build_from_objects(&all_objects_for_graph, &builtin_catalog)?;
+            
+            // Step 3.25: Validate that deletions are safe
+            // Check if any objects being deleted have dependents that aren't also being deleted
+            let mut deletion_errors = Vec::new();
+            let deleted_object_refs: HashSet<ObjectRef> = object_changes.iter()
+                .filter_map(|change| match change {
+                    ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                        let qname = crate::sql::QualifiedIdent::from_qualified_name(object_name);
+                        Some(ObjectRef {
+                            object_type: object_type.clone(),
+                            qualified_name: qname,
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            
+            for deleted_ref in &deleted_object_refs {
+                let dependents = graph.dependents_of(deleted_ref);
+                for dependent in dependents {
+                    // Check if this dependent is also being deleted
+                    if !deleted_object_refs.contains(&dependent) {
+                        // Also check if the dependent exists in the file objects (i.e., it's not being deleted)
+                        let dependent_exists_in_files = file_objects.iter().any(|obj| {
+                            obj.object_type == dependent.object_type &&
+                            obj.qualified_name == dependent.qualified_name
+                        });
+                        
+                        if dependent_exists_in_files {
+                            deletion_errors.push(format!(
+                                "Cannot delete {} '{}' because {} '{}' depends on it",
+                                format!("{:?}", deleted_ref.object_type).to_lowercase(),
+                                format_qualified_name(&deleted_ref.qualified_name),
+                                format!("{:?}", dependent.object_type).to_lowercase(),
+                                format_qualified_name(&dependent.qualified_name),
+                            ));
+                        }
+                    }
+                }
+            }
+            
+            if !deletion_errors.is_empty() {
+                return Err(deletion_errors.join("\n").into());
+            }
             
             // Step 3.5: Find all pgmg-managed objects affected by changes
             let updated_objects: Vec<ObjectRef> = object_changes.iter()
@@ -317,31 +394,74 @@ fn extract_comment_text(ddl: &str) -> Option<String> {
     None
 }
 
-/// Validate that no function names are duplicated in the SQL files
-fn validate_no_function_overloading_in_files(file_objects: &[SqlObject]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut function_locations: HashMap<String, Vec<String>> = HashMap::new();
+/// Validate that no object names are duplicated in the SQL files
+fn validate_no_duplicate_objects_in_files(file_objects: &[SqlObject]) -> Result<(), Box<dyn std::error::Error>> {
+    let mut object_locations: HashMap<String, Vec<(String, ObjectType)>> = HashMap::new();
     
-    // Track all function and procedure names and their locations
+    // Track object names and their locations for types that should be unique
     for obj in file_objects {
-        if matches!(obj.object_type, ObjectType::Function | ObjectType::Procedure) {
-            let func_name = format_qualified_name(&obj.qualified_name);
-            let location = obj.source_file
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "unknown location".to_string());
+        // Check object types that should have unique names within a schema
+        // Skip Comments, Triggers, CronJobs as they are contextual and may be legitimately duplicated
+        let should_check = matches!(
+            obj.object_type,
+            ObjectType::Function 
+            | ObjectType::Procedure 
+            | ObjectType::View 
+            | ObjectType::MaterializedView
+            | ObjectType::Table 
+            | ObjectType::Type 
+            | ObjectType::Domain
+            | ObjectType::Index
+            | ObjectType::Aggregate
+        );
+        
+        if should_check {
+            let obj_name = format_qualified_name(&obj.qualified_name);
+            let location = match &obj.source_file {
+                Some(path) => {
+                    match path.strip_prefix(std::env::current_dir().unwrap_or_default()) {
+                        Ok(relative_path) => relative_path.display().to_string(),
+                        Err(_) => path.display().to_string(),
+                    }
+                }
+                None => "unknown location".to_string(),
+            };
             
-            function_locations.entry(func_name).or_insert_with(Vec::new).push(location);
+            // Add line number if available
+            let location_with_line = if let Some(line) = obj.start_line {
+                format!("{}:{}", location, line)
+            } else {
+                location
+            };
+            
+            object_locations.entry(obj_name).or_insert_with(Vec::new).push((location_with_line, obj.object_type.clone()));
         }
     }
     
     // Check for duplicates
-    for (func_name, locations) in function_locations {
+    for (obj_name, locations) in object_locations {
         if locations.len() > 1 {
+            let object_type_name = match locations[0].1 {
+                ObjectType::Function => "function",
+                ObjectType::Procedure => "procedure", 
+                ObjectType::View => "view",
+                ObjectType::MaterializedView => "materialized view",
+                ObjectType::Table => "table",
+                ObjectType::Type => "type",
+                ObjectType::Domain => "domain",
+                ObjectType::Index => "index",
+                ObjectType::Aggregate => "aggregate",
+                _ => "object",
+            };
+            
+            let location_list: Vec<String> = locations.iter().map(|(loc, _)| loc.clone()).collect();
+            
             return Err(format!(
-                "Multiple definitions of function/procedure '{}' found in SQL files:\n  - {}\n\
-                pgmg does not support function/procedure overloading. Each function/procedure must have a unique name.",
-                func_name,
-                locations.join("\n  - ")
+                "Multiple definitions of {} '{}' found in SQL files:\n  - {}\n\
+                pgmg does not allow duplicate object names. Please rename or remove one definition.",
+                object_type_name,
+                obj_name,
+                location_list.join("\n  - ")
             ).into());
         }
     }
@@ -490,6 +610,7 @@ fn print_associated_comments(
         ObjectType::Comment => "comment",
         ObjectType::CronJob => "cron_job",
         ObjectType::Aggregate => "aggregate",
+        ObjectType::Operator => "operator",
     };
     
     let parent_name = format_qualified_name(&parent_object.qualified_name);
@@ -532,4 +653,44 @@ fn print_associated_comments(
             }
         }
     }
+}
+
+/// Quick check for pending changes without building full plan
+/// Returns (has_changes, change_count)
+pub async fn check_for_pending_changes(
+    migrations_dir: Option<PathBuf>,
+    code_dir: Option<PathBuf>,
+    connection_string: String,
+) -> Result<(bool, usize), Box<dyn std::error::Error>> {
+    // Connect to database
+    let (client, connection) = connect_with_url(&connection_string).await?;
+    
+    // Spawn connection handler
+    connection.spawn();
+
+    // Initialize state tracking
+    let state_manager = StateManager::new(&client);
+    state_manager.initialize().await?;
+
+    let mut change_count = 0;
+
+    // Check for new migrations
+    if let Some(migrations_dir) = &migrations_dir {
+        let new_migrations = check_new_migrations(
+            migrations_dir, 
+            &state_manager
+        ).await?;
+        change_count += new_migrations.len();
+    }
+
+    // Check for object changes
+    if let Some(code_dir) = &code_dir {
+        let builtin_catalog = BuiltinCatalog::from_database(&client).await?;
+        let file_objects = scan_sql_files(code_dir, &builtin_catalog).await?;
+        let db_objects = state_manager.get_tracked_objects().await?;
+        let object_changes = detect_object_changes(&file_objects, &db_objects).await?;
+        change_count += object_changes.len();
+    }
+
+    Ok((change_count > 0, change_count))
 }

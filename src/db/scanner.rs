@@ -24,9 +24,15 @@ fn scan_directory_recursive(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entries = fs::read_dir(dir)?;
     
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
+    // Collect and sort entries to ensure deterministic ordering
+    let mut paths: Vec<_> = entries
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+    
+    for path in paths {
         
         if path.is_dir() {
             // Recursively scan subdirectories

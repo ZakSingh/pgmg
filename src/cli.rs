@@ -1,3 +1,4 @@
+#[cfg(feature = "cli")]
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -37,8 +38,46 @@ pub enum Commands {
         output_graph: Option<PathBuf>,
     },
     
+    /// Show current status (alias for plan)
+    Status {
+        /// Directory containing sequential migration files
+        #[arg(long)]
+        migrations_dir: Option<PathBuf>,
+        
+        /// Directory containing declarative SQL objects (views, functions, types)
+        #[arg(long)]
+        code_dir: Option<PathBuf>,
+        
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
+        
+        /// Output dependency graph in Graphviz DOT format to the specified file
+        #[arg(long)]
+        output_graph: Option<PathBuf>,
+    },
+    
     /// Apply pending changes
     Apply {
+        /// Directory containing sequential migration files
+        #[arg(long)]
+        migrations_dir: Option<PathBuf>,
+        
+        /// Directory containing declarative SQL objects (views, functions, types)
+        #[arg(long)]
+        code_dir: Option<PathBuf>,
+        
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
+        
+        /// Enable development mode (includes NOTIFY events)
+        #[arg(long)]
+        dev: bool,
+    },
+    
+    /// Apply pending changes (alias for apply)
+    Migrate {
         /// Directory containing sequential migration files
         #[arg(long)]
         migrations_dir: Option<PathBuf>,
@@ -104,6 +143,9 @@ pub enum Commands {
         #[arg(long)]
         tap_output: bool,
         
+        /// Suppress progress output and only show failures and summary
+        #[arg(long)]
+        quiet: bool,
         
         /// Run all tests in the project (searches all directories)
         #[arg(long)]
@@ -130,6 +172,10 @@ pub enum Commands {
     
     /// Run plpgsql_check on all user-defined functions
     Check {
+        /// Function name to check (optional)
+        #[arg(value_name = "FUNCTION_NAME")]
+        function_name: Option<String>,
+        
         /// PostgreSQL connection string
         #[arg(long)]
         connection_string: Option<String>,
@@ -141,6 +187,17 @@ pub enum Commands {
         /// Hide warnings and only show errors
         #[arg(long)]
         errors_only: bool,
+    },
+    
+    /// Run a SQL file with full output (including NOTICE messages)
+    Run {
+        /// Path to the SQL file to execute
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+        
+        /// PostgreSQL connection string
+        #[arg(long)]
+        connection_string: Option<String>,
     },
 }
 
@@ -279,11 +336,12 @@ mod tests {
         let cli = Cli::try_parse_from(args).unwrap();
         
         match cli.command {
-            Commands::Test { path, connection_string, tap_output, all } => {
+            Commands::Test { path, connection_string, tap_output, all, quiet } => {
                 assert_eq!(path, Some(PathBuf::from("tests/")));
                 assert_eq!(connection_string, Some("postgresql://localhost/test_db".to_string()));
                 assert_eq!(tap_output, true);
                 assert_eq!(all, false);
+                assert_eq!(quiet, false);
             }
             _ => panic!("Expected Test command"),
         }

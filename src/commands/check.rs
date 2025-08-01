@@ -1,5 +1,5 @@
 use crate::db::connect_with_url;
-use crate::plpgsql_check::{check_function, is_plpgsql_check_available, PlpgsqlCheckError, display_check_errors};
+use crate::plpgsql_check::{check_all_functions, is_plpgsql_check_available, PlpgsqlCheckError, display_check_errors};
 use owo_colors::OwoColorize;
 use std::time::Instant;
 
@@ -14,79 +14,39 @@ pub struct CheckResult {
 
 pub async fn execute_check(
     connection_string: String,
+    function_name: Option<String>,
     schemas: Option<Vec<String>>,
     errors_only: bool,
 ) -> Result<CheckResult, Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     
     // Connect to database
-    let (mut client, connection) = connect_with_url(&connection_string).await?;
+    let (client, connection) = connect_with_url(&connection_string).await?;
     
     // Spawn connection handler
     connection.spawn();
     
     // Check if plpgsql_check is available first
-    {
-        let transaction = client.transaction().await?;
-        if !is_plpgsql_check_available(&transaction).await? {
-            return Err("plpgsql_check extension is not installed. Please install it with: CREATE EXTENSION plpgsql_check;".into());
-        }
-        transaction.rollback().await?;
+    if !is_plpgsql_check_available(&client).await? {
+        return Err("plpgsql_check extension is not installed. Please install it with: CREATE EXTENSION plpgsql_check;".into());
     }
     
     // Build schema filter
     let schema_filter = if let Some(ref schema_list) = schemas {
         if schema_list.is_empty() {
-            vec!["public".to_string()]
+            Some(vec!["public".to_string()])
         } else {
-            schema_list.clone()
+            Some(schema_list.clone())
         }
     } else {
         // Default: check all user schemas (excluding pg_* and information_schema)
-        vec![]
+        None
     };
     
-    // Query all user-defined functions and procedures written in PL/pgSQL
-    // Exclude system functions, extension functions, and internal pgTAP functions
-    let query = if schema_filter.is_empty() {
-        // Check all user schemas
-        "SELECT n.nspname, p.proname, p.prokind::text
-         FROM pg_proc p
-         JOIN pg_namespace n ON n.oid = p.pronamespace
-         JOIN pg_language l ON l.oid = p.prolang
-         LEFT JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
-         LEFT JOIN pg_extension e ON e.oid = d.refobjid
-         WHERE n.nspname NOT LIKE 'pg_%' 
-           AND n.nspname != 'information_schema'
-           AND p.prokind IN ('f', 'p')
-           AND l.lanname = 'plpgsql'
-           AND e.extname IS NULL  -- Exclude functions installed by extensions
-           AND p.proname NOT LIKE '\\_%'  -- Exclude functions starting with underscore (convention for internal)
-         ORDER BY n.nspname, p.proname"
-    } else {
-        // Check specific schemas
-        "SELECT n.nspname, p.proname, p.prokind::text
-         FROM pg_proc p
-         JOIN pg_namespace n ON n.oid = p.pronamespace
-         JOIN pg_language l ON l.oid = p.prolang
-         LEFT JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
-         LEFT JOIN pg_extension e ON e.oid = d.refobjid
-         WHERE n.nspname = ANY($1)
-           AND p.prokind IN ('f', 'p')
-           AND l.lanname = 'plpgsql'
-           AND e.extname IS NULL  -- Exclude functions installed by extensions
-           AND p.proname NOT LIKE '\\_%'  -- Exclude functions starting with underscore (convention for internal)
-         ORDER BY n.nspname, p.proname"
-    };
+    // Use the new bulk query approach
+    let all_results = check_all_functions(&client, schema_filter.as_deref(), function_name.as_deref()).await?;
     
-    let rows = if schema_filter.is_empty() {
-        client.query(query, &[]).await?
-    } else {
-        client.query(query, &[&schema_filter]).await?
-    };
-    
-    let total_functions = rows.len();
-    if total_functions == 0 {
+    if all_results.is_empty() {
         return Ok(CheckResult {
             functions_checked: 0,
             errors_found: 0,
@@ -96,74 +56,43 @@ pub async fn execute_check(
         });
     }
     
-    println!("{} Checking {} PL/pgSQL functions/procedures...", "→".cyan(), total_functions.to_string().yellow());
+    // Group results by function to count how many functions were checked
+    let mut function_names = std::collections::HashSet::new();
+    for result in &all_results {
+        if let Some(functionid) = &result.functionid {
+            function_names.insert(functionid.clone());
+        }
+    }
+    
+    let functions_checked = function_names.len();
+    println!("{} Checking {} PL/pgSQL functions/procedures...", "→".cyan(), functions_checked.to_string().yellow());
     
     let mut all_errors = Vec::new();
-    let mut functions_checked = 0;
     let mut errors_found = 0;
     let mut warnings_found = 0;
     
-    // Check each function
-    for row in rows {
-        let schema: String = row.get(0);
-        let name: String = row.get(1);
-        let kind: String = row.get(2);  // prokind cast to text
-        
-        let qualified_name = format!("{}.{}", schema, name);
-        let object_type = if kind == "f" { "function" } else { "procedure" };
-        
-        // Use a separate transaction for each function check
-        let transaction = match client.transaction().await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("{}: Failed to start transaction for {} {}: {}", 
-                    "Warning".yellow().bold(), 
-                    object_type,
-                    qualified_name.cyan(), 
-                    e);
-                continue;
+    // Process results
+    for result in all_results {
+        if let Some(level) = &result.level {
+            // Count errors and warnings
+            match level.as_str() {
+                "error" => errors_found += 1,
+                "warning" => warnings_found += 1,
+                _ => {}
             }
-        };
-        
-        match check_function(&transaction, &qualified_name).await {
-            Ok(results) => {
-                functions_checked += 1;
-                
-                
-                for result in results {
-                    if let Some(level) = &result.level {
-                        // Count errors and warnings
-                        match level.as_str() {
-                            "error" => errors_found += 1,
-                            "warning" => warnings_found += 1,
-                            _ => {}
-                        }
-                        
-                        // Collect errors and warnings (unless errors_only mode)
-                        if level == "error" || (level == "warning" && !errors_only) {
-                            let error = PlpgsqlCheckError {
-                                function_name: qualified_name.clone(),
-                                source_file: None, // No source file info for direct checks
-                                source_line: None,
-                                check_result: result,
-                            };
-                            all_errors.push(error);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                // Log but continue checking other functions
-                eprintln!("{}: Failed to check {} {}: {}", 
-                    "Warning".yellow().bold(), 
-                    object_type,
-                    qualified_name.cyan(), 
-                    e);
+            
+            // Collect errors and warnings (unless errors_only mode)
+            if level == "error" || (level == "warning" && !errors_only) {
+                let function_name = result.functionid.as_deref().unwrap_or("unknown");
+                let error = PlpgsqlCheckError {
+                    function_name: function_name.to_string(),
+                    source_file: None, // No source file info for direct checks
+                    source_line: None,
+                    check_result: result,
+                };
+                all_errors.push(error);
             }
         }
-        
-        // Commit or rollback the transaction
-        let _ = transaction.rollback().await;
     }
     
     // Display progress

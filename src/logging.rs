@@ -1,4 +1,3 @@
-use color_eyre::eyre::Result;
 use std::io::IsTerminal;
 use tracing::Level;
 use tracing_subscriber::{
@@ -9,8 +8,9 @@ use tracing_subscriber::{
 };
 
 /// Initialize the logging and error reporting infrastructure
-pub fn init(verbosity: u8) -> Result<()> {
-    // Install color-eyre panic and error handlers
+pub fn init(verbosity: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Install color-eyre panic and error handlers if available
+    #[cfg(feature = "cli")]
     color_eyre::install()?;
     
     // Set up the logging level based on verbosity
@@ -163,13 +163,19 @@ macro_rules! log_object_change {
 
 /// Format output for CLI with colors
 pub mod output {
+    #[cfg(feature = "cli")]
     use console::{style, Emoji};
     use std::fmt::Display;
     
+    #[cfg(feature = "cli")]
     static CHECKMARK: Emoji<'_, '_> = Emoji("✓ ", "[OK] ");
+    #[cfg(feature = "cli")]
     static CROSS: Emoji<'_, '_> = Emoji("✗ ", "[FAIL] ");
+    #[cfg(feature = "cli")]
     static ARROW: Emoji<'_, '_> = Emoji("→ ", "-> ");
+    #[cfg(feature = "cli")]
     static WARNING: Emoji<'_, '_> = Emoji("⚠ ", "[WARN] ");
+    #[cfg(feature = "cli")]
     static INFO: Emoji<'_, '_> = Emoji("ℹ ", "[INFO] ");
     
     pub fn success(message: impl Display) {

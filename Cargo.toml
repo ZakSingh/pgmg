@@ -10,9 +10,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "pgmg"
 path = "src/main.rs"
+required-features = ["cli"]
 
 [features]
-default = []
+default = ["cli"]
+cli = ["dep:clap", "dep:owo-colors", "dep:console", "dep:color-eyre"]
 tls = ["tokio-postgres-rustls", "rustls", "webpki-roots", "rustls-pemfile"]
 
 [dependencies]
@@ -23,7 +25,7 @@ futures-util = "0.3.31"
 pg_query = { path = "../pg_query.rs" }
 regex = "1.10.2"
 serde_json = "1.0"
-clap = { version = "4.5.41", features= ["derive"]}
+clap = { version = "4.5.41", features= ["derive"], optional = true }
 petgraph = "0.8"
 sha2 = "0.10"
 notify = "8.1"
@@ -35,9 +37,9 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "fmt"] }
-color-eyre = "0.6"
-console = "0.16"
-owo-colors = "4.0"
+color-eyre = { version = "0.6", optional = true }
+console = { version = "0.16", optional = true }
+owo-colors = { version = "4.0", optional = true }
 
 # Optional TLS dependencies
 tokio-postgres-rustls = { version = "0.13", optional = true }

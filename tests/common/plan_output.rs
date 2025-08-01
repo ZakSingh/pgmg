@@ -187,6 +187,7 @@ fn object_type_to_str(obj_type: &ObjectType) -> &'static str {
         ObjectType::Comment => "comment",
         ObjectType::CronJob => "cron_job",
         ObjectType::Aggregate => "aggregate",
+        ObjectType::Operator => "operator",
     }
 }
 
