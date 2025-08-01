@@ -2,9 +2,7 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::time::{Duration, Instant};
 use crate::db::connect_with_url;
-use crate::commands::check::execute_check;
-use crate::plpgsql_check::display_check_errors;
-use crate::error::format_postgres_error_with_details;
+use crate::sql::splitter::split_sql_file;
 use owo_colors::OwoColorize;
 // Manual TAP parsing implementation
 
@@ -44,8 +42,10 @@ pub async fn execute_test(
     path: Option<PathBuf>,
     connection_string: String,
     tap_output: bool,
+    quiet: bool,
+    config: &crate::config::PgmgConfig,
 ) -> Result<TestResult, Box<dyn std::error::Error>> {
-    execute_test_with_options(path, connection_string, tap_output, true).await
+    execute_test_with_options(path, connection_string, tap_output, !quiet, quiet, config).await
 }
 
 pub async fn execute_test_with_options(
@@ -53,6 +53,8 @@ pub async fn execute_test_with_options(
     connection_string: String,
     tap_output: bool,
     show_immediate_results: bool,
+    quiet: bool,
+    config: &crate::config::PgmgConfig,
 ) -> Result<TestResult, Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     
@@ -65,22 +67,32 @@ pub async fn execute_test_with_options(
     
     println!("{} Found {} test file(s)", "→".cyan(), test_files.len());
     
-    // Run pgmg check first to provide helpful diagnostics
-    println!("\n{} Running plpgsql_check before tests...", "→".cyan());
-    match execute_check(connection_string.clone(), None, false).await {
-        Ok(check_result) => {
-            if check_result.errors_found > 0 {
-                println!("{} Found {} error(s) in PL/pgSQL functions", "⚠".yellow(), check_result.errors_found);
-                display_check_errors(&check_result.check_errors);
-                println!(); // Add blank line after check errors
-            } else if check_result.warnings_found > 0 {
-                println!("{} Found {} warning(s) in PL/pgSQL functions", "⚠".yellow(), check_result.warnings_found);
-            } else {
-                println!("{} All PL/pgSQL functions passed checks", "✓".green());
+    // Check for pending changes
+    match crate::commands::plan::check_for_pending_changes(
+        config.migrations_dir.clone(),
+        config.code_dir.clone(),
+        connection_string.clone(),
+    ).await {
+        Ok((has_changes, change_count)) => {
+            if has_changes {
+                println!();
+                println!("{} {} You have {} unapplied change{}!", 
+                    "⚠️ ".yellow().bold(),
+                    "WARNING:".yellow().bold(),
+                    change_count.to_string().yellow().bold(),
+                    if change_count == 1 { "" } else { "s" }
+                );
+                println!("   Run {} to apply your changes before running tests.", 
+                    "'pgmg apply'".cyan().bold()
+                );
+                println!("   Proceeding with tests against current database state...");
+                println!();
             }
         }
         Err(e) => {
-            println!("{} plpgsql_check not available or failed: {}", "⚠".yellow(), e);
+            // Don't fail tests if we can't check for changes
+            eprintln!("{} Failed to check for pending changes: {}", 
+                "Warning:".yellow(), e);
         }
     }
     
@@ -106,17 +118,19 @@ pub async fn execute_test_with_options(
             .ok()
             .and_then(|cwd| test_file.strip_prefix(cwd).ok())
             .unwrap_or(&test_file);
-        println!("\n{} Running {}", "→".cyan(), display_path.display().to_string().bright_blue());
+        if !quiet {
+            println!("\n{} Running {}", "→".cyan(), display_path.display().to_string().bright_blue());
+        }
         
-        let file_result = run_test_file(&client, &test_file, tap_output).await?;
+        let file_result = run_test_file(&client, &test_file, tap_output, quiet).await?;
         
         total_run += file_result.test_count;
         total_passed += file_result.passed_count;
         total_failed += file_result.failed_count;
         total_skipped += file_result.skipped_count;
         
-        // Print immediate results if requested
-        if show_immediate_results {
+        // Print immediate results if requested and not in quiet mode
+        if show_immediate_results && !quiet {
             if file_result.passed {
                 println!("  {} {} tests passed", "✓".green(), file_result.test_count);
             } else {
@@ -211,6 +225,7 @@ async fn run_test_file(
     client: &tokio_postgres::Client,
     test_file: &Path,
     show_tap_output: bool,
+    quiet: bool,
 ) -> Result<TestFileResult, Box<dyn std::error::Error>> {
     let start_time = Instant::now();
     
@@ -309,14 +324,13 @@ SET client_min_messages TO 'INFO';
                 use owo_colors::OwoColorize;
                 
                 if let Some(details) = extract_postgres_error_details(&e) {
-                    let mut output = format!("Failed to execute SQL for {}", 
-                        test_file.file_name().unwrap_or_default().to_string_lossy().red());
+                    let mut output = format!("SQL Execution Error in {}", 
+                        test_file.file_name().unwrap_or_default().to_string_lossy().red().bold());
                     
-                    // Add file location
-                    output.push_str(&format!("\n  {}: {}", "File".dimmed(), test_file.display()));
+                    // Add the core error message prominently
+                    output.push_str(&format!("\n  {}: {}", "Error".red().bold(), details.message));
                     
-                    // If we have an error position, calculate it relative to the wrapped content
-                    // then adjust for the original test content
+                    // If we have an error position, calculate it and show detailed context
                     if let Some(pos) = details.position {
                         // Calculate position in wrapped content
                         let (wrapped_line, col) = calculate_line_column(&wrapped_test, pos - 1);
@@ -327,29 +341,38 @@ SET client_min_messages TO 'INFO';
                         if wrapped_line > wrapper_lines {
                             let actual_line = wrapped_line - wrapper_lines;
                             
-                            output.push_str(&format!("\n  {} line {}, column {}", 
-                                "Error at".yellow(), 
-                                actual_line.to_string().yellow().bold(),
-                                col.to_string().yellow().bold()
-                            ));
-                            
-                            // Show the problematic line from the original test content
-                            if let Some(error_line) = test_content.lines().nth(actual_line - 1) {
-                                output.push_str(&format!("\n  {}", error_line.dimmed()));
-                                output.push_str(&format!("\n  {}{}", " ".repeat(col - 1), "^".red().bold()));
+                            // Use our new SQL analysis function to show detailed context
+                            if let Some(sql_analysis) = analyze_sql_error(&test_content, actual_line, col) {
+                                output.push_str(&sql_analysis);
+                            } else {
+                                // Fallback to basic line display
+                                output.push_str(&format!("\n  {} line {}, column {}", 
+                                    "Error at".yellow(), 
+                                    actual_line.to_string().yellow().bold(),
+                                    col.to_string().yellow().bold()
+                                ));
+                                
+                                if let Some(error_line) = test_content.lines().nth(actual_line - 1) {
+                                    output.push_str(&format!("\n  → {}", error_line.red()));
+                                    if col > 0 {
+                                        output.push_str(&format!("\n    {}{}", " ".repeat(col - 1), "^".red().bold()));
+                                    }
+                                }
                             }
                         } else {
-                            // Error is in the wrapper part, just show the position
+                            // Error is in the wrapper part
                             output.push_str(&format!("\n  {} SQL setup, line {}, column {}", 
                                 "Error at".yellow(),
                                 wrapped_line.to_string().yellow().bold(),
                                 col.to_string().yellow().bold()
                             ));
                         }
+                    } else {
+                        // No position information available
+                        output.push_str(&format!("\n  {}: Position information not available", "Note".yellow()));
                     }
                     
-                    output.push_str(&format!("\n  {}: {}", "Error".red().bold(), details.message));
-                    
+                    // Add additional PostgreSQL error details
                     if let Some(detail) = details.detail {
                         output.push_str(&format!("\n  {}: {}", "Detail".yellow(), detail));
                     }
@@ -358,6 +381,7 @@ SET client_min_messages TO 'INFO';
                         output.push_str(&format!("\n  {}: {}", "Hint".green(), hint));
                     }
                     
+                    output.push_str(&format!("\n  {}: {}", "File".dimmed(), test_file.display()));
                     output.push_str(&format!("\n  {}: {} ({})", "Code".dimmed(), details.code, details.severity));
                     
                     output
@@ -377,7 +401,7 @@ SET client_min_messages TO 'INFO';
                 skipped_count: 0,
                 failures: vec![TestFailure {
                     test_number: 0,
-                    description: "Test execution failed".to_string(),
+                    description: "SQL execution error - check the failing statement above".to_string(),
                     diagnostic: Some(e.to_string()),
                     detailed_error: Some(detailed_error),
                     sql_context: Some(test_content.clone()), // Store original test content
@@ -393,7 +417,7 @@ SET client_min_messages TO 'INFO';
     }
     
     // Parse TAP output
-    let parsed_results = parse_tap_output(&tap_output)?;
+    let parsed_results = parse_tap_output(&tap_output, quiet)?;
     
     let duration = start_time.elapsed();
     
@@ -418,7 +442,7 @@ struct ParsedTapResults {
     failures: Vec<TestFailure>,
 }
 
-fn parse_tap_output(tap_output: &str) -> Result<ParsedTapResults, Box<dyn std::error::Error>> {
+fn parse_tap_output(tap_output: &str, quiet: bool) -> Result<ParsedTapResults, Box<dyn std::error::Error>> {
     let mut test_count = 0;
     let mut passed_count = 0;
     let mut failed_count = 0;
@@ -437,17 +461,26 @@ fn parse_tap_output(tap_output: &str) -> Result<ParsedTapResults, Box<dyn std::e
             continue;
         }
         
-        if line.starts_with("ok ") {
+        // Check for skipped tests first (handles both "ok N # SKIP" and "not ok N # SKIP")
+        if line.contains("# SKIP") {
+            test_count += 1;
+            skipped_count += 1;
+            let description = extract_test_description(line);
+            if !quiet {
+                println!("    {} {} {}", "↷".yellow(), "SKIP".yellow(), description.bright_black());
+            }
+        } else if line.starts_with("ok ") {
             test_count += 1;
             passed_count += 1;
             let description = extract_test_description(line);
-            if !description.is_empty() {
+            if !quiet && !description.is_empty() {
                 println!("    {} {}", "✓".green(), description.bright_black());
             }
         } else if line.starts_with("not ok ") {
             test_count += 1;
             failed_count += 1;
             let description = extract_test_description(line);
+            // Always show failures, even in quiet mode
             println!("    {} {}", "✗".red(), description.red());
             
             // Look ahead for diagnostic information
@@ -490,11 +523,6 @@ fn parse_tap_output(tap_output: &str) -> Result<ParsedTapResults, Box<dyn std::e
                 detailed_error: None,
                 sql_context: None,
             });
-        } else if line.contains("# SKIP") {
-            test_count += 1;
-            skipped_count += 1;
-            let description = extract_test_description(line);
-            println!("    {} {} {}", "↷".yellow(), "SKIP".yellow(), description.bright_black());
         }
         
         i += 1;
@@ -521,6 +549,126 @@ fn extract_test_description(line: &str) -> String {
         }
     } else {
         String::new()
+    }
+}
+
+/// Find the SQL statement that caused an error and provide context
+fn analyze_sql_error(test_content: &str, error_line: usize, error_col: usize) -> Option<String> {
+    // Parse the test content into SQL statements
+    let statements = match split_sql_file(test_content) {
+        Ok(stmts) => stmts,
+        Err(_) => return None,
+    };
+    
+    // Find which statement contains the error line
+    let mut statement_info = None;
+    for (idx, stmt) in statements.iter().enumerate() {
+        let stmt_start = stmt.start_line.unwrap_or(1);
+        let stmt_end = stmt_start + stmt.sql.lines().count();
+        
+        if error_line >= stmt_start && error_line < stmt_end {
+            statement_info = Some((idx + 1, stmt, stmt_start, stmt_end));
+            break;
+        }
+    }
+    
+    if let Some((stmt_num, stmt, stmt_start, stmt_end)) = statement_info {
+        let mut output = String::new();
+        
+        // Show the failing statement prominently
+        output.push_str(&format!("\n  {}: Statement {} (lines {}-{})", 
+            "Failing SQL".red().bold(), 
+            stmt_num.to_string().yellow().bold(),
+            stmt_start.to_string().yellow(),
+            stmt_end.to_string().yellow()
+        ));
+        
+        // Show the actual SQL statement with line numbers
+        output.push_str(&format!("\n  {}", "Statement:".yellow().bold()));
+        for (line_idx, line) in stmt.sql.lines().enumerate() {
+            let actual_line_num = stmt_start + line_idx;
+            let is_error_line = actual_line_num == error_line;
+            
+            if is_error_line {
+                output.push_str(&format!("\n  → {:3}: {}", 
+                    actual_line_num.to_string().yellow().bold(), 
+                    line.red()
+                ));
+                // Add pointer to specific column if we have it
+                if error_col > 0 {
+                    let padding = format!("  → {:3}: ", actual_line_num);
+                    output.push_str(&format!("\n  {}{}{}", 
+                        " ".repeat(padding.len() + error_col - 1),
+                        "^".red().bold(),
+                        " error here".red().dimmed()
+                    ));
+                }
+            } else {
+                output.push_str(&format!("\n    {:3}: {}", 
+                    actual_line_num.to_string().dimmed(), 
+                    line.dimmed()
+                ));
+            }
+        }
+        
+        // Show context around the statement
+        let lines: Vec<&str> = test_content.lines().collect();
+        let context_start = (stmt_start.saturating_sub(3)).max(1);
+        let context_end = (stmt_end + 2).min(lines.len());
+        
+        if context_start < stmt_start || context_end > stmt_end {
+            output.push_str(&format!("\n  {}", "Context:".yellow().bold()));
+            for line_num in context_start..=context_end {
+                if line_num >= stmt_start && line_num < stmt_end {
+                    continue; // Skip lines we already showed above
+                }
+                
+                if let Some(line) = lines.get(line_num - 1) {
+                    output.push_str(&format!("\n    {:3}: {}", 
+                        line_num.to_string().dimmed(), 
+                        line.bright_black()
+                    ));
+                }
+            }
+        }
+        
+        Some(output)
+    } else {
+        // Fallback: show context around the error line
+        let lines: Vec<&str> = test_content.lines().collect();
+        let context_start = error_line.saturating_sub(3);
+        let context_end = (error_line + 3).min(lines.len());
+        
+        let mut output = String::new();
+        output.push_str(&format!("\n  {} line {}", "Error at".yellow().bold(), error_line.to_string().yellow().bold()));
+        output.push_str(&format!("\n  {}", "Context:".yellow().bold()));
+        
+        for line_num in context_start..context_end {
+            if let Some(line) = lines.get(line_num) {
+                let actual_line_num = line_num + 1;
+                if actual_line_num == error_line {
+                    output.push_str(&format!("\n  → {:3}: {}", 
+                        actual_line_num.to_string().yellow().bold(), 
+                        line.red()
+                    ));
+                    if error_col > 0 {
+                        let padding = format!("  → {:3}: ", actual_line_num);
+                        output.push_str(&format!("\n  {}{}{}", 
+                            " ".repeat(padding.len() + error_col - 1),
+                            "^".red().bold(),
+                            " error here".red().dimmed()
+                        ));
+                    }
+                } else {
+                    output.push_str(&format!("\n    {:3}: {}", 
+                        actual_line_num.to_string().dimmed(), 
+                        line.bright_black()
+                    ));
+                }
+            }
+        }
+        
+        Some(output)
     }
 }
 

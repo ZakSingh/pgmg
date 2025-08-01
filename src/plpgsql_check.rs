@@ -1,30 +1,22 @@
-use serde::{Deserialize, Serialize};
 use crate::sql::{SqlObject, ObjectType};
 use owo_colors::OwoColorize;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct PlpgsqlCheckResult {
-    #[serde(rename = "functionid")]
     pub functionid: Option<String>,
-    #[serde(rename = "level")]
-    pub level: Option<String>,
-    #[serde(rename = "message")]
-    pub message: Option<String>,
-    #[serde(rename = "sqlState")]
-    pub sqlstate: Option<String>,
-    #[serde(rename = "detail")]
-    pub detail: Option<String>,
-    #[serde(rename = "hint")]
-    pub hint: Option<String>,
-    #[serde(rename = "context")]
-    pub context: Option<String>,
-    #[serde(rename = "lineno")]
     pub lineno: Option<i32>,
-    #[serde(rename = "position")]
+    pub statement: Option<String>,
+    pub sqlstate: Option<String>,
+    pub message: Option<String>,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    pub level: Option<String>,
     pub position: Option<i32>,
+    pub query: Option<String>,
+    pub context: Option<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PlpgsqlCheckError {
     pub function_name: String,
     pub source_file: Option<String>,
@@ -33,7 +25,10 @@ pub struct PlpgsqlCheckError {
 }
 
 /// Check if the plpgsql_check extension is installed
-pub async fn is_plpgsql_check_available(client: &tokio_postgres::Transaction<'_>) -> Result<bool, Box<dyn std::error::Error>> {
+pub async fn is_plpgsql_check_available<C>(client: &C) -> Result<bool, Box<dyn std::error::Error>>
+where
+    C: tokio_postgres::GenericClient,
+{
     let result = client.query_one(
         "SELECT EXISTS (
             SELECT 1 FROM pg_extension 
@@ -45,56 +40,126 @@ pub async fn is_plpgsql_check_available(client: &tokio_postgres::Transaction<'_>
     Ok(result.get(0))
 }
 
-/// Run plpgsql_check on a function and return results
-pub async fn check_function(
-    client: &tokio_postgres::Transaction<'_>,
-    function_name: &str,
-) -> Result<Vec<PlpgsqlCheckResult>, Box<dyn std::error::Error>> {
-    // Parse the function name to extract schema and name
-    let (schema, name) = if function_name.contains('.') {
-        let parts: Vec<&str> = function_name.splitn(2, '.').collect();
-        (parts[0], parts[1].trim_end_matches("()"))
+/// Run plpgsql_check on all functions using the bulk query approach
+pub async fn check_all_functions<C>(
+    client: &C,
+    schema_filter: Option<&[String]>,
+    function_name_filter: Option<&str>,
+) -> Result<Vec<PlpgsqlCheckResult>, Box<dyn std::error::Error>>
+where
+    C: tokio_postgres::GenericClient,
+{
+    // Base query from plpgsql_check README
+    let base_query = "
+        SELECT
+          (pcf).functionid::regprocedure::text, (pcf).lineno, (pcf).statement,
+          (pcf).sqlstate, (pcf).message, (pcf).detail, (pcf).hint, (pcf).level,
+          (pcf).\"position\", (pcf).query, (pcf).context
+        FROM
+          (
+            SELECT
+              plpgsql_check_function_tb(pg_proc.oid, COALESCE(pg_trigger.tgrelid, 0),
+                                        oldtable=>pg_trigger.tgoldtable,
+                                        newtable=>pg_trigger.tgnewtable) AS pcf
+            FROM pg_proc
+                 LEFT JOIN pg_trigger
+                           ON (pg_trigger.tgfoid = pg_proc.oid)
+            WHERE
+              prolang = (SELECT lang.oid FROM pg_language lang WHERE lang.lanname = 'plpgsql') AND
+              pronamespace <> (SELECT nsp.oid FROM pg_namespace nsp WHERE nsp.nspname = 'pg_catalog')";
+
+    // Build dynamic WHERE conditions
+    let mut where_conditions = Vec::new();
+    let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Send + Sync>> = Vec::new();
+    let mut param_index = 1;
+
+    // Add schema filtering
+    if let Some(schemas) = schema_filter {
+        if !schemas.is_empty() {
+            where_conditions.push(format!("AND pronamespace IN (SELECT oid FROM pg_namespace WHERE nspname = ANY(${}))", param_index));
+            params.push(Box::new(schemas.to_vec()));
+            param_index += 1;
+        }
     } else {
-        ("public", function_name.trim_end_matches("()"))
+        // Default: exclude pg_* and information_schema
+        where_conditions.push("AND pronamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname LIKE 'pg_%' OR nspname = 'information_schema')".to_string());
+    }
+
+    // Add function name filtering  
+    if let Some(function_name) = function_name_filter {
+        // Parse schema-qualified function names
+        if function_name.contains('.') {
+            let parts: Vec<&str> = function_name.splitn(2, '.').collect();
+            let schema_name = parts[0].to_string();
+            let func_name = parts[1].trim_end_matches("()").to_string();
+            where_conditions.push(format!("AND pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = ${}) AND proname = ${}", param_index, param_index + 1));
+            params.push(Box::new(schema_name));
+            params.push(Box::new(func_name));
+        } else {
+            let func_name = function_name.trim_end_matches("()").to_string();
+            where_conditions.push(format!("AND proname = ${}", param_index));
+            params.push(Box::new(func_name));
+        }
+    } else {
+        // When checking all functions, exclude internal ones starting with underscore
+        where_conditions.push("AND proname NOT LIKE '\\_%'".to_string());
+    }
+
+    // Complete the query
+    let full_query = format!("{}
+              {}
+              -- ignore unused triggers
+              AND (pg_proc.prorettype <> (SELECT typ.oid FROM pg_type typ WHERE typ.typname = 'trigger') OR
+                   pg_trigger.tgfoid IS NOT NULL)
+            OFFSET 0
+          ) ss
+        ORDER BY (pcf).functionid::regprocedure::text, (pcf).lineno",
+        base_query,
+        where_conditions.join(" ")
+    );
+
+    let rows = if params.is_empty() {
+        client.query(&full_query, &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)]).await?
+    } else {
+        let params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = 
+            params.iter().map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
+        client.query(&full_query, &params_refs).await?
     };
-    
-    // Query that finds the function by name and runs plpgsql_check on it
-    let query = "
-        SELECT result::text
-        FROM pg_proc p 
-        JOIN pg_namespace n ON n.oid = p.pronamespace,
-        LATERAL plpgsql_check_function(p.oid, format:='json') AS result
-        WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind IN ('f', 'p')
-    ";
-    
-    let rows = client.query(query, &[&schema, &name]).await?;
     let mut results = Vec::new();
-    
+
     for row in rows {
-        // The JSON is returned as a single column
-        if let Ok(json_str) = row.try_get::<_, String>(0) {
-            // Parse the JSON wrapper structure
-            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                // Extract issues array from the wrapper
-                if let Some(issues) = json_value.get("issues").and_then(|v| v.as_array()) {
-                    for issue in issues {
-                        if let Ok(check_result) = serde_json::from_value::<PlpgsqlCheckResult>(issue.clone()) {
-                            results.push(check_result);
-                        }
-                    }
-                }
-            }
+        // Parse the table output
+        let result = PlpgsqlCheckResult {
+            functionid: row.get::<_, Option<String>>(0),
+            lineno: row.get::<_, Option<i32>>(1),
+            statement: row.get::<_, Option<String>>(2),
+            sqlstate: row.get::<_, Option<String>>(3),
+            message: row.get::<_, Option<String>>(4),
+            detail: row.get::<_, Option<String>>(5),
+            hint: row.get::<_, Option<String>>(6),
+            level: row.get::<_, Option<String>>(7),
+            position: row.get::<_, Option<i32>>(8),
+            query: row.get::<_, Option<String>>(9),
+            context: row.get::<_, Option<String>>(10),
+        };
+
+        // Only include results with actual messages (skip empty rows)
+        if result.level.is_some() && result.message.is_some() {
+            results.push(result);
         }
     }
-    
+
     Ok(results)
 }
 
-/// Check all functions that were created or updated
-pub async fn check_modified_functions(
-    client: &tokio_postgres::Transaction<'_>,
+/// Check all functions that were created or updated using the bulk query approach
+pub async fn check_modified_functions<C>(
+    client: &C,
     modified_objects: &[&SqlObject],
-) -> Result<Vec<PlpgsqlCheckError>, Box<dyn std::error::Error>> {
+) -> Result<Vec<PlpgsqlCheckError>, Box<dyn std::error::Error>>
+where
+    C: tokio_postgres::GenericClient,
+{
     let mut errors = Vec::new();
     
     // Filter to only functions and procedures (both can contain PL/pgSQL code)
@@ -113,35 +178,54 @@ pub async fn check_modified_functions(
         return Ok(errors);
     }
     
-    for function in functions {
+    // Use bulk query to check all functions, then filter results
+    let all_results = check_all_functions(client, None, None).await?;
+    
+    // Create a map of modified function names for quick lookup
+    let mut modified_function_names = std::collections::HashSet::new();
+    for function in &functions {
         let func_name = match &function.qualified_name.schema {
-            Some(schema) => format!("{}.{}()", schema, function.qualified_name.name),
-            None => format!("{}()", function.qualified_name.name),
+            Some(schema) => format!("{}.{}", schema, function.qualified_name.name),
+            None => function.qualified_name.name.clone(),
         };
-        
-        match check_function(client, &func_name).await {
-            Ok(results) => {
-                for result in results {
-                    // Only report errors and warnings (skip notices)
-                    if let Some(level) = &result.level {
-                        if level == "error" || level == "warning" {
-                            let error = PlpgsqlCheckError {
-                                function_name: func_name.clone(),
-                                source_file: function.source_file.as_ref().map(|p| p.to_string_lossy().to_string()),
-                                source_line: calculate_source_line(function, result.lineno),
-                                check_result: result,
-                            };
-                            errors.push(error);
-                        }
+        modified_function_names.insert(func_name);
+    }
+    
+    // Filter bulk results to only modified functions
+    for result in all_results {
+        if let Some(functionid) = &result.functionid {
+            // Extract function name from regprocedure format (schema.function or just function)
+            let function_name = if functionid.contains('(') {
+                // Remove parameters from function signature
+                functionid.split('(').next().unwrap_or(functionid).to_string()
+            } else {
+                functionid.clone()
+            };
+            
+            // Check if this function was modified
+            if modified_function_names.contains(&function_name) {
+                // Only report errors and warnings (skip notices)
+                if let Some(level) = &result.level {
+                    if level == "error" || level == "warning" {
+                        // Find the corresponding SqlObject for source file info
+                        let source_info = functions.iter()
+                            .find(|f| {
+                                let obj_name = match &f.qualified_name.schema {
+                                    Some(schema) => format!("{}.{}", schema, f.qualified_name.name),
+                                    None => f.qualified_name.name.clone(),
+                                };
+                                obj_name == function_name
+                            });
+                        
+                        let error = PlpgsqlCheckError {
+                            function_name: function_name.clone(),
+                            source_file: source_info.and_then(|f| f.source_file.as_ref().map(|p| p.to_string_lossy().to_string())),
+                            source_line: source_info.and_then(|f| calculate_source_line(f, result.lineno)),
+                            check_result: result,
+                        };
+                        errors.push(error);
                     }
                 }
-            }
-            Err(e) => {
-                // Log but don't fail the operation
-                eprintln!("{}: Failed to check function/procedure {}: {}", 
-                    "Warning".yellow().bold(), 
-                    func_name.cyan(), 
-                    e);
             }
         }
     }
@@ -151,12 +235,15 @@ pub async fn check_modified_functions(
 
 /// Check functions that have soft dependencies on modified functions
 /// These are functions that call the modified functions and need validation
-pub async fn check_soft_dependent_functions(
-    client: &tokio_postgres::Transaction<'_>,
+pub async fn check_soft_dependent_functions<C>(
+    client: &C,
     dependency_graph: &crate::analysis::DependencyGraph,
     modified_objects: &[&SqlObject],
     all_file_objects: &[SqlObject],
-) -> Result<Vec<PlpgsqlCheckError>, Box<dyn std::error::Error>> {
+) -> Result<Vec<PlpgsqlCheckError>, Box<dyn std::error::Error>>
+where
+    C: tokio_postgres::GenericClient,
+{
     use crate::analysis::ObjectRef;
     
     let mut errors = Vec::new();
@@ -186,47 +273,57 @@ pub async fn check_soft_dependent_functions(
         return Ok(errors);
     }
     
-    println!("\n{}: Checking {} dependent functions for compatibility...", 
-        "Info".blue().bold(), 
-        functions_to_check.len().to_string().yellow());
+    // Don't print status message here to avoid breaking output flow
     
     let num_functions_to_check = functions_to_check.len();
     
-    // Check each dependent function
-    for func_ref in functions_to_check {
-        // Find the function in file objects to get source info
-        let function = all_file_objects.iter()
-            .find(|obj| obj.object_type == func_ref.object_type && 
-                       obj.qualified_name == func_ref.qualified_name);
-        
+    // Use bulk query to check all functions, then filter to dependents
+    let all_results = check_all_functions(client, None, None).await?;
+    
+    // Create a map of function names to check
+    let mut dependent_function_names = std::collections::HashSet::new();
+    for func_ref in &functions_to_check {
         let func_name = match &func_ref.qualified_name.schema {
-            Some(schema) => format!("{}.{}()", schema, func_ref.qualified_name.name),
-            None => format!("{}()", func_ref.qualified_name.name),
+            Some(schema) => format!("{}.{}", schema, func_ref.qualified_name.name),
+            None => func_ref.qualified_name.name.clone(),
         };
-        
-        match check_function(client, &func_name).await {
-            Ok(results) => {
-                for result in results {
-                    // Only report errors (not warnings for dependent functions)
-                    if let Some(level) = &result.level {
-                        if level == "error" {
-                            let error = PlpgsqlCheckError {
-                                function_name: func_name.clone(),
-                                source_file: function.and_then(|f| f.source_file.as_ref().map(|p| p.to_string_lossy().to_string())),
-                                source_line: function.and_then(|f| calculate_source_line(f, result.lineno)),
-                                check_result: result,
-                            };
-                            errors.push(error);
-                        }
+        dependent_function_names.insert(func_name);
+    }
+    
+    // Filter bulk results to only dependent functions
+    for result in all_results {
+        if let Some(functionid) = &result.functionid {
+            // Extract function name from regprocedure format
+            let function_name = if functionid.contains('(') {
+                functionid.split('(').next().unwrap_or(functionid).to_string()
+            } else {
+                functionid.clone()
+            };
+            
+            // Check if this is a dependent function we need to check
+            if dependent_function_names.contains(&function_name) {
+                // Only report errors (not warnings for dependent functions)
+                if let Some(level) = &result.level {
+                    if level == "error" {
+                        // Find the corresponding SqlObject for source file info
+                        let source_info = all_file_objects.iter()
+                            .find(|f| {
+                                let obj_name = match &f.qualified_name.schema {
+                                    Some(schema) => format!("{}.{}", schema, f.qualified_name.name),
+                                    None => f.qualified_name.name.clone(),
+                                };
+                                obj_name == function_name && matches!(f.object_type, ObjectType::Function | ObjectType::Procedure)
+                            });
+                        
+                        let error = PlpgsqlCheckError {
+                            function_name: function_name.clone(),
+                            source_file: source_info.and_then(|f| f.source_file.as_ref().map(|p| p.to_string_lossy().to_string())),
+                            source_line: source_info.and_then(|f| calculate_source_line(f, result.lineno)),
+                            check_result: result,
+                        };
+                        errors.push(error);
                     }
                 }
-            }
-            Err(e) => {
-                // Log but don't fail the operation
-                eprintln!("{}: Failed to check dependent function {}: {}", 
-                    "Warning".yellow().bold(), 
-                    func_name.cyan(), 
-                    e);
             }
         }
     }
@@ -249,7 +346,7 @@ fn calculate_source_line(function: &SqlObject, function_line: Option<i32>) -> Op
     }
 }
 
-/// Format and display plpgsql_check errors
+/// Format and display plpgsql_check errors, sorted by severity (warnings first, then errors)
 pub fn display_check_errors(errors: &[PlpgsqlCheckError]) {
     if errors.is_empty() {
         return;
@@ -257,7 +354,28 @@ pub fn display_check_errors(errors: &[PlpgsqlCheckError]) {
     
     println!("\n{}", "=== PL/pgSQL Check Results ===".bold().yellow());
     
-    for error in errors {
+    // Sort errors by level - warnings first, then errors
+    let mut sorted_errors = errors.to_vec();
+    sorted_errors.sort_by(|a, b| {
+        let level_a = a.check_result.level.as_deref().unwrap_or("error");
+        let level_b = b.check_result.level.as_deref().unwrap_or("error");
+        
+        // Define sort order: warning = 0, error = 1, other = 2
+        let order_a = match level_a {
+            "warning" => 0,
+            "error" => 1,
+            _ => 2,
+        };
+        let order_b = match level_b {
+            "warning" => 0,
+            "error" => 1,
+            _ => 2,
+        };
+        
+        order_a.cmp(&order_b)
+    });
+    
+    for error in &sorted_errors {
         let level_str = error.check_result.level.as_deref().unwrap_or("error");
         let level_colored = match level_str {
             "error" => format!("{}", level_str.red().bold()),
@@ -299,10 +417,22 @@ pub fn display_check_errors(errors: &[PlpgsqlCheckError]) {
         }
     }
     
-    println!("\n{} {} found by plpgsql_check", 
-        errors.len().to_string().yellow().bold(),
-        if errors.len() == 1 { "issue" } else { "issues" }
-    );
+    // Count warnings and errors
+    let warnings = sorted_errors.iter().filter(|e| e.check_result.level.as_deref() == Some("warning")).count();
+    let errors_count = sorted_errors.iter().filter(|e| e.check_result.level.as_deref() == Some("error")).count();
+    
+    // Display summary
+    print!("\n{} ", sorted_errors.len().to_string().yellow().bold());
+    if warnings > 0 && errors_count > 0 {
+        print!("issues ({} warnings, {} errors) ", warnings, errors_count);
+    } else if warnings > 0 {
+        print!("warning{} ", if warnings == 1 { "" } else { "s" });
+    } else if errors_count > 0 {
+        print!("error{} ", if errors_count == 1 { "" } else { "s" });
+    } else {
+        print!("issue{} ", if sorted_errors.len() == 1 { "" } else { "s" });
+    }
+    println!("found by plpgsql_check");
 }
 
 #[cfg(test)]
@@ -336,24 +466,4 @@ mod tests {
         assert_eq!(calculate_source_line(&function, Some(1)), None);
     }
     
-    #[test]
-    fn test_plpgsql_check_result_deserialization() {
-        let json = r#"{
-            "functionid": "12345",
-            "lineno": 5,
-            "position": 10,
-            "sqlstate": "42703",
-            "message": "column \"foo\" does not exist",
-            "detail": "There is a column named \"bar\" in table \"test\", but it cannot be referenced from this part of the query.",
-            "hint": "Try using a different column name.",
-            "level": "error",
-            "context": "SQL expression \"SELECT foo FROM test\""
-        }"#;
-        
-        let result: PlpgsqlCheckResult = serde_json::from_str(json).unwrap();
-        assert_eq!(result.functionid, Some("12345".to_string()));
-        assert_eq!(result.lineno, Some(5));
-        assert_eq!(result.sqlstate, Some("42703".to_string()));
-        assert_eq!(result.level, Some("error".to_string()));
-    }
 }

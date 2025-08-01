@@ -5,7 +5,53 @@ use tempfile::TempDir;
 use testcontainers::{clients::Cli, Container, RunnableImage};
 use testcontainers_modules::postgres::Postgres;
 use tokio::sync::Mutex;
-use tokio_postgres::{Client, NoTls};
+use tokio_postgres::{Client, NoTls, Row};
+
+/// Trait for converting database rows to Rust types
+pub trait FromRow: Sized {
+    fn from_row(row: Row) -> Self;
+}
+
+// Implement FromRow for common tuple types used in tests
+impl<A, B> FromRow for (A, B)
+where
+    A: for<'a> tokio_postgres::types::FromSql<'a>,
+    B: for<'a> tokio_postgres::types::FromSql<'a>,
+{
+    fn from_row(row: Row) -> Self {
+        (row.get(0), row.get(1))
+    }
+}
+
+impl<A, B, C> FromRow for (A, B, C)
+where
+    A: for<'a> tokio_postgres::types::FromSql<'a>,
+    B: for<'a> tokio_postgres::types::FromSql<'a>,
+    C: for<'a> tokio_postgres::types::FromSql<'a>,
+{
+    fn from_row(row: Row) -> Self {
+        (row.get(0), row.get(1), row.get(2))
+    }
+}
+
+impl<A, B, C, D, E> FromRow for (A, B, C, D, E)
+where
+    A: for<'a> tokio_postgres::types::FromSql<'a>,
+    B: for<'a> tokio_postgres::types::FromSql<'a>,
+    C: for<'a> tokio_postgres::types::FromSql<'a>,
+    D: for<'a> tokio_postgres::types::FromSql<'a>,
+    E: for<'a> tokio_postgres::types::FromSql<'a>,
+{
+    fn from_row(row: Row) -> Self {
+        (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))
+    }
+}
+
+impl FromRow for String {
+    fn from_row(row: Row) -> Self {
+        row.get(0)
+    }
+}
 
 /// Container info stored globally
 struct ContainerInfo {
@@ -113,6 +159,12 @@ impl TestEnvironment {
         content: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let file_path = self.sql_dir.join(name);
+        
+        // Create parent directories if they don't exist
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
         std::fs::write(file_path, content)?;
         Ok(())
     }
@@ -190,6 +242,28 @@ impl TestEnvironment {
             .await?;
         
         Ok(rows.into_iter().map(|row| (row.get(0), row.get(1))).collect())
+    }
+    
+    /// Execute a query and return a single scalar value
+    pub async fn query_scalar<T: for<'a> tokio_postgres::types::FromSql<'a>>(&self, query: &str) -> Result<T, Box<dyn std::error::Error>> {
+        let row = self.client.query_one(query, &[]).await?;
+        Ok(row.get(0))
+    }
+    
+    /// Execute a query and return all rows as tuples
+    pub async fn query_all<T>(&self, query: &str) -> Result<Vec<T>, Box<dyn std::error::Error>> 
+    where
+        T: FromRow,
+    {
+        let rows = self.client.query(query, &[]).await?;
+        Ok(rows.into_iter().map(T::from_row).collect())
+    }
+    
+    /// Delete a SQL file from the test environment
+    pub async fn delete_sql_file(&self, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let file_path = self.sql_dir.join(filename);
+        tokio::fs::remove_file(file_path).await?;
+        Ok(())
     }
 }
 

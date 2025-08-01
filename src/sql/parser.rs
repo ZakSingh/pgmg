@@ -1020,6 +1020,7 @@ fn extract_type_from_type_name(type_name: &pg_query::protobuf::TypeName) -> Opti
 pub fn analyze_plpgsql(sql: &str) -> Result<Dependencies, Box<dyn std::error::Error>> {
     let json_result = pg_query::parse_plpgsql(sql)?;
     
+    
     let mut all_relations = HashSet::new();
     let mut all_functions = HashSet::new();
     let mut all_types = HashSet::new();
@@ -1081,17 +1082,26 @@ fn extract_dependencies_from_plpgsql_function(
     // Extract all PL/pgSQL expressions from the function body
     let plpgsql_expressions = extract_plpgsql_expressions_from_json(function_json);
     
+    
     // Analyze each expression
     for expr in plpgsql_expressions {
+        
         // Check if it's a regular SQL statement
-        let expr_upper = expr.trim().to_uppercase();
+        // Remove leading/trailing parentheses if present
+        let expr_trimmed = expr.trim().trim_start_matches('(').trim_end_matches(')').trim();
+        let expr_upper = expr_trimmed.to_uppercase();
         if expr_upper.starts_with("SELECT") 
             || expr_upper.starts_with("INSERT")
             || expr_upper.starts_with("UPDATE")
             || expr_upper.starts_with("DELETE")
             || expr_upper.starts_with("WITH") {
             // It's a SQL statement, analyze it but avoid recursive PL/pgSQL analysis
-            if let Ok(parse_result) = pg_query::parse(&expr) {
+            
+            if let Ok(parse_result) = pg_query::parse(expr_trimmed) {
+                // Use pg_query's built-in methods directly to debug
+                let _parsed_wrapped = pg_query::ParseResult::new(parse_result.protobuf.clone(), String::new());
+                
+                
                 if let Ok(deps) = extract_dependencies_from_parse_result(&parse_result.protobuf) {
                     for relation in deps.relations {
                         relations.insert(relation);
@@ -1296,6 +1306,59 @@ mod tests {
         
         let expected_type = QualifiedIdent::from_name("custom_type".to_string());
         assert!(result.types.contains(&expected_type));
+    }
+
+    #[test]
+    fn test_pg_query_direct() {
+        // Test what pg_query returns directly
+        let sql = "CREATE OR REPLACE FUNCTION schema_b.count_records() RETURNS INTEGER AS $$ BEGIN RETURN 1; END; $$ LANGUAGE plpgsql;";
+        
+        let parse_result = pg_query::parse(sql).unwrap();
+        println!("pg_query tables: {:?}", parse_result.tables());
+        println!("pg_query functions: {:?}", parse_result.functions());
+        
+        // Test just a SELECT statement
+        let select_sql = "SELECT COUNT(*) FROM schema_a.source_table";
+        let select_result = pg_query::parse(select_sql).unwrap();
+        println!("\nFor SELECT statement:");
+        println!("pg_query tables: {:?}", select_result.tables());
+        println!("pg_query functions: {:?}", select_result.functions());
+        
+        // The SELECT should find the table
+        assert!(select_result.tables().contains(&"schema_a.source_table".to_string()));
+    }
+
+    #[test]
+    fn test_cross_schema_plpgsql_function() {
+        // This reproduces the issue we're seeing in the integration tests
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION schema_b.count_records()
+            RETURNS INTEGER AS $$
+            BEGIN
+                RETURN (SELECT COUNT(*) FROM schema_a.source_table);
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+        
+        let result = analyze_statement(sql).unwrap();
+        
+        println!("DEBUG: Relations found: {:?}", result.relations);
+        println!("DEBUG: Functions found: {:?}", result.functions);
+        
+        // The table should be identified as a relation
+        let expected_table = QualifiedIdent::new(Some("schema_a".to_string()), "source_table".to_string());
+        assert!(result.relations.contains(&expected_table), 
+                "Expected to find schema_a.source_table in relations, but found: {:?}", result.relations);
+        
+        // COUNT should be identified as a function
+        let count_func = QualifiedIdent::from_name("count".to_string());
+        assert!(result.functions.contains(&count_func),
+                "Expected to find count function");
+        
+        // schema_b should NOT be identified as a function
+        let schema_b_func = QualifiedIdent::from_name("schema_b".to_string());
+        assert!(!result.functions.contains(&schema_b_func),
+                "schema_b should not be identified as a function, but functions are: {:?}", result.functions);
     }
 
     #[test]

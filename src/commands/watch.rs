@@ -6,6 +6,7 @@ use crate::sql::{scan_test_files, build_test_dependency_map, TestDependencyMap};
 use crate::analysis::graph::ObjectRef;
 use crate::builtin_catalog::BuiltinCatalog;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use owo_colors::OwoColorize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -398,6 +399,8 @@ async fn run_specific_tests(config: &WatchConfig, test_files: Vec<PathBuf>) {
             config.connection_string.clone(),
             false, // Don't show TAP output in watch mode
             false, // Don't show immediate results (we'll show our own)
+            true,  // Run quietly in watch mode
+            &config.pgmg_config,
         ).await {
             Ok(test_result) => {
                 // Display relative path from current directory
@@ -420,20 +423,51 @@ async fn run_specific_tests(config: &WatchConfig, test_files: Vec<PathBuf>) {
                         test_result.tests_passed
                     ));
                     
-                    // Show failures
+                    // Show failures with enhanced formatting
                     for file_result in &test_result.test_files {
                         for failure in &file_result.failures {
-                            println!("    ✗ {}: {}", failure.test_number, failure.description);
+                            println!("    {} {}: {}", "✗".red(), failure.test_number, failure.description);
                             
-                            // Show detailed error if available
+                            // Show detailed error if available (SQL execution errors)
                             if let Some(detailed_error) = &failure.detailed_error {
                                 // The detailed error already includes formatting, so just print it with indentation
                                 for line in detailed_error.lines() {
                                     println!("      {}", line);
                                 }
                             } else if let Some(diagnostic) = &failure.diagnostic {
-                                // Fall back to simple diagnostic
-                                println!("      {}", diagnostic);
+                                // Show pgtap diagnostic information with proper formatting
+                                println!("      {}: {}", "Diagnostic".yellow().bold(), "");
+                                for diag_line in diagnostic.lines() {
+                                    if diag_line.trim().is_empty() {
+                                        continue;
+                                    }
+                                    
+                                    // Format specific pgtap diagnostic patterns
+                                    if diag_line.contains("Failed test") {
+                                        println!("        {}: {}", "Test".dimmed(), diag_line.replace("Failed test", "").trim().trim_matches('"').yellow());
+                                    } else if diag_line.contains("got:") || diag_line.contains("Got:") {
+                                        let got_value = diag_line.split(':').nth(1).unwrap_or("").trim();
+                                        println!("        {}: {}", "Got".red().bold(), got_value.red());
+                                    } else if diag_line.contains("expected:") || diag_line.contains("Expected:") {
+                                        let expected_value = diag_line.split(':').nth(1).unwrap_or("").trim();
+                                        println!("        {}: {}", "Expected".green().bold(), expected_value.green());
+                                    } else if diag_line.contains("DETAIL:") {
+                                        let detail = diag_line.replace("DETAIL:", "").trim().to_string();
+                                        println!("        {}: {}", "Detail".yellow(), detail);
+                                    } else if diag_line.contains("HINT:") {
+                                        let hint = diag_line.replace("HINT:", "").trim().to_string();
+                                        println!("        {}: {}", "Hint".green(), hint);
+                                    } else if diag_line.contains("caught:") {
+                                        let caught_value = diag_line.split(':').skip(1).collect::<Vec<_>>().join(":").trim().to_string();
+                                        println!("        {}: {}", "Caught".red().bold(), caught_value.red());
+                                    } else if diag_line.contains("wanted:") {
+                                        let wanted_value = diag_line.split(':').skip(1).collect::<Vec<_>>().join(":").trim().to_string();
+                                        println!("        {}: {}", "Expected".green().bold(), wanted_value.green());
+                                    } else {
+                                        // Generic diagnostic line
+                                        println!("        {}", diag_line.bright_black());
+                                    }
+                                }
                             }
                         }
                     }

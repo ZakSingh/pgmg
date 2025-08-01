@@ -293,6 +293,7 @@ impl DependencyGraph {
                 ObjectType::Comment => ("lavender", "note"),
                 ObjectType::CronJob => ("orange", "octagon"),
                 ObjectType::Aggregate => ("lightsteelblue", "triangle"),
+                ObjectType::Operator => ("lightsalmon", "invhouse"),
             };
 
             // Create unique node ID that includes object type to avoid conflicts

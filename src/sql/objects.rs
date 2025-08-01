@@ -26,6 +26,7 @@ pub enum ObjectType {
     Comment,
     CronJob,
     Aggregate,
+    Operator,
 }
 
 impl fmt::Display for ObjectType {
@@ -43,6 +44,7 @@ impl fmt::Display for ObjectType {
             ObjectType::Comment => write!(f, "COMMENT"),
             ObjectType::CronJob => write!(f, "CRON JOB"),
             ObjectType::Aggregate => write!(f, "AGGREGATE"),
+            ObjectType::Operator => write!(f, "OPERATOR"),
         }
     }
 }
@@ -331,6 +333,25 @@ pub fn parse_sql_object(statement: &str) -> Result<Option<ParsedSqlObject>, Box<
                                 }));
                             }
                         }
+                        // Handle CREATE OPERATOR statements
+                        else if define_stmt.kind == 26 { // OBJECT_OPERATOR = 26 in pg_query protobuf
+                            if !define_stmt.defnames.is_empty() {
+                                let qualified_name = extract_defname(&define_stmt.defnames)?;
+                                let mut dependencies = extract_dependencies_from_parsed_with_sql(&parsed, statement)?;
+                                
+                                // Extract additional operator-specific dependencies
+                                extract_operator_dependencies(&define_stmt, &mut dependencies)?;
+                                
+                                return Ok(Some(ParsedSqlObject {
+                                    statement: statement.to_string(),
+                                    parsed,
+                                    object_type: ObjectType::Operator,
+                                    qualified_name,
+                                    dependencies,
+                                    trigger_table: None,
+                                }));
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -607,6 +628,26 @@ fn parse_comment_target(comment_stmt: &pg_query::protobuf::CommentStmt) -> Resul
                 }
             }
         }
+        PgObjectType::ObjectOperator => {
+            // COMMENT ON OPERATOR schema.operator_name(lefttype, righttype)
+            if let Some(object) = &comment_stmt.object {
+                if let Some(node) = &object.node {
+                    if let pg_query::NodeEnum::ObjectWithArgs(op_with_args) = node {
+                        let qualified_name = extract_name_from_node_list(&op_with_args.objname)?;
+                        // For operators, we track them as functions since they depend on functions
+                        dependencies.functions.insert(qualified_name.clone());
+                        
+                        // Generate operator signature for unique identification
+                        let signature = format_operator_signature(&qualified_name, &op_with_args.objargs)?;
+                        let comment_id = QualifiedIdent::new(
+                            None,
+                            format!("operator:{}", signature)
+                        );
+                        return Ok((comment_id, dependencies));
+                    }
+                }
+            }
+        }
         PgObjectType::ObjectType => {
             // COMMENT ON TYPE schema.type_name
             if let Some(object) = &comment_stmt.object {
@@ -745,6 +786,30 @@ fn format_function_signature(qualified_name: &QualifiedIdent, _args: &[pg_query:
     // For now, we'll use a simplified approach without parsing full argument types
     // In practice, PostgreSQL handles function overloading, but we've blocked that in pgmg
     format!("{}()", format_qualified_name(qualified_name))
+}
+
+/// Helper to format operator signature for unique identification
+fn format_operator_signature(qualified_name: &QualifiedIdent, args: &[pg_query::protobuf::Node]) -> Result<String, Box<dyn std::error::Error>> {
+    // Operators have 1 or 2 type arguments
+    let mut arg_types = Vec::new();
+    
+    for arg in args {
+        if let Some(pg_query::NodeEnum::TypeName(type_name)) = &arg.node {
+            if let Some(type_str) = extract_type_name(type_name) {
+                arg_types.push(type_str);
+            }
+        }
+    }
+    
+    // Format as: operator_name(lefttype, righttype) or operator_name(NONE, righttype) for prefix ops
+    let signature = match arg_types.len() {
+        0 => return Err("Operator must have at least one argument type".into()),
+        1 => format!("{}(NONE, {})", format_qualified_name(qualified_name), arg_types[0]),
+        2 => format!("{}({}, {})", format_qualified_name(qualified_name), arg_types[0], arg_types[1]),
+        _ => return Err("Operator cannot have more than two argument types".into()),
+    };
+    
+    Ok(signature)
 }
 
 /// Helper to format a qualified name
@@ -947,6 +1012,60 @@ fn parse_cron_command_dependencies(command: &str) -> Dependencies {
             }
         }
     }
+}
+
+/// Extract operator-specific dependencies from a DefineStmt
+fn extract_operator_dependencies(define_stmt: &pg_query::protobuf::DefineStmt, dependencies: &mut Dependencies) -> Result<(), Box<dyn std::error::Error>> {
+    // Parse the definition list to extract operator properties
+    for def_elem in &define_stmt.definition {
+        if let Some(pg_query::NodeEnum::DefElem(elem)) = &def_elem.node {
+            match elem.defname.as_str() {
+                "procedure" | "function" => {
+                    // Extract the function/procedure dependency
+                    if let Some(arg) = &elem.arg {
+                        if let Some(pg_query::NodeEnum::ObjectWithArgs(func_with_args)) = &arg.node {
+                            let func_name = extract_name_from_node_list(&func_with_args.objname)?;
+                            dependencies.functions.insert(func_name);
+                        }
+                    }
+                }
+                "leftarg" | "rightarg" => {
+                    // Extract type dependencies from operator arguments
+                    if let Some(arg) = &elem.arg {
+                        if let Some(pg_query::NodeEnum::TypeName(type_name)) = &arg.node {
+                            if let Some(type_str) = extract_type_name(type_name) {
+                                // Convert type string to QualifiedIdent
+                                let qualified_type = QualifiedIdent::from_qualified_name(&type_str);
+                                dependencies.types.insert(qualified_type);
+                            }
+                        }
+                    }
+                }
+                "commutator" | "negator" => {
+                    // Extract operator dependencies
+                    if let Some(arg) = &elem.arg {
+                        if let Some(pg_query::NodeEnum::String(s)) = &arg.node {
+                            // Operator references might be schema-qualified
+                            let _op_ref = QualifiedIdent::from_qualified_name(&s.sval);
+                            // Note: We don't add operator dependencies to the dependencies struct
+                            // as it doesn't have an operators field. This could be enhanced later.
+                        }
+                    }
+                }
+                "restrict" | "join" => {
+                    // Extract selectivity function dependencies
+                    if let Some(arg) = &elem.arg {
+                        if let Some(pg_query::NodeEnum::List(list)) = &arg.node {
+                            let func_name = extract_name_from_node_list(&list.items)?;
+                            dependencies.functions.insert(func_name);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Calculate hash for DDL statement for change detection

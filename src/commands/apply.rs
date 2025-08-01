@@ -1,14 +1,16 @@
 use std::path::PathBuf;
 use std::time::Duration;
 use crate::db::{StateManager, connect_with_url, AdvisoryLockManager, AdvisoryLockError};
-use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table, extract_function_signature}, splitter::split_sql_file};
+use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file};
 use crate::commands::plan::{execute_plan, ChangeOperation};
 use crate::config::PgmgConfig;
 use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification};
 use crate::plpgsql_check::{check_modified_functions, check_soft_dependent_functions, display_check_errors};
 use crate::error::format_postgres_error_with_details;
+use tracing::{info, warn, debug, error};
+
+#[cfg(feature = "cli")]
 use owo_colors::OwoColorize;
-use tracing::{info, warn};
 
 #[derive(Debug)]
 pub struct ApplyResult {
@@ -17,6 +19,8 @@ pub struct ApplyResult {
     pub objects_updated: Vec<String>,
     pub objects_deleted: Vec<String>,
     pub errors: Vec<String>,
+    pub plpgsql_errors_found: usize,
+    pub plpgsql_warnings_found: usize,
 }
 
 pub async fn execute_apply(
@@ -26,6 +30,101 @@ pub async fn execute_apply(
     config: &PgmgConfig,
 ) -> Result<ApplyResult, Box<dyn std::error::Error>> {
     execute_apply_with_lock_management(migrations_dir, code_dir, connection_string, config).await
+}
+
+/// Library-friendly version of execute_apply
+/// 
+/// All output goes through the tracing system. Configure your tracing subscriber
+/// to control how output is displayed or logged.
+/// 
+/// # Example
+/// ```no_run
+/// use pgmg::{PgmgConfig, apply_migrations};
+/// use tracing_subscriber;
+/// 
+/// // Initialize tracing (you control the output format)
+/// tracing_subscriber::fmt::init();
+/// 
+/// let config = PgmgConfig::load_from_file()?;
+/// let result = apply_migrations(&config).await?;
+/// ```
+pub async fn apply_migrations(
+    config: &PgmgConfig,
+) -> Result<ApplyResult, Box<dyn std::error::Error>> {
+    apply_migrations_with_options(config, None, None).await
+}
+
+/// Library-friendly version with custom directory options
+pub async fn apply_migrations_with_options(
+    config: &PgmgConfig,
+    migrations_dir: Option<PathBuf>,
+    code_dir: Option<PathBuf>,
+) -> Result<ApplyResult, Box<dyn std::error::Error>> {
+    use tracing::{info_span, Instrument};
+    
+    // Get connection string from config
+    let connection_string = config.connection_string.clone()
+        .ok_or("No database connection string configured")?;
+    
+    info!("Starting database migrations");
+    debug!(?migrations_dir, ?code_dir, "Migration directories");
+    
+    // Use default directories if not provided
+    let migrations_dir = migrations_dir.or_else(|| config.migrations_dir.clone());
+    let code_dir = code_dir.or_else(|| config.code_dir.clone());
+    
+    // Execute with detailed tracing
+    let span = info_span!("apply_migrations");
+    let result = execute_apply_with_lock_management(
+        migrations_dir,
+        code_dir,
+        connection_string,
+        config,
+    ).instrument(span).await?;
+    
+    // Log summary information
+    info!(
+        migrations_applied = result.migrations_applied.len(),
+        objects_created = result.objects_created.len(),
+        objects_updated = result.objects_updated.len(),
+        objects_deleted = result.objects_deleted.len(),
+        "Migration completed successfully"
+    );
+    
+    // Log details at debug level
+    for migration in &result.migrations_applied {
+        debug!(migration, "Applied migration");
+    }
+    for object in &result.objects_created {
+        debug!(object, "Created object");
+    }
+    for object in &result.objects_updated {
+        debug!(object, "Updated object");
+    }
+    for object in &result.objects_deleted {
+        debug!(object, "Deleted object");
+    }
+    
+    // Log any errors that were collected
+    for error in &result.errors {
+        error!(error, "Migration error");
+    }
+    
+    // Warnings for PL/pgSQL issues
+    if result.plpgsql_errors_found > 0 {
+        error!(
+            errors = result.plpgsql_errors_found,
+            "PL/pgSQL errors found - functions may not work correctly"
+        );
+    }
+    if result.plpgsql_warnings_found > 0 {
+        warn!(
+            warnings = result.plpgsql_warnings_found,
+            "PL/pgSQL warnings found"
+        );
+    }
+    
+    Ok(result)
 }
 
 /// Execute apply with advisory lock management
@@ -80,6 +179,7 @@ async fn execute_apply_with_lock_management(
     apply_result
 }
 
+
 /// Internal apply function that runs with the lock already acquired
 async fn execute_apply_internal(
     migrations_dir: Option<PathBuf>,
@@ -99,6 +199,8 @@ async fn execute_apply_internal(
         objects_updated: Vec::new(),
         objects_deleted: Vec::new(),
         errors: Vec::new(),
+        plpgsql_errors_found: 0,
+        plpgsql_warnings_found: 0,
     };
 
     // Step 1: Get the plan to understand what needs to be applied
@@ -133,10 +235,21 @@ async fn execute_apply_internal(
                         apply_result.errors.push(e.to_string());
                         println!("  {} Failed migration: {}", "✗".red().bold(), migration_name.cyan());
                         println!("{}", e.to_string().red());
+                        break; // Stop processing migrations on first error
                     }
                 }
             }
         }
+    }
+
+    // Check for migration errors before proceeding to object changes
+    if !apply_result.errors.is_empty() {
+        transaction.rollback().await?;
+        eprintln!("\n{} {} {}", "Rolled back due to".red().bold(), apply_result.errors.len().to_string().yellow(), "migration error:".red().bold());
+        for error in &apply_result.errors {
+            eprintln!("{}", error);
+        }
+        return Err("Migration failed - all changes rolled back".into());
     }
 
     // Track modified objects for plpgsql_check
@@ -172,7 +285,7 @@ async fn execute_apply_internal(
         // Track if transaction has been aborted
         let mut transaction_aborted = false;
 
-        // Phase 1: Drop all objects that need updating (in reverse dependency order)
+        // Phase 1: Drop objects that need updating (in reverse dependency order)
         if !updates.is_empty() && deletion_order.is_some() {
             println!("\n{}: {}", "Phase 1".blue().bold(), "Dropping objects for update...".blue());
             let del_order = deletion_order.as_ref().expect("deletion_order was checked to be Some");
@@ -186,7 +299,7 @@ async fn execute_apply_internal(
                         object.qualified_name == object_ref.qualified_name,
                     _ => false,
                 }) {
-                    ordered_updates_for_drop.push(update);
+                    ordered_updates_for_drop.push(*update);
                 }
             }
             
@@ -212,26 +325,98 @@ async fn execute_apply_internal(
             }
         }
         
-        // Phase 2: Delete objects marked for deletion
+        // Phase 2: Delete objects marked for deletion (in dependency order)
         if !deletes.is_empty() && !transaction_aborted {
             println!("\n{}: {}", "Phase 2".blue().bold(), "Deleting objects...".blue());
-            for change in deletes {
-                if transaction_aborted { break; }
-                
-                if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
-                    match apply_delete_object(&transaction, object_type, object_name).await {
-                        Ok(_) => {
-                            apply_result.objects_deleted.push(object_name.clone());
-                            println!("  {} Deleted {}: {}", 
-                                "✓".green().bold(),
-                                format!("{:?}", object_type).to_lowercase().yellow(),
-                                object_name.cyan()
-                            );
+            
+            // Separate comments from other deletions
+            let (comment_deletes, non_comment_deletes): (Vec<_>, Vec<_>) = deletes.into_iter()
+                .partition(|change| match change {
+                    ChangeOperation::DeleteObject { object_type, .. } => object_type == &ObjectType::Comment,
+                    _ => false,
+                });
+            
+            // Process comments first (they need their parent objects to exist)
+            if !comment_deletes.is_empty() {
+                println!("  {}", "Processing comments first...".dimmed());
+                for change in comment_deletes {
+                    if transaction_aborted { break; }
+                    
+                    if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
+                        match apply_delete_object(&transaction, object_type, object_name).await {
+                            Ok(_) => {
+                                apply_result.objects_deleted.push(object_name.clone());
+                                println!("  {} Deleted {}: {}", 
+                                    "✓".green().bold(),
+                                    format!("{:?}", object_type).to_lowercase().yellow(),
+                                    object_name.cyan()
+                                );
+                            }
+                            Err(e) => {
+                                apply_result.errors.push(format!("Failed to delete {}: {}", object_name, e));
+                                println!("  {} Failed to delete {}: {}", "✗".red().bold(), object_name.cyan(), e.to_string().red());
+                                transaction_aborted = true;
+                            }
                         }
-                        Err(e) => {
-                            apply_result.errors.push(format!("Failed to delete {}: {}", object_name, e));
-                            println!("  {} Failed to delete {}: {}", "✗".red().bold(), object_name.cyan(), e.to_string().red());
-                            transaction_aborted = true;
+                    }
+                }
+            }
+            
+            // Then process non-comment deletions in dependency order
+            if !non_comment_deletes.is_empty() && !transaction_aborted {
+                // Sort deletions by dependency order if available
+                let ordered_deletes = if let Some(ref del_order) = deletion_order {
+                    let mut ordered = Vec::new();
+                    // Process in deletion order (dependents first)
+                    for object_ref in del_order {
+                        if let Some(delete_op) = non_comment_deletes.iter().find(|d| match d {
+                            ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                                let qname = crate::sql::QualifiedIdent::from_qualified_name(object_name);
+                                object_type == &object_ref.object_type && qname == object_ref.qualified_name
+                            }
+                            _ => false,
+                        }) {
+                            ordered.push(*delete_op);
+                        }
+                    }
+                    // Add any deletes not in the dependency graph at the end
+                    for delete_op in &non_comment_deletes {
+                        let already_added = ordered.iter().any(|o| {
+                            match (o, delete_op) {
+                                (ChangeOperation::DeleteObject { object_type: t1, object_name: n1, .. },
+                                 ChangeOperation::DeleteObject { object_type: t2, object_name: n2, .. }) => {
+                                    t1 == t2 && n1 == n2
+                                }
+                                _ => false,
+                            }
+                        });
+                        if !already_added {
+                            ordered.push(*delete_op);
+                        }
+                    }
+                    ordered
+                } else {
+                    non_comment_deletes
+                };
+                
+                for change in ordered_deletes {
+                    if transaction_aborted { break; }
+                    
+                    if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
+                        match apply_delete_object(&transaction, object_type, object_name).await {
+                            Ok(_) => {
+                                apply_result.objects_deleted.push(object_name.clone());
+                                println!("  {} Deleted {}: {}", 
+                                    "✓".green().bold(),
+                                    format!("{:?}", object_type).to_lowercase().yellow(),
+                                    object_name.cyan()
+                                );
+                            }
+                            Err(e) => {
+                                apply_result.errors.push(format!("Failed to delete {}: {}", object_name, e));
+                                println!("  {} Failed to delete {}: {}", "✗".red().bold(), object_name.cyan(), e.to_string().red());
+                                transaction_aborted = true;
+                            }
                         }
                     }
                 }
@@ -318,16 +503,38 @@ async fn execute_apply_internal(
         }
     }
 
+    // Handle SQL errors with rollback first
+    if !apply_result.errors.is_empty() {
+        transaction.rollback().await?;
+        eprintln!("{} {} {}", "Rolled back due to".red().bold(), apply_result.errors.len().to_string().yellow(), "errors:".red().bold());
+        for error in &apply_result.errors {
+            eprintln!("  {} {}", "-".red().bold(), error.red());
+        }
+        return Err("Apply operation failed - all changes rolled back".into());
+    }
+    
     // Step 4.5: Run plpgsql_check on modified functions if in development mode
-    if apply_result.errors.is_empty() && 
-       config.development_mode.unwrap_or(false) && 
+    // IMPORTANT: Run plpgsql_check WITHIN the transaction before committing
+    if config.development_mode.unwrap_or(false) && 
        config.check_plpgsql.unwrap_or(false) &&
        !modified_objects.is_empty() {
         
-        // Check the modified functions themselves
+        // Collect all plpgsql_check errors before displaying
+        let mut all_plpgsql_errors = Vec::new();
+        
+        // Check the modified functions themselves using the transaction
         match check_modified_functions(&transaction, &modified_objects).await {
-            Ok(check_errors) => {
-                display_check_errors(&check_errors);
+            Ok(mut check_errors) => {
+                for error in &check_errors {
+                    if let Some(level) = &error.check_result.level {
+                        match level.as_str() {
+                            "error" => apply_result.plpgsql_errors_found += 1,
+                            "warning" => apply_result.plpgsql_warnings_found += 1,
+                            _ => {}
+                        }
+                    }
+                }
+                all_plpgsql_errors.append(&mut check_errors);
             }
             Err(e) => {
                 // Log but don't fail the operation
@@ -339,13 +546,22 @@ async fn execute_apply_internal(
         // Also check soft dependents if we have a dependency graph
         if let Some(ref dependency_graph) = plan_result.dependency_graph {
             match check_soft_dependent_functions(
-                &transaction, 
+                &transaction,
                 dependency_graph, 
                 &modified_objects,
                 &plan_result.file_objects
             ).await {
-                Ok(check_errors) => {
-                    display_check_errors(&check_errors);
+                Ok(mut check_errors) => {
+                    for error in &check_errors {
+                        if let Some(level) = &error.check_result.level {
+                            match level.as_str() {
+                                "error" => apply_result.plpgsql_errors_found += 1,
+                                "warning" => apply_result.plpgsql_warnings_found += 1,
+                                _ => {}
+                            }
+                        }
+                    }
+                    all_plpgsql_errors.append(&mut check_errors);
                 }
                 Err(e) => {
                     // Log but don't fail the operation
@@ -354,19 +570,30 @@ async fn execute_apply_internal(
                 }
             }
         }
-    }
-    
-    // Step 5: Commit or rollback transaction
-    if apply_result.errors.is_empty() {
-        transaction.commit().await?;
-        println!("{}", "All changes applied successfully!".green().bold());
-    } else {
-        transaction.rollback().await?;
-        eprintln!("{} {} {}", "Rolled back due to".red().bold(), apply_result.errors.len().to_string().yellow(), "errors:".red().bold());
-        for error in &apply_result.errors {
-            eprintln!("  {} {}", "-".red().bold(), error.red());
+        
+        // Display all plpgsql_check errors at once (sorted by severity)
+        if !all_plpgsql_errors.is_empty() {
+            display_check_errors(&all_plpgsql_errors);
         }
-        return Err("Apply operation failed - all changes rolled back".into());
+        
+        // If there are plpgsql_check errors, rollback and fail
+        if apply_result.plpgsql_errors_found > 0 {
+            transaction.rollback().await?;
+            eprintln!("\n{} {} {}", 
+                "Apply blocked due to".red().bold(), 
+                apply_result.plpgsql_errors_found.to_string().yellow(), 
+                "PL/pgSQL errors. All changes rolled back. Fix the errors above and try again.".red().bold()
+            );
+            return Err("Apply operation blocked due to PL/pgSQL compilation errors".into());
+        }
+        
+        // If plpgsql_check passed, commit the transaction
+        transaction.commit().await?;
+        print_apply_success_message(&apply_result);
+    } else {
+        // Step 5: Commit transaction if no plpgsql_check
+        transaction.commit().await?;
+        print_apply_success_message(&apply_result);
     }
 
     Ok(apply_result)
@@ -424,6 +651,9 @@ async fn apply_create_object(
     let ddl_hash = calculate_ddl_hash(&object.ddl_statement);
     update_object_hash_in_transaction(client, &object.object_type, &object.qualified_name, &ddl_hash).await?;
     
+    // Store object dependencies
+    store_object_dependencies_in_transaction(client, &object.object_type, &object.qualified_name, &object.dependencies).await?;
+    
     // Emit NOTIFY event if in development mode
     if config.development_mode.unwrap_or(false) && config.emit_notify_events.unwrap_or(false) {
         let mut notification = ObjectLoadedNotification::from_sql_object(object);
@@ -475,22 +705,29 @@ async fn apply_drop_for_update(
                 }
             }
         }
-        ObjectType::Function | ObjectType::Procedure => {
-            // For functions and procedures, we need the full signature
-            match extract_function_signature(&object.ddl_statement) {
-                Ok(signature) => {
-                    let object_type_str = if object.object_type == ObjectType::Function {
-                        "FUNCTION"
-                    } else {
-                        "PROCEDURE"
-                    };
-                    format!("DROP {} IF EXISTS {}", object_type_str, signature)
-                }
-                Err(_) => {
-                    // Fall back to the simple drop statement
-                    generate_drop_statement(&object.object_type, &object.qualified_name)
-                }
+        ObjectType::Function | ObjectType::Procedure | ObjectType::Aggregate => {
+            // For functions, procedures, and aggregates, we need to drop all existing overloads
+            let existing_signatures = get_existing_function_signatures(client, &object.object_type, &object.qualified_name).await?;
+            
+            if existing_signatures.is_empty() {
+                // No existing function found, nothing to drop
+                return Ok(());
             }
+            
+            let object_type_str = match object.object_type {
+                ObjectType::Function => "FUNCTION",
+                ObjectType::Procedure => "PROCEDURE",
+                ObjectType::Aggregate => "AGGREGATE",
+                _ => unreachable!(),
+            };
+            
+            // Drop all existing overloads
+            for signature in existing_signatures {
+                let drop_statement = format!("DROP {} IF EXISTS {}", object_type_str, signature);
+                client.execute(&drop_statement, &[]).await?;
+            }
+            
+            return Ok(());
         }
         _ => generate_drop_statement(&object.object_type, &object.qualified_name)
     };
@@ -509,7 +746,72 @@ async fn apply_delete_object(
     // Handle comment deletion specially - comments can't be dropped, only set to NULL
     if object_type == &ObjectType::Comment {
         let comment_null_statement = generate_comment_null_statement(object_name)?;
-        client.execute(&comment_null_statement, &[]).await?;
+        
+        // Create a savepoint before attempting the comment deletion
+        client.execute("SAVEPOINT comment_deletion", &[]).await?;
+        
+        // Try to execute the comment deletion
+        match client.execute(&comment_null_statement, &[]).await {
+            Ok(_) => {
+                // Comment successfully deleted, release the savepoint
+                client.execute("RELEASE SAVEPOINT comment_deletion", &[]).await?;
+            }
+            Err(_) => {
+                // Any error in comment deletion - just rollback the savepoint
+                // The comment is either already gone or can't be deleted
+                client.execute("ROLLBACK TO SAVEPOINT comment_deletion", &[]).await?;
+            }
+        }
+        
+        // Always remove from state tracking, regardless of whether the SQL succeeded
+        // This ensures we don't try to delete non-existent comments repeatedly
+        remove_object_from_state_in_transaction(client, object_type, &qualified_name).await?;
+        return Ok(());
+    } else if matches!(object_type, ObjectType::Function | ObjectType::Procedure | ObjectType::Aggregate | ObjectType::Operator) {
+        // For functions, procedures, aggregates, and operators, drop all existing overloads
+        let existing_signatures = get_existing_function_signatures(client, object_type, &qualified_name).await?;
+        
+        if !existing_signatures.is_empty() {
+            let object_type_str = match object_type {
+                ObjectType::Function => "FUNCTION",
+                ObjectType::Procedure => "PROCEDURE",
+                ObjectType::Aggregate => "AGGREGATE",
+                ObjectType::Operator => "OPERATOR",
+                _ => unreachable!(),
+            };
+            
+            // Drop all existing overloads
+            for signature in existing_signatures {
+                let drop_statement = format!("DROP {} IF EXISTS {}", object_type_str, signature);
+                match client.execute(&drop_statement, &[]).await {
+                    Ok(_) => {},
+                    Err(e) => {
+                        // Check if this is a dependency error
+                        let error_msg = e.to_string();
+                        if error_msg.contains("because other objects depend on it") {
+                            return Err(format!(
+                                "Cannot drop {} {} because other objects depend on it. This usually means there are triggers, views, or other functions that reference this {}. You may need to drop those dependent objects first or review your migration strategy.",
+                                object_type_str.to_lowercase(),
+                                signature,
+                                object_type_str.to_lowercase()
+                            ).into());
+                        } else {
+                            // Re-throw the original error
+                            return Err(e.into());
+                        }
+                    }
+                }
+            }
+        }
+    } else if object_type == &ObjectType::Trigger {
+        // Triggers need special handling - we need to find the table they're on
+        let trigger_table = get_trigger_table_from_dependencies(client, &qualified_name).await?;
+        let trigger_name = match &qualified_name.schema {
+            Some(schema) => format!("{}.{}", schema, qualified_name.name),
+            None => qualified_name.name.clone(),
+        };
+        let drop_statement = format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, trigger_table);
+        client.execute(&drop_statement, &[]).await?;
     } else {
         // Drop the object
         let drop_statement = generate_drop_statement(object_type, &qualified_name);
@@ -556,6 +858,16 @@ fn generate_comment_null_statement_from_object(object: &SqlObject) -> Result<Str
             let agg_name = name.trim_end_matches("()");
             Ok(format!("COMMENT ON AGGREGATE {} IS NULL", agg_name))
         }
+        ["procedure", name] => {
+            // Since pgmg prevents procedure overloading, we can use the name without parentheses
+            let proc_name = name.trim_end_matches("()");
+            Ok(format!("COMMENT ON PROCEDURE {} IS NULL", proc_name))
+        }
+        ["operator", name] => {
+            // Operators need their full signature, which should be stored in the comment identifier
+            // Format: operator:name(lefttype,righttype)
+            Ok(format!("COMMENT ON OPERATOR {} IS NULL", name))
+        }
         _ => Err(format!("Unknown comment identifier format: {}", comment_identifier).into()),
     }
 }
@@ -590,6 +902,16 @@ fn generate_comment_null_statement(comment_identifier: &str) -> Result<String, B
             let agg_name = name.trim_end_matches("()");
             Ok(format!("COMMENT ON AGGREGATE {} IS NULL", agg_name))
         }
+        ["procedure", name] => {
+            // Since pgmg prevents procedure overloading, we can use the name without parentheses
+            let proc_name = name.trim_end_matches("()");
+            Ok(format!("COMMENT ON PROCEDURE {} IS NULL", proc_name))
+        }
+        ["operator", name] => {
+            // Operators need their full signature, which should be stored in the comment identifier
+            // Format: operator:name(lefttype,righttype)
+            Ok(format!("COMMENT ON OPERATOR {} IS NULL", name))
+        }
         _ => Err(format!("Unknown comment identifier format: {}", comment_identifier).into()),
     }
 }
@@ -608,6 +930,7 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
         ObjectType::Comment => "COMMENT",
         ObjectType::CronJob => "CRON_JOB",  // Will be handled specially
         ObjectType::Aggregate => "AGGREGATE",
+        ObjectType::Operator => "OPERATOR",
     };
     
     let full_name = match &qualified_name.schema {
@@ -636,6 +959,12 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
             // For cron jobs, we use cron.unschedule
             format!("SELECT cron.unschedule('{}')", qualified_name.name)
         }
+        ObjectType::Operator => {
+            // Operators need special handling as they require their signature
+            // For now, we'll use a simplified approach
+            // TODO: Store and retrieve operator signatures properly
+            format!("DROP {} IF EXISTS {}", object_type_str, full_name)
+        }
         _ => {
             format!("DROP {} IF EXISTS {}", object_type_str, full_name)
         }
@@ -661,6 +990,7 @@ async fn update_object_hash_in_transaction(
         ObjectType::Comment => "comment",
         ObjectType::CronJob => "cron_job",
         ObjectType::Aggregate => "aggregate",
+        ObjectType::Operator => "operator",
     };
 
     let qualified_name = match &object_name.schema {
@@ -678,6 +1008,96 @@ async fn update_object_hash_in_transaction(
         &[&object_type_str, &qualified_name, &ddl_hash],
     ).await?;
 
+    Ok(())
+}
+
+async fn store_object_dependencies_in_transaction(
+    client: &tokio_postgres::Transaction<'_>,
+    object_type: &ObjectType,
+    object_name: &crate::sql::QualifiedIdent,
+    dependencies: &crate::sql::Dependencies,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let object_type_str = match object_type {
+        ObjectType::Table => "table",
+        ObjectType::View => "view",
+        ObjectType::MaterializedView => "materialized_view",
+        ObjectType::Function => "function",
+        ObjectType::Procedure => "procedure",
+        ObjectType::Type => "type",
+        ObjectType::Domain => "domain",
+        ObjectType::Index => "index",
+        ObjectType::Trigger => "trigger",
+        ObjectType::Comment => "comment",
+        ObjectType::CronJob => "cron_job",
+        ObjectType::Aggregate => "aggregate",
+        ObjectType::Operator => "operator",
+    };
+
+    let qualified_name = match &object_name.schema {
+        Some(schema) => format!("{}.{}", schema, object_name.name),
+        None => object_name.name.clone(),
+    };
+    
+    // First, remove existing dependencies for this object
+    client.execute(
+        "DELETE FROM pgmg.pgmg_dependencies WHERE dependent_type = $1 AND dependent_name = $2",
+        &[&object_type_str, &qualified_name],
+    ).await?;
+    
+    // Store relation dependencies
+    for dep in &dependencies.relations {
+        let dep_qualified = match &dep.schema {
+            Some(schema) => format!("{}.{}", schema, dep.name),
+            None => dep.name.clone(),
+        };
+        // Relations could be tables, views, or materialized views - we store as generic "relation"
+        client.execute(
+            r#"
+            INSERT INTO pgmg.pgmg_dependencies 
+            (dependent_type, dependent_name, dependency_type, dependency_name, dependency_kind)
+            VALUES ($1, $2, 'relation', $3, 'hard')
+            "#,
+            &[&object_type_str, &qualified_name, &dep_qualified],
+        ).await?;
+    }
+    
+    // Store function dependencies
+    for dep in &dependencies.functions {
+        let dep_qualified = match &dep.schema {
+            Some(schema) => format!("{}.{}", schema, dep.name),
+            None => dep.name.clone(),
+        };
+        // Determine dependency kind based on dependent object type
+        let dep_kind = match object_type {
+            ObjectType::Function | ObjectType::Procedure => "soft",
+            _ => "hard",
+        };
+        client.execute(
+            r#"
+            INSERT INTO pgmg.pgmg_dependencies 
+            (dependent_type, dependent_name, dependency_type, dependency_name, dependency_kind)
+            VALUES ($1, $2, 'function', $3, $4)
+            "#,
+            &[&object_type_str, &qualified_name, &dep_qualified, &dep_kind],
+        ).await?;
+    }
+    
+    // Store type dependencies
+    for dep in &dependencies.types {
+        let dep_qualified = match &dep.schema {
+            Some(schema) => format!("{}.{}", schema, dep.name),
+            None => dep.name.clone(),
+        };
+        client.execute(
+            r#"
+            INSERT INTO pgmg.pgmg_dependencies 
+            (dependent_type, dependent_name, dependency_type, dependency_name, dependency_kind)
+            VALUES ($1, $2, 'type', $3, 'hard')
+            "#,
+            &[&object_type_str, &qualified_name, &dep_qualified],
+        ).await?;
+    }
+    
     Ok(())
 }
 
@@ -699,6 +1119,7 @@ async fn remove_object_from_state_in_transaction(
         ObjectType::Comment => "comment",
         ObjectType::CronJob => "cron_job",
         ObjectType::Aggregate => "aggregate",
+        ObjectType::Operator => "operator",
     };
 
     let qualified_name = match &object_name.schema {
@@ -710,6 +1131,68 @@ async fn remove_object_from_state_in_transaction(
         "DELETE FROM pgmg.pgmg_state WHERE object_type = $1 AND object_name = $2",
         &[&object_type_str, &qualified_name],
     ).await?;
+    
+    // Also remove dependencies
+    client.execute(
+        "DELETE FROM pgmg.pgmg_dependencies WHERE dependent_type = $1 AND dependent_name = $2",
+        &[&object_type_str, &qualified_name],
+    ).await?;
+    
+    client.execute(
+        "DELETE FROM pgmg.pgmg_dependencies WHERE dependency_type = $1 AND dependency_name = $2",
+        &[&object_type_str, &qualified_name],
+    ).await?;
+    
+    // Also remove any comments that reference this object
+    match object_type {
+        ObjectType::Table | ObjectType::View | ObjectType::MaterializedView | ObjectType::Type => {
+            // Remove column comments for this object
+            let column_comment_pattern = format!("column:{}.", qualified_name);
+            client.execute(
+                "DELETE FROM pgmg.pgmg_state WHERE object_type = 'comment' AND object_name LIKE $1",
+                &[&format!("{}%", column_comment_pattern)],
+            ).await?;
+            
+            // Remove the object's own comment
+            let object_comment = format!("{}:{}", object_type_str, qualified_name);
+            client.execute(
+                "DELETE FROM pgmg.pgmg_state WHERE object_type = 'comment' AND object_name = $1",
+                &[&object_comment],
+            ).await?;
+        }
+        ObjectType::Function | ObjectType::Procedure | ObjectType::Operator => {
+            // Remove function/procedure/operator comments
+            let object_comment = format!("{}:{}", object_type_str, qualified_name);
+            client.execute(
+                "DELETE FROM pgmg.pgmg_state WHERE object_type = 'comment' AND object_name = $1",
+                &[&object_comment],
+            ).await?;
+        }
+        ObjectType::Trigger => {
+            // Triggers have a special format: trigger:trigger_name:table_name
+            // When removing a trigger, remove its comment
+            // The qualified_name might include schema, so we need to handle both cases
+            let trigger_comment_pattern = format!("trigger:{}:", qualified_name);
+            
+            // Also try without schema prefix in case the comment was stored differently
+            let trigger_name_only = qualified_name.split('.').last().unwrap_or(&qualified_name);
+            let trigger_comment_pattern_no_schema = format!("trigger:{}:", trigger_name_only);
+            
+            // Delete using both patterns
+            client.execute(
+                "DELETE FROM pgmg.pgmg_state WHERE object_type = 'comment' AND (object_name LIKE $1 OR object_name LIKE $2)",
+                &[&format!("{}%", trigger_comment_pattern), &format!("{}%", trigger_comment_pattern_no_schema)],
+            ).await?;
+        }
+        _ => {
+            // For other object types that might have comments
+            let object_comment = format!("{}:{}", object_type_str, qualified_name);
+            client.execute(
+                "DELETE FROM pgmg.pgmg_state WHERE object_type = 'comment' AND object_name = $1",
+                &[&object_comment],
+            ).await?;
+        }
+    }
 
     Ok(())
 }
@@ -786,11 +1269,32 @@ async fn get_object_oid(
              JOIN pg_namespace n ON n.oid = p.pronamespace 
              WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind = 'a'"
         }
+        ObjectType::Operator => {
+            "SELECT o.oid FROM pg_operator o 
+             JOIN pg_namespace n ON n.oid = o.oprnamespace 
+             WHERE n.nspname = $1 AND o.oprname = $2"
+        }
     };
     
     let row = client.query_one(query, &[&schema_name, &object_name]).await?;
     let oid: u32 = row.get(0);
     Ok(oid)
+}
+
+/// Print the appropriate success message based on SQL and plpgsql_check results
+fn print_apply_success_message(result: &ApplyResult) {
+    if result.plpgsql_errors_found > 0 {
+        println!("{}", "Changes applied with errors in PL/pgSQL functions!".red().bold());
+        println!("  {} {} PL/pgSQL errors found", "✗".red(), result.plpgsql_errors_found.to_string().red().bold());
+        if result.plpgsql_warnings_found > 0 {
+            println!("  {} {} PL/pgSQL warnings found", "⚠".yellow(), result.plpgsql_warnings_found.to_string().yellow().bold());
+        }
+    } else if result.plpgsql_warnings_found > 0 {
+        println!("{}", "Changes applied successfully with warnings!".yellow().bold());
+        println!("  {} {} PL/pgSQL warnings found", "⚠".yellow(), result.plpgsql_warnings_found.to_string().yellow().bold());
+    } else {
+        println!("{}", "All changes applied successfully!".green().bold());
+    }
 }
 
 fn format_object_name(object: &SqlObject) -> String {
@@ -800,6 +1304,102 @@ fn format_object_name(object: &SqlObject) -> String {
     }
 }
 
+
+async fn get_trigger_table_from_dependencies(
+    client: &tokio_postgres::Transaction<'_>,
+    trigger_name: &crate::sql::QualifiedIdent,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let qualified_trigger_name = match &trigger_name.schema {
+        Some(schema) => format!("{}.{}", schema, trigger_name.name),
+        None => trigger_name.name.clone(),
+    };
+    
+    // Query the dependencies table to find the table this trigger depends on
+    let row = client.query_one(
+        r#"
+        SELECT dependency_name 
+        FROM pgmg.pgmg_dependencies 
+        WHERE dependent_type = 'trigger' 
+          AND dependent_name = $1 
+          AND dependency_type = 'relation'
+        LIMIT 1
+        "#,
+        &[&qualified_trigger_name],
+    ).await.map_err(|_| format!("Could not find table dependency for trigger {}", qualified_trigger_name))?;
+    
+    let table_name: String = row.get(0);
+    Ok(table_name)
+}
+
+async fn get_existing_function_signatures(
+    client: &tokio_postgres::Transaction<'_>,
+    object_type: &ObjectType,
+    qualified_name: &crate::sql::QualifiedIdent,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let (schema_name, function_name) = match &qualified_name.schema {
+        Some(s) => (s.as_str(), qualified_name.name.as_str()),
+        None => ("public", qualified_name.name.as_str()),
+    };
+    
+    // Handle operators separately as they use pg_operator, not pg_proc
+    if object_type == &ObjectType::Operator {
+        let query = r#"
+            SELECT 
+                CASE 
+                    WHEN n.nspname = 'public' THEN o.oprname
+                    ELSE n.nspname || '.' || o.oprname
+                END || '(' || 
+                COALESCE(tl.typname, 'NONE') || ', ' || 
+                COALESCE(tr.typname, 'NONE') || ')' AS signature
+            FROM pg_operator o
+            JOIN pg_namespace n ON n.oid = o.oprnamespace
+            LEFT JOIN pg_type tl ON tl.oid = o.oprleft
+            LEFT JOIN pg_type tr ON tr.oid = o.oprright
+            WHERE n.nspname = $1 
+              AND o.oprname = $2
+        "#;
+        
+        let rows = client.query(query, &[&schema_name, &function_name]).await?;
+        
+        let signatures: Vec<String> = rows.iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect();
+        
+        return Ok(signatures);
+    }
+    
+    let prokind: &str = match object_type {
+        ObjectType::Function => "f",
+        ObjectType::Procedure => "p", 
+        ObjectType::Aggregate => "a",
+        _ => return Ok(vec![]),
+    };
+    
+    // Query to get all overloads of a function with their full signatures
+    let query = r#"
+        SELECT 
+            CASE 
+                WHEN n.nspname = 'public' THEN p.proname
+                ELSE n.nspname || '.' || p.proname
+            END || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS signature
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = $1 
+          AND p.proname = $2
+          AND p.prokind = $3::char
+    "#;
+    
+    let rows = client.query(query, &[&schema_name, &function_name, &prokind]).await?;
+    
+    let signatures: Vec<String> = rows.iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    
+    Ok(signatures)
+}
+
+
+#[cfg(feature = "cli")]
 pub fn print_apply_summary(result: &ApplyResult) {
     println!("\n{}", "=== PGMG Apply Summary ===".bold().blue());
     
@@ -846,16 +1446,46 @@ pub fn print_apply_summary(result: &ApplyResult) {
     if total_changes == 0 && result.errors.is_empty() {
         println!("\n{}", "No changes applied. Database was already up to date.".green());
     } else if result.errors.is_empty() {
-        println!("\n{} {} {}", 
-            "✓".green().bold(), 
-            "Successfully applied".green().bold(), 
-            format!("{} changes", total_changes).yellow()
-        );
+        if result.plpgsql_errors_found > 0 {
+            println!("\n{} {} {} {} {}", 
+                "✓".yellow().bold(), 
+                "Applied".yellow().bold(),
+                format!("{} changes", total_changes).yellow(),
+                "with".yellow().bold(),
+                "PL/pgSQL errors".red().bold()
+            );
+        } else if result.plpgsql_warnings_found > 0 {
+            println!("\n{} {} {} {} {}", 
+                "✓".yellow().bold(), 
+                "Applied".yellow().bold(),
+                format!("{} changes", total_changes).yellow(),
+                "with".yellow().bold(),
+                "PL/pgSQL warnings".yellow().bold()
+            );
+        } else {
+            println!("\n{} {} {}", 
+                "✓".green().bold(), 
+                "Successfully applied".green().bold(), 
+                format!("{} changes", total_changes).yellow()
+            );
+        }
     } else {
         println!("\n{} {} {}", 
             "✗".red().bold(), 
             "Apply failed with".red().bold(), 
             format!("{} errors", result.errors.len()).yellow()
         );
+    }
+    
+    // Show plpgsql_check summary if there were any issues
+    if result.plpgsql_errors_found > 0 || result.plpgsql_warnings_found > 0 {
+        println!();
+        println!("{}:", "PL/pgSQL Check Results".bold().yellow());
+        if result.plpgsql_errors_found > 0 {
+            println!("  {} {} errors found", "✗".red(), result.plpgsql_errors_found.to_string().red().bold());
+        }
+        if result.plpgsql_warnings_found > 0 {
+            println!("  {} {} warnings found", "⚠".yellow(), result.plpgsql_warnings_found.to_string().yellow().bold());
+        }
     }
 }
