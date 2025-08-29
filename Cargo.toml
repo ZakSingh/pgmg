@@ -31,6 +31,7 @@ sha2 = "0.10"
 notify = "8.1"
 toml = "0.9"
 url = "2.5"
+percent-encoding = "2.3"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3.0"
 serde = { version = "1.0", features = ["derive"] }

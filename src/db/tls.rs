@@ -194,20 +194,20 @@ pub enum PgConnection {
 impl PgConnection {
     /// Spawn the connection handler
     pub fn spawn(self) {
-        tokio::spawn(async move {
-            match self {
-                PgConnection::NoTls(conn) => {
+        match self {
+            PgConnection::NoTls(conn) => {
+                tokio::spawn(async move {
                     if let Err(e) = conn.await {
                         eprintln!("Database connection error: {}", e);
                     }
-                }
-                #[cfg(feature = "tls")]
-                PgConnection::Rustls(_conn) => {
-                    // The boxed connection can't be awaited generically
-                    // It will be cleaned up when dropped
-                }
+                });
             }
-        });
+            #[cfg(feature = "tls")]
+            PgConnection::Rustls(_) => {
+                // For TLS connections, the connection handler is already spawned
+                // in connect_with_tls(), so nothing to do here
+            }
+        }
     }
 }
 
@@ -234,7 +234,15 @@ pub async fn connect_with_tls(
             // For "prefer" mode, try TLS first, then fall back to no TLS
             if tls_config.mode == TlsMode::Prefer {
                 match tokio_postgres::connect(connection_string, rustls.clone()).await {
-                    Ok((client, connection)) => Ok((client, PgConnection::Rustls(Box::new(connection)))),
+                    Ok((client, connection)) => {
+                        // Spawn the TLS connection handler immediately
+                        tokio::spawn(async move {
+                            if let Err(e) = connection.await {
+                                eprintln!("TLS connection error: {}", e);
+                            }
+                        });
+                        Ok((client, PgConnection::Rustls(Box::new(()))))
+                    },
                     Err(_) => {
                         // Fall back to no TLS
                         let (client, connection) = tokio_postgres::connect(connection_string, NoTls).await?;
@@ -243,7 +251,13 @@ pub async fn connect_with_tls(
                 }
             } else {
                 let (client, connection) = tokio_postgres::connect(connection_string, rustls).await?;
-                Ok((client, PgConnection::Rustls(Box::new(connection))))
+                // Spawn the TLS connection handler immediately
+                tokio::spawn(async move {
+                    if let Err(e) = connection.await {
+                        eprintln!("TLS connection error: {}", e);
+                    }
+                });
+                Ok((client, PgConnection::Rustls(Box::new(()))))
             }
         }
     }

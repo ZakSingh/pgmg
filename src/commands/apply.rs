@@ -29,7 +29,18 @@ pub async fn execute_apply(
     connection_string: String,
     config: &PgmgConfig,
 ) -> Result<ApplyResult, Box<dyn std::error::Error>> {
-    execute_apply_with_lock_management(migrations_dir, code_dir, connection_string, config).await
+    execute_apply_with_test_mode(migrations_dir, code_dir, connection_string, config, false).await
+}
+
+/// Execute apply with test mode support
+pub async fn execute_apply_with_test_mode(
+    migrations_dir: Option<PathBuf>,
+    code_dir: Option<PathBuf>,
+    connection_string: String,
+    config: &PgmgConfig,
+    test_mode: bool,
+) -> Result<ApplyResult, Box<dyn std::error::Error>> {
+    execute_apply_with_lock_management(migrations_dir, code_dir, connection_string, config, test_mode).await
 }
 
 /// Library-friendly version of execute_apply
@@ -80,6 +91,7 @@ pub async fn apply_migrations_with_options(
         code_dir,
         connection_string,
         config,
+        false, // test_mode = false for normal apply
     ).instrument(span).await?;
     
     // Log summary information
@@ -133,12 +145,26 @@ async fn execute_apply_with_lock_management(
     code_dir: Option<PathBuf>,
     connection_string: String,
     config: &PgmgConfig,
+    test_mode: bool,
 ) -> Result<ApplyResult, Box<dyn std::error::Error>> {
     // Connect to database
-    let (mut client, connection) = connect_with_url(&connection_string).await?;
+    let (client, connection) = connect_with_url(&connection_string).await?;
     
     // Spawn connection handler
     connection.spawn();
+    
+    // Pass test_mode through to the inner function
+    execute_apply_inner(client, migrations_dir, code_dir, connection_string, config, test_mode).await
+}
+
+async fn execute_apply_inner(
+    mut client: tokio_postgres::Client,
+    migrations_dir: Option<PathBuf>,
+    code_dir: Option<PathBuf>,
+    connection_string: String,
+    config: &PgmgConfig,
+    test_mode: bool,
+) -> Result<ApplyResult, Box<dyn std::error::Error>> {
 
     // Acquire advisory lock to prevent concurrent apply operations
     let mut lock_manager = AdvisoryLockManager::new(&connection_string);
@@ -168,6 +194,7 @@ async fn execute_apply_with_lock_management(
         connection_string,
         config,
         &mut client,
+        test_mode,
     ).await;
 
     // Always attempt to release the lock
@@ -187,6 +214,7 @@ async fn execute_apply_internal(
     connection_string: String,
     config: &PgmgConfig,
     client: &mut tokio_postgres::Client,
+    test_mode: bool,
 ) -> Result<ApplyResult, Box<dyn std::error::Error>> {
 
     // Initialize state tracking
@@ -221,14 +249,18 @@ async fn execute_apply_internal(
 
     // Step 3: Apply migrations first (they need to be applied in order)
     if !plan_result.new_migrations.is_empty() {
-        println!("{} {} {}", "Applying".blue().bold(), plan_result.new_migrations.len().to_string().yellow(), "new migrations...".blue().bold());
+        if !test_mode {
+            println!("{} {} {}", "Applying".blue().bold(), plan_result.new_migrations.len().to_string().yellow(), "new migrations...".blue().bold());
+        }
         
         if let Some(ref migrations_dir) = migrations_dir {
             for migration_name in &plan_result.new_migrations {
-                match apply_migration(&transaction, migrations_dir, migration_name).await {
+                match apply_migration(&transaction, migrations_dir, migration_name, test_mode).await {
                     Ok(_) => {
                         apply_result.migrations_applied.push(migration_name.clone());
-                        println!("  {} Applied migration: {}", "✓".green().bold(), migration_name.cyan());
+                        if !test_mode {
+                            println!("  {} Applied migration: {}", "✓".green().bold(), migration_name.cyan());
+                        }
                     }
                     Err(e) => {
                         // The error from apply_migration already contains detailed formatting
@@ -257,7 +289,9 @@ async fn execute_apply_internal(
     
     // Step 4: Apply object changes based on dependency order
     if !plan_result.changes.is_empty() {
-        println!("{} {} {}", "Applying".blue().bold(), plan_result.changes.len().to_string().yellow(), "object changes...".blue().bold());
+        if !test_mode {
+            println!("{} {} {}", "Applying".blue().bold(), plan_result.changes.len().to_string().yellow(), "object changes...".blue().bold());
+        }
         
         // Separate the changes into phases
         let (_migrations, non_migrations): (Vec<_>, Vec<_>) = plan_result.changes.iter()
@@ -287,7 +321,9 @@ async fn execute_apply_internal(
 
         // Phase 1: Drop objects that need updating (in reverse dependency order)
         if !updates.is_empty() && deletion_order.is_some() {
-            println!("\n{}: {}", "Phase 1".blue().bold(), "Dropping objects for update...".blue());
+            if !test_mode {
+                println!("\n{}: {}", "Phase 1".blue().bold(), "Dropping objects for update...".blue());
+            }
             let del_order = deletion_order.as_ref().expect("deletion_order was checked to be Some");
             
             // Sort updates by deletion order
@@ -327,7 +363,9 @@ async fn execute_apply_internal(
         
         // Phase 2: Delete objects marked for deletion (in dependency order)
         if !deletes.is_empty() && !transaction_aborted {
-            println!("\n{}: {}", "Phase 2".blue().bold(), "Deleting objects...".blue());
+            if !test_mode {
+                println!("\n{}: {}", "Phase 2".blue().bold(), "Deleting objects...".blue());
+            }
             
             // Separate comments from other deletions
             let (comment_deletes, non_comment_deletes): (Vec<_>, Vec<_>) = deletes.into_iter()
@@ -425,7 +463,9 @@ async fn execute_apply_internal(
         
         // Phase 3: Create new objects and recreate updated objects (in dependency order)
         if !transaction_aborted && (creates.len() + updates.len() > 0) {
-            println!("\n{}: {}", "Phase 3".blue().bold(), "Creating objects...".blue());
+            if !test_mode {
+                println!("\n{}: {}", "Phase 3".blue().bold(), "Creating objects...".blue());
+            }
             
             // Combine creates and updates (which need recreation)
             let mut all_creates: Vec<(&SqlObject, bool)> = Vec::new();
@@ -457,25 +497,29 @@ async fn execute_apply_internal(
             for (object, is_update) in all_creates {
                 if transaction_aborted { break; }
                 
-                match apply_create_object(&transaction, object, config).await {
+                match apply_create_object(&transaction, object, config, test_mode).await {
                     Ok(_) => {
                         // Track modified objects for plpgsql_check
                         modified_objects.push(object);
                         
                         if is_update {
                             apply_result.objects_updated.push(format_object_name(object));
-                            println!("  {} Recreated {}: {} (updated)", 
-                                "✓".green().bold(),
-                                format!("{:?}", object.object_type).to_lowercase().yellow(),
-                                format_object_name(object).cyan()
-                            );
+                            if !test_mode {
+                                println!("  {} Recreated {}: {} (updated)", 
+                                    "✓".green().bold(),
+                                    format!("{:?}", object.object_type).to_lowercase().yellow(),
+                                    format_object_name(object).cyan()
+                                );
+                            }
                         } else {
                             apply_result.objects_created.push(format_object_name(object));
-                            println!("  {} Created {}: {}", 
-                                "✓".green().bold(),
-                                format!("{:?}", object.object_type).to_lowercase().yellow(),
-                                format_object_name(object).cyan()
-                            );
+                            if !test_mode {
+                                println!("  {} Created {}: {}", 
+                                    "✓".green().bold(),
+                                    format!("{:?}", object.object_type).to_lowercase().yellow(),
+                                    format_object_name(object).cyan()
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -589,11 +633,11 @@ async fn execute_apply_internal(
         
         // If plpgsql_check passed, commit the transaction
         transaction.commit().await?;
-        print_apply_success_message(&apply_result);
+        print_apply_success_message(&apply_result, test_mode);
     } else {
         // Step 5: Commit transaction if no plpgsql_check
         transaction.commit().await?;
-        print_apply_success_message(&apply_result);
+        print_apply_success_message(&apply_result, test_mode);
     }
 
     Ok(apply_result)
@@ -604,6 +648,7 @@ async fn apply_migration(
     client: &tokio_postgres::Transaction<'_>,
     migrations_dir: &PathBuf,
     migration_name: &str,
+    test_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let migration_path = migrations_dir.join(format!("{}.sql", migration_name));
     let migration_content = std::fs::read_to_string(&migration_path)?;
@@ -611,8 +656,27 @@ async fn apply_migration(
     // Split migration into statements and execute each one
     let statements = split_sql_file(&migration_content)?;
     
+    // Check if we're on AWS RDS once at the beginning
+    let is_rds = is_aws_rds(client.client()).await;
+    if is_rds {
+        info!("Detected AWS RDS environment - will skip plpgsql_check related statements");
+    }
+    
     for (idx, statement) in statements.iter().enumerate() {
         if !statement.sql.trim().is_empty() {
+            // Skip pg_cron related statements in test mode
+            if test_mode && should_skip_in_test_mode(&statement.sql) {
+                debug!("Skipping pg_cron statement in test mode: {}", statement.sql.lines().next().unwrap_or(""));
+                continue;
+            }
+            
+            // Skip plpgsql_check related statements on RDS
+            if is_rds && should_skip_plpgsql_check_on_rds(&statement.sql) {
+                debug!("Skipping plpgsql_check statement on RDS: {}", statement.sql.lines().next().unwrap_or(""));
+                eprintln!("  {} Skipping plpgsql_check statement (not available on AWS RDS)", "⚠".yellow().bold());
+                continue;
+            }
+            
             match client.execute(&statement.sql, &[]).await {
                 Ok(_) => {},
                 Err(e) => {
@@ -643,7 +707,14 @@ async fn apply_create_object(
     client: &tokio_postgres::Transaction<'_>,
     object: &SqlObject,
     config: &PgmgConfig,
+    test_mode: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Skip pg_cron related objects in test mode
+    if test_mode && should_skip_in_test_mode(&object.ddl_statement) {
+        debug!("Skipping pg_cron object in test mode: {}", object.qualified_name.name);
+        return Ok(());
+    }
+    
     // Execute the DDL statement
     client.execute(&object.ddl_statement, &[]).await?;
     
@@ -690,14 +761,14 @@ async fn apply_drop_for_update(
             // For triggers, we need to extract the table name from the DDL
             match extract_trigger_table(&object.ddl_statement) {
                 Ok(table_name) => {
-                    let trigger_name = match &object.qualified_name.schema {
-                        Some(schema) => format!("{}.{}", schema, object.qualified_name.name),
-                        None => object.qualified_name.name.clone(),
-                    };
-                    let table_full_name = match &table_name.schema {
-                        Some(schema) => format!("{}.{}", schema, table_name.name),
-                        None => table_name.name.clone(),
-                    };
+                    let trigger_name = quote_qualified_identifier(
+                        object.qualified_name.schema.as_deref(),
+                        &object.qualified_name.name
+                    );
+                    let table_full_name = quote_qualified_identifier(
+                        table_name.schema.as_deref(),
+                        &table_name.name
+                    );
                     format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, table_full_name)
                 }
                 Err(e) => {
@@ -806,11 +877,26 @@ async fn apply_delete_object(
     } else if object_type == &ObjectType::Trigger {
         // Triggers need special handling - we need to find the table they're on
         let trigger_table = get_trigger_table_from_dependencies(client, &qualified_name).await?;
-        let trigger_name = match &qualified_name.schema {
-            Some(schema) => format!("{}.{}", schema, qualified_name.name),
-            None => qualified_name.name.clone(),
+        let trigger_name = quote_qualified_identifier(
+            qualified_name.schema.as_deref(),
+            &qualified_name.name
+        );
+        
+        // The trigger_table could be either "table_name" or "schema.table_name"
+        // We need to properly quote it
+        let quoted_table = if trigger_table.contains('.') {
+            // It's already qualified, split and quote each part
+            let parts: Vec<&str> = trigger_table.splitn(2, '.').collect();
+            if parts.len() == 2 {
+                quote_qualified_identifier(Some(parts[0]), parts[1])
+            } else {
+                quote_qualified_identifier(None, &trigger_table)
+            }
+        } else {
+            quote_qualified_identifier(None, &trigger_table)
         };
-        let drop_statement = format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, trigger_table);
+        
+        let drop_statement = format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, quoted_table);
         client.execute(&drop_statement, &[]).await?;
     } else {
         // Drop the object
@@ -938,6 +1024,10 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
         None => qualified_name.name.clone(),
     };
     
+    // Note: Triggers are not handled here because DROP TRIGGER requires the table name
+    // (e.g., DROP TRIGGER trigger_name ON table_name). Since this function only has
+    // access to the object name and type, triggers must be handled specially in the
+    // calling code (see apply_drop_for_update and apply_delete_object).
     match object_type {
         ObjectType::Function => {
             // pgmg prevents function overloading, so CASCADE is not needed
@@ -948,12 +1038,6 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
             // pgmg prevents procedure overloading, so CASCADE is not needed
             // This ensures safety - unmanaged objects depending on this procedure will block the drop
             format!("DROP {} IF EXISTS {}", object_type_str, full_name)
-        }
-        ObjectType::Trigger => {
-            // Triggers need special handling - they require the table name
-            // We'll need to return both the trigger name and table name
-            // For now, return just the trigger name and we'll handle it specially
-            format!("DROP TRIGGER IF EXISTS {}", full_name)
         }
         ObjectType::CronJob => {
             // For cron jobs, we use cron.unschedule
@@ -1282,7 +1366,11 @@ async fn get_object_oid(
 }
 
 /// Print the appropriate success message based on SQL and plpgsql_check results
-fn print_apply_success_message(result: &ApplyResult) {
+fn print_apply_success_message(result: &ApplyResult, test_mode: bool) {
+    if test_mode {
+        return; // Don't print success messages in test mode
+    }
+    
     if result.plpgsql_errors_found > 0 {
         println!("{}", "Changes applied with errors in PL/pgSQL functions!".red().bold());
         println!("  {} {} PL/pgSQL errors found", "✗".red(), result.plpgsql_errors_found.to_string().red().bold());
@@ -1489,3 +1577,66 @@ pub fn print_apply_summary(result: &ApplyResult) {
         }
     }
 }
+
+// Helper function to quote identifiers properly
+fn quote_qualified_identifier(schema: Option<&str>, name: &str) -> String {
+    match schema {
+        Some(s) => format!("{}.{}", quote_identifier(s), quote_identifier(name)),
+        None => quote_identifier(name),
+    }
+}
+
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace("\"", "\"\""))
+}
+
+/// Check if we're running on AWS RDS by looking for the rdsadmin database
+async fn is_aws_rds(client: &tokio_postgres::Client) -> bool {
+    match client.query_one(
+        "SELECT 1 FROM pg_database WHERE datname = 'rdsadmin'", 
+        &[]
+    ).await {
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
+/// Check if a SQL statement should be skipped in test mode
+fn should_skip_in_test_mode(sql: &str) -> bool {
+    let sql_lower = sql.to_lowercase();
+    
+    // Skip pg_cron extension creation
+    if sql_lower.contains("create extension") && sql_lower.contains("pg_cron") {
+        return true;
+    }
+    
+    // Skip comments on pg_cron extension
+    if sql_lower.contains("comment on extension") && sql_lower.contains("pg_cron") {
+        return true;
+    }
+    
+    // Skip cron.schedule calls
+    if sql_lower.contains("cron.schedule") {
+        return true;
+    }
+    
+    // Skip cron.unschedule calls
+    if sql_lower.contains("cron.unschedule") {
+        return true;
+    }
+    
+    false
+}
+
+/// Check if a SQL statement is related to plpgsql_check and should be skipped on RDS
+fn should_skip_plpgsql_check_on_rds(sql: &str) -> bool {
+    let sql_lower = sql.to_lowercase();
+    
+    // Skip plpgsql_check extension creation
+    if sql_lower.contains("plpgsql_check") {
+        return true;
+    }
+    
+    false
+}
+

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use std::time::{Duration, Instant};
-use crate::db::connect_with_url;
+use crate::db::{connect_with_url, TestDatabase};
 use crate::sql::splitter::split_sql_file;
 use owo_colors::OwoColorize;
 // Manual TAP parsing implementation
@@ -67,94 +67,87 @@ pub async fn execute_test_with_options(
     
     println!("{} Found {} test file(s)", "→".cyan(), test_files.len());
     
-    // Check for pending changes
-    match crate::commands::plan::check_for_pending_changes(
+    // Create isolated test database using template for speed
+    println!("{} Creating isolated test database...", "→".cyan());
+    let test_db = TestDatabase::new_with_template(
+        &connection_string,
         config.migrations_dir.clone(),
         config.code_dir.clone(),
-        connection_string.clone(),
-    ).await {
-        Ok((has_changes, change_count)) => {
-            if has_changes {
-                println!();
-                println!("{} {} You have {} unapplied change{}!", 
-                    "⚠️ ".yellow().bold(),
-                    "WARNING:".yellow().bold(),
-                    change_count.to_string().yellow().bold(),
-                    if change_count == 1 { "" } else { "s" }
-                );
-                println!("   Run {} to apply your changes before running tests.", 
-                    "'pgmg apply'".cyan().bold()
-                );
-                println!("   Proceeding with tests against current database state...");
-                println!();
-            }
-        }
-        Err(e) => {
-            // Don't fail tests if we can't check for changes
-            eprintln!("{} Failed to check for pending changes: {}", 
-                "Warning:".yellow(), e);
-        }
-    }
+        config,
+    ).await?;
+    println!("  {} Created test database: {}", "✓".green(), test_db.name);
     
-    // Connect to database
-    let (client, connection) = connect_with_url(&connection_string).await?;
+    // Connect to test database
+    let (client, connection) = connect_with_url(&test_db.connection_string).await?;
     
     // Spawn connection handler
     connection.spawn();
     
-    // Check if pgTAP is available
-    check_pgtap_availability(&client).await?;
-    
-    let mut test_results = Vec::new();
-    let mut total_passed = 0;
-    let mut total_failed = 0;
-    let mut total_skipped = 0;
-    let mut total_run = 0;
-    
-    // Run each test file
-    for test_file in test_files {
-        // Display relative path from current directory
-        let display_path = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| test_file.strip_prefix(cwd).ok())
-            .unwrap_or(&test_file);
-        if !quiet {
-            println!("\n{} Running {}", "→".cyan(), display_path.display().to_string().bright_blue());
-        }
+    // Run tests in a block to ensure cleanup happens even on error
+    let test_result = async {
+        // Check if pgTAP is available
+        check_pgtap_availability(&client).await?;
         
-        let file_result = run_test_file(&client, &test_file, tap_output, quiet).await?;
+        let mut test_results = Vec::new();
+        let mut total_passed = 0;
+        let mut total_failed = 0;
+        let mut total_skipped = 0;
+        let mut total_run = 0;
         
-        total_run += file_result.test_count;
-        total_passed += file_result.passed_count;
-        total_failed += file_result.failed_count;
-        total_skipped += file_result.skipped_count;
-        
-        // Print immediate results if requested and not in quiet mode
-        if show_immediate_results && !quiet {
-            if file_result.passed {
-                println!("  {} {} tests passed", "✓".green(), file_result.test_count);
-            } else {
-                println!("  {} {} tests failed", "✗".red(), file_result.failed_count);
+        // Run each test file
+        for test_file in test_files {
+            // Display relative path from current directory
+            let display_path = std::env::current_dir()
+                .ok()
+                .and_then(|cwd| test_file.strip_prefix(cwd).ok())
+                .unwrap_or(&test_file);
+            if !quiet {
+                println!("\n{} Running {}", "→".cyan(), display_path.display().to_string().bright_blue());
             }
+            
+            let file_result = run_test_file(&client, &test_file, tap_output, quiet).await?;
+            
+            total_run += file_result.test_count;
+            total_passed += file_result.passed_count;
+            total_failed += file_result.failed_count;
+            total_skipped += file_result.skipped_count;
+            
+            // Print immediate results if requested and not in quiet mode
+            if show_immediate_results && !quiet {
+                if file_result.passed {
+                    println!("  {} {} tests passed", "✓".green(), file_result.test_count);
+                } else {
+                    println!("  {} {} tests failed", "✗".red(), file_result.failed_count);
+                }
+            }
+            
+            test_results.push(file_result);
+            
+            // Clean up any aborted transaction before next test file
+            // This ensures each test file starts with a clean connection state
+            let _ = client.simple_query("ROLLBACK").await;
         }
         
-        test_results.push(file_result);
-        
-        // Clean up any aborted transaction before next test file
-        // This ensures each test file starts with a clean connection state
-        let _ = client.simple_query("ROLLBACK").await;
+        Ok::<_, Box<dyn std::error::Error>>(TestResult {
+            tests_run: total_run,
+            tests_passed: total_passed,
+            tests_failed: total_failed,
+            tests_skipped: total_skipped,
+            test_files: test_results,
+            duration: start_time.elapsed(),
+        })
+    }.await;
+    
+    // Clean up test database regardless of test outcome
+    println!("\n{} Cleaning up test database...", "→".cyan());
+    if let Err(e) = test_db.cleanup().await {
+        eprintln!("{} Failed to drop test database: {}", "Warning:".yellow(), e);
+    } else {
+        println!("  {} Test database dropped", "✓".green());
     }
     
-    let duration = start_time.elapsed();
-    
-    Ok(TestResult {
-        tests_run: total_run,
-        tests_passed: total_passed,
-        tests_failed: total_failed,
-        tests_skipped: total_skipped,
-        test_files: test_results,
-        duration,
-    })
+    // Return the test result (propagating any errors)
+    test_result
 }
 
 fn discover_test_files(path: Option<PathBuf>) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
