@@ -3,6 +3,7 @@ use std::env;
 use crate::db::tls::{TlsMode, TlsConfig, connect_with_tls, PgConnection};
 use crate::error::{PgmgError, Result};
 use tracing::{info, debug};
+use percent_encoding::percent_decode_str;
 
 #[derive(Clone)]
 pub struct DatabaseConfig {
@@ -12,6 +13,31 @@ pub struct DatabaseConfig {
     pub password: String,
     pub database: String,
     pub tls_config: TlsConfig,
+}
+
+/// Escape a value for use in a tokio-postgres connection string
+/// Values with special characters are wrapped in single quotes,
+/// and single quotes and backslashes within are escaped
+fn escape_conn_value(value: &str) -> String {
+    // Check if value needs escaping - include more special characters that require quoting
+    if value.is_empty() || value.chars().any(|c| {
+        c.is_whitespace() || c == '\'' || c == '\\' || 
+        c == '"' || c == '=' || c == ' ' || c == '\t' || 
+        c == '\n' || c == '\r' || c == '{' || c == '}' ||
+        c == '[' || c == ']' || c == ',' || c == ';' ||
+        c == '(' || c == ')' || c == '$' || c == '!' ||
+        c == '?' || c == '&' || c == '%' || c == '#' ||
+        c == '@' || c == '*' || c == '^' || c == '~' ||
+        c == '`' || c == '<' || c == '>' || c == '|'
+    }) {
+        // Escape backslashes and single quotes
+        let escaped = value
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'");
+        format!("'{}'", escaped)
+    } else {
+        value.to_string()
+    }
 }
 
 impl DatabaseConfig {
@@ -26,9 +52,21 @@ impl DatabaseConfig {
 
         let host = parsed_url.host_str().unwrap_or("localhost").to_string();
         let port = parsed_url.port().unwrap_or(5432);
-        let user = parsed_url.username().to_string();
-        let password = parsed_url.password().unwrap_or("").to_string();
-        let database = parsed_url.path().trim_start_matches('/').to_string();
+        let user = percent_decode_str(parsed_url.username())
+            .decode_utf8()
+            .unwrap_or_else(|_| std::borrow::Cow::Borrowed(parsed_url.username()))
+            .to_string();
+        let password = parsed_url.password()
+            .map(|p| percent_decode_str(p)
+                .decode_utf8()
+                .unwrap_or_else(|_| std::borrow::Cow::Borrowed(p))
+                .to_string())
+            .unwrap_or_default();
+        let database = percent_decode_str(parsed_url.path().trim_start_matches('/'))
+            .decode_utf8()
+            .unwrap_or_else(|_| std::borrow::Cow::Borrowed(parsed_url.path().trim_start_matches('/')))
+            .to_string();
+        
         
         // Parse TLS configuration from query parameters
         let mut tls_config = TlsConfig::default();
@@ -85,12 +123,19 @@ impl DatabaseConfig {
         let base = if self.password.is_empty() {
             format!(
                 "host={} port={} user={} dbname={}",
-                self.host, self.port, self.user, self.database
+                escape_conn_value(&self.host), 
+                self.port, 
+                escape_conn_value(&self.user), 
+                escape_conn_value(&self.database)
             )
         } else {
             format!(
                 "host={} port={} user={} password={} dbname={}",
-                self.host, self.port, self.user, self.password, self.database
+                escape_conn_value(&self.host), 
+                self.port, 
+                escape_conn_value(&self.user), 
+                escape_conn_value(&self.password), 
+                escape_conn_value(&self.database)
             )
         };
         

@@ -296,11 +296,28 @@ async fn detect_object_changes(
     
     let mut file_object_set: HashSet<String> = HashSet::new();
     
+    // Build set of all file objects first
+    for file_obj in file_objects {
+        let key = format!("{:?}:{}", file_obj.object_type,
+            format_qualified_name(&file_obj.qualified_name));
+        file_object_set.insert(key);
+    }
+    
+    // Check for deleted objects first (in database but not in files)
+    for (key, db_obj) in &db_object_map {
+        if !file_object_set.contains(key) {
+            changes.push(ChangeOperation::DeleteObject {
+                object_type: db_obj.object_type.clone(),
+                object_name: format_qualified_name(&db_obj.object_name),
+                reason: "Object no longer exists in code".to_string(),
+            });
+        }
+    }
+    
     // Check for new or updated objects
     for file_obj in file_objects {
         let key = format!("{:?}:{}", file_obj.object_type,
             format_qualified_name(&file_obj.qualified_name));
-        file_object_set.insert(key.clone());
         
         let new_hash = calculate_ddl_hash(&file_obj.ddl_statement);
         
@@ -321,7 +338,15 @@ async fn detect_object_changes(
                 if matches!(file_obj.object_type, ObjectType::Function | ObjectType::Procedure) {
                     let func_name = format_qualified_name(&file_obj.qualified_name);
                     if let Some(existing_funcs) = db_functions_by_name.get(&func_name) {
-                        if !existing_funcs.is_empty() {
+                        // Check if any non-deleted functions/procedures exist with this name
+                        let has_non_deleted_overload = existing_funcs.iter().any(|db_obj| {
+                            !changes.iter().any(|change| {
+                                matches!(change, ChangeOperation::DeleteObject { object_type, object_name, .. } 
+                                    if object_type == &db_obj.object_type && object_name == &format_qualified_name(&db_obj.object_name))
+                            })
+                        });
+                        
+                        if has_non_deleted_overload {
                             let obj_type = if file_obj.object_type == ObjectType::Function { "Function" } else { "Procedure" };
                             return Err(format!(
                                 "{} '{}' already exists in the database. pgmg does not support function/procedure overloading. \
@@ -337,17 +362,6 @@ async fn detect_object_changes(
                     reason: "New object not in database".to_string(),
                 });
             }
-        }
-    }
-    
-    // Check for deleted objects (in database but not in files)
-    for (key, db_obj) in &db_object_map {
-        if !file_object_set.contains(key) {
-            changes.push(ChangeOperation::DeleteObject {
-                object_type: db_obj.object_type.clone(),
-                object_name: format_qualified_name(&db_obj.object_name),
-                reason: "Object no longer exists in code".to_string(),
-            });
         }
     }
     

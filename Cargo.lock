@@ -1404,6 +1404,7 @@ dependencies = [
  "notify",
  "once_cell",
  "owo-colors",
+ "percent-encoding",
  "petgraph 0.8.2",
  "pg_query",
  "postgres-types",

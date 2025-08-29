@@ -11,6 +11,12 @@ use color_eyre;
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
+    // Install default CryptoProvider for SSL support
+    #[cfg(feature = "tls")]
+    rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::ring::default_provider()
+    ).expect("Failed to install CryptoProvider");
+    
     // Parse CLI args first to get verbosity level
     let cli = Cli::parse_args();
     
