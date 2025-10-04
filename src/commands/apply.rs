@@ -1,9 +1,11 @@
 use std::path::PathBuf;
 use std::time::Duration;
+use std::collections::HashSet;
 use crate::db::{StateManager, connect_with_url, AdvisoryLockManager, AdvisoryLockError};
 use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file};
 use crate::commands::plan::{execute_plan, ChangeOperation};
 use crate::config::PgmgConfig;
+use crate::analysis::ObjectRef;
 use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification};
 use crate::plpgsql_check::{check_modified_functions, check_soft_dependent_functions, display_check_errors};
 use crate::error::format_postgres_error_with_details;
@@ -247,6 +249,109 @@ async fn execute_apply_internal(
     // Step 2: Start a transaction for all changes
     let transaction = client.transaction().await?;
 
+    // Step 2.5: Pre-drop managed objects if there are migrations
+    // This unblocks migrations that would otherwise be blocked by dependent objects
+    let mut pre_dropped_objects: HashSet<String> = HashSet::new();
+
+    if !plan_result.new_migrations.is_empty() && !plan_result.changes.is_empty() {
+        // Collect objects that need pre-dropping (updates and deletes)
+        let updates_to_predrop: Vec<&ChangeOperation> = plan_result.changes.iter()
+            .filter(|change| matches!(change, ChangeOperation::UpdateObject { .. }))
+            .collect();
+
+        let deletes_to_predrop: Vec<&ChangeOperation> = plan_result.changes.iter()
+            .filter(|change| matches!(change, ChangeOperation::DeleteObject { .. }))
+            .collect();
+
+        if !updates_to_predrop.is_empty() || !deletes_to_predrop.is_empty() {
+            if !test_mode {
+                println!("{} {} {}",
+                    "Pre-dropping".blue().bold(),
+                    (updates_to_predrop.len() + deletes_to_predrop.len()).to_string().yellow(),
+                    "managed objects to unblock migrations...".blue().bold()
+                );
+            }
+
+            // Get dependency order for proper dropping
+            let deletion_order = plan_result.dependency_graph.as_ref()
+                .and_then(|g| g.deletion_order().ok());
+
+            // Phase A: Drop objects for update (reverse dependency order)
+            if !updates_to_predrop.is_empty() {
+                let ordered_updates = order_changes_by_deletion(&updates_to_predrop, &deletion_order);
+
+                for change in ordered_updates {
+                    if let ChangeOperation::UpdateObject { object, .. } = change {
+                        match apply_drop_for_update(&transaction, object).await {
+                            Ok(_) => {
+                                // Track that we pre-dropped this object
+                                pre_dropped_objects.insert(format!("{:?}:{}",
+                                    object.object_type,
+                                    format_object_name(object)
+                                ));
+
+                                if !test_mode {
+                                    println!("  {} Pre-dropped {}: {} (will be recreated after migration)",
+                                        "✓".green().bold(),
+                                        format!("{:?}", object.object_type).to_lowercase().yellow(),
+                                        format_object_name(object).cyan()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                apply_result.errors.push(format!("Failed to pre-drop {} for update: {}", format_object_name(object), e));
+                                if !test_mode {
+                                    println!("  {} Failed to pre-drop {}: {}", "✗".red().bold(), format_object_name(object).cyan(), e.to_string().red());
+                                }
+                                transaction.rollback().await?;
+                                return Err("Pre-drop failed - all changes rolled back".into());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Phase B: Delete objects marked for deletion (reverse dependency order)
+            if !deletes_to_predrop.is_empty() {
+                let ordered_deletes = order_changes_by_deletion(&deletes_to_predrop, &deletion_order);
+
+                for change in ordered_deletes {
+                    if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
+                        match apply_delete_object(&transaction, object_type, object_name).await {
+                            Ok(_) => {
+                                // Track that we pre-dropped this object
+                                pre_dropped_objects.insert(format!("{:?}:{}", object_type, object_name));
+
+                                // Mark as deleted in result
+                                apply_result.objects_deleted.push(object_name.clone());
+
+                                if !test_mode {
+                                    println!("  {} Pre-dropped {}: {} (will be deleted)",
+                                        "✓".green().bold(),
+                                        format!("{:?}", object_type).to_lowercase().yellow(),
+                                        object_name.cyan()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                apply_result.errors.push(format!("Failed to pre-drop {}: {}", object_name, e));
+                                if !test_mode {
+                                    println!("  {} Failed to pre-drop {}: {}", "✗".red().bold(), object_name.cyan(), e.to_string().red());
+                                }
+                                transaction.rollback().await?;
+                                return Err("Pre-drop failed - all changes rolled back".into());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !test_mode && (!updates_to_predrop.is_empty() || !deletes_to_predrop.is_empty()) {
+                println!();  // Blank line for readability
+            }
+        }
+    }
+
     // Step 3: Apply migrations first (they need to be applied in order)
     if !plan_result.new_migrations.is_empty() {
         if !test_mode {
@@ -341,11 +446,17 @@ async fn execute_apply_internal(
             
             for change in ordered_updates_for_drop {
                 if transaction_aborted { break; }
-                
+
                 if let ChangeOperation::UpdateObject { object, .. } = change {
+                    // Skip if already pre-dropped
+                    let object_key = format!("{:?}:{}", object.object_type, format_object_name(object));
+                    if pre_dropped_objects.contains(&object_key) {
+                        continue;
+                    }
+
                     match apply_drop_for_update(&transaction, object).await {
                         Ok(_) => {
-                            println!("  {} Dropped {}: {} (for update)", 
+                            println!("  {} Dropped {}: {} (for update)",
                                 "✓".green().bold(),
                                 format!("{:?}", object.object_type).to_lowercase().yellow(),
                                 format_object_name(object).cyan()
@@ -379,12 +490,18 @@ async fn execute_apply_internal(
                 println!("  {}", "Processing comments first...".dimmed());
                 for change in comment_deletes {
                     if transaction_aborted { break; }
-                    
+
                     if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
+                        // Skip if already pre-dropped
+                        let object_key = format!("{:?}:{}", object_type, object_name);
+                        if pre_dropped_objects.contains(&object_key) {
+                            continue;
+                        }
+
                         match apply_delete_object(&transaction, object_type, object_name).await {
                             Ok(_) => {
                                 apply_result.objects_deleted.push(object_name.clone());
-                                println!("  {} Deleted {}: {}", 
+                                println!("  {} Deleted {}: {}",
                                     "✓".green().bold(),
                                     format!("{:?}", object_type).to_lowercase().yellow(),
                                     object_name.cyan()
@@ -439,12 +556,18 @@ async fn execute_apply_internal(
                 
                 for change in ordered_deletes {
                     if transaction_aborted { break; }
-                    
+
                     if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
+                        // Skip if already pre-dropped
+                        let object_key = format!("{:?}:{}", object_type, object_name);
+                        if pre_dropped_objects.contains(&object_key) {
+                            continue;
+                        }
+
                         match apply_delete_object(&transaction, object_type, object_name).await {
                             Ok(_) => {
                                 apply_result.objects_deleted.push(object_name.clone());
-                                println!("  {} Deleted {}: {}", 
+                                println!("  {} Deleted {}: {}",
                                     "✓".green().bold(),
                                     format!("{:?}", object_type).to_lowercase().yellow(),
                                     object_name.cyan()
@@ -1631,12 +1754,57 @@ fn should_skip_in_test_mode(sql: &str) -> bool {
 /// Check if a SQL statement is related to plpgsql_check and should be skipped on RDS
 fn should_skip_plpgsql_check_on_rds(sql: &str) -> bool {
     let sql_lower = sql.to_lowercase();
-    
+
     // Skip plpgsql_check extension creation
     if sql_lower.contains("plpgsql_check") {
         return true;
     }
-    
+
     false
+}
+
+/// Helper to order changes by deletion order from dependency graph
+fn order_changes_by_deletion<'a>(
+    changes: &[&'a ChangeOperation],
+    deletion_order: &Option<Vec<ObjectRef>>,
+) -> Vec<&'a ChangeOperation> {
+    if let Some(del_order) = deletion_order {
+        let mut ordered = Vec::new();
+        let mut added_indices = std::collections::HashSet::new();
+
+        // Add changes in the order specified by the dependency graph
+        for object_ref in del_order {
+            for (idx, change) in changes.iter().enumerate() {
+                let matches = match change {
+                    ChangeOperation::UpdateObject { object, .. } =>
+                        object.object_type == object_ref.object_type &&
+                        object.qualified_name == object_ref.qualified_name,
+                    ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                        let qname = crate::sql::QualifiedIdent::from_qualified_name(object_name);
+                        object_type == &object_ref.object_type && qname == object_ref.qualified_name
+                    }
+                    _ => false,
+                };
+
+                if matches && !added_indices.contains(&idx) {
+                    ordered.push(*change);
+                    added_indices.insert(idx);
+                    break;
+                }
+            }
+        }
+
+        // Add any changes not in dependency graph at the end
+        for (idx, change) in changes.iter().enumerate() {
+            if !added_indices.contains(&idx) {
+                ordered.push(*change);
+            }
+        }
+
+        ordered
+    } else {
+        // No dependency order available, return as-is
+        changes.to_vec()
+    }
 }
 
