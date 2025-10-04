@@ -491,8 +491,39 @@ pub fn print_plan_summary(plan: &PlanResult) {
         for migration in &plan.new_migrations {
             println!("  {} {}", "+".green().bold(), migration.cyan());
         }
+
+        // Show objects that will be pre-dropped before migrations
+        let objects_to_predrop: Vec<_> = plan.changes.iter()
+            .filter(|c| matches!(c,
+                ChangeOperation::UpdateObject { .. } |
+                ChangeOperation::DeleteObject { .. }
+            ))
+            .collect();
+
+        if !objects_to_predrop.is_empty() {
+            println!("\n  {}:", "Objects to pre-drop before migrations".dimmed());
+            for change in objects_to_predrop {
+                match change {
+                    ChangeOperation::UpdateObject { object, .. } => {
+                        println!("    {} {} {} (will be recreated)",
+                            "↓".yellow(),
+                            format!("{:?}", object.object_type).to_lowercase().dimmed(),
+                            format_qualified_name(&object.qualified_name).cyan()
+                        );
+                    }
+                    ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                        println!("    {} {} {} (will be deleted)",
+                            "↓".red(),
+                            format!("{:?}", object_type).to_lowercase().dimmed(),
+                            object_name.cyan()
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
-    
+
     if !plan.changes.is_empty() {
         println!("\n{}:", "Object Changes".bold());
         
