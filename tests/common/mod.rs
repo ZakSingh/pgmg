@@ -224,11 +224,11 @@ impl TestEnvironment {
     pub async fn get_applied_migrations(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let rows = self.client
             .query(
-                "SELECT name FROM pgmg_migrations ORDER BY name",
+                "SELECT name FROM pgmg.pgmg_migrations ORDER BY name",
                 &[],
             )
             .await?;
-        
+
         Ok(rows.into_iter().map(|row| row.get(0)).collect())
     }
     
@@ -236,7 +236,7 @@ impl TestEnvironment {
     pub async fn get_tracked_objects(&self) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
         let rows = self.client
             .query(
-                "SELECT object_type, object_name FROM pgmg_state ORDER BY object_name",
+                "SELECT object_type, object_name FROM pgmg.pgmg_state ORDER BY object_name",
                 &[],
             )
             .await?;

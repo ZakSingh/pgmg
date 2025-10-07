@@ -60,8 +60,8 @@ impl ObjectLoadedNotification {
 }
 
 /// Emit a NOTIFY event for an object that was loaded
-pub async fn emit_object_loaded_notification(
-    client: &tokio_postgres::Transaction<'_>,
+pub async fn emit_object_loaded_notification<C: tokio_postgres::GenericClient>(
+    client: &C,
     notification: &ObjectLoadedNotification,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let payload = notification.to_json()?;

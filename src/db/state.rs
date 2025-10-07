@@ -191,6 +191,15 @@ impl<'a> StateManager<'a> {
         Ok(objects)
     }
 
+    /// Check if database has no applied migrations (fresh build)
+    pub async fn is_empty(&self) -> Result<bool, Box<dyn std::error::Error>> {
+        let count: i64 = self.client.query_one(
+            "SELECT COUNT(*) FROM pgmg.pgmg_migrations",
+            &[],
+        ).await?.get(0);
+        Ok(count == 0)
+    }
+
     /// Update or insert an object's hash
     pub async fn update_object_hash(
         &self,

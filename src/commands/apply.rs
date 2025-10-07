@@ -3,13 +3,14 @@ use std::time::Duration;
 use std::collections::HashSet;
 use crate::db::{StateManager, connect_with_url, AdvisoryLockManager, AdvisoryLockError};
 use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file};
-use crate::commands::plan::{execute_plan, ChangeOperation};
+use crate::commands::plan::{execute_plan, ChangeOperation, PlanResult};
 use crate::config::PgmgConfig;
 use crate::analysis::ObjectRef;
 use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification};
 use crate::plpgsql_check::{check_modified_functions, check_soft_dependent_functions, display_check_errors};
 use crate::error::format_postgres_error_with_details;
 use tracing::{info, warn, debug, error};
+use tokio_postgres::GenericClient;
 
 #[cfg(feature = "cli")]
 use owo_colors::OwoColorize;
@@ -246,9 +247,47 @@ async fn execute_apply_internal(
         return Ok(apply_result);
     }
 
-    // Step 2: Start a transaction for all changes
-    let transaction = client.transaction().await?;
+    // Step 2: Determine if we should use transaction mode
+    // Use auto-commit mode for fresh builds and test mode
+    // This allows ALTER TYPE ADD VALUE and other non-transactional DDL
+    let is_fresh_build = state_manager.is_empty().await?;
+    let use_transaction = !test_mode && !is_fresh_build;
 
+    if !test_mode {
+        if use_transaction {
+            println!("{}", "Running in transactional mode (safe rollback on error)".dimmed());
+        } else {
+            println!("{}", "Running in auto-commit mode (fresh build detected)".yellow());
+            println!("{}", "  Note: Changes cannot be rolled back".yellow().dimmed());
+        }
+    }
+
+    // Step 3: Execute changes in either transaction or auto-commit mode
+    if use_transaction {
+        let transaction = client.transaction().await?;
+        execute_all_changes(&transaction, &mut apply_result, &plan_result,
+                           &migrations_dir, &code_dir, config, test_mode).await?;
+        transaction.commit().await?;
+        print_apply_success_message(&apply_result, test_mode);
+    } else {
+        execute_all_changes(client, &mut apply_result, &plan_result,
+                           &migrations_dir, &code_dir, config, test_mode).await?;
+        print_apply_success_message(&apply_result, test_mode);
+    }
+
+    Ok(apply_result)
+}
+
+// Helper function to execute all changes using GenericClient (works with both Transaction and Client)
+async fn execute_all_changes<C: GenericClient>(
+    client: &C,
+    apply_result: &mut ApplyResult,
+    plan_result: &PlanResult,
+    migrations_dir: &Option<PathBuf>,
+    _code_dir: &Option<PathBuf>,
+    config: &PgmgConfig,
+    test_mode: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Step 2.5: Pre-drop managed objects if there are migrations
     // This unblocks migrations that would otherwise be blocked by dependent objects
     let mut pre_dropped_objects: HashSet<String> = HashSet::new();
@@ -282,7 +321,7 @@ async fn execute_apply_internal(
 
                 for change in ordered_updates {
                     if let ChangeOperation::UpdateObject { object, .. } = change {
-                        match apply_drop_for_update(&transaction, object).await {
+                        match apply_drop_for_update(client, object).await {
                             Ok(_) => {
                                 // Track that we pre-dropped this object
                                 pre_dropped_objects.insert(format!("{:?}:{}",
@@ -303,8 +342,7 @@ async fn execute_apply_internal(
                                 if !test_mode {
                                     println!("  {} Failed to pre-drop {}: {}", "✗".red().bold(), format_object_name(object).cyan(), e.to_string().red());
                                 }
-                                transaction.rollback().await?;
-                                return Err("Pre-drop failed - all changes rolled back".into());
+                                return Err("Pre-drop failed".into());
                             }
                         }
                     }
@@ -317,7 +355,7 @@ async fn execute_apply_internal(
 
                 for change in ordered_deletes {
                     if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
-                        match apply_delete_object(&transaction, object_type, object_name).await {
+                        match apply_delete_object(client, object_type, object_name).await {
                             Ok(_) => {
                                 // Track that we pre-dropped this object
                                 pre_dropped_objects.insert(format!("{:?}:{}", object_type, object_name));
@@ -338,8 +376,7 @@ async fn execute_apply_internal(
                                 if !test_mode {
                                     println!("  {} Failed to pre-drop {}: {}", "✗".red().bold(), object_name.cyan(), e.to_string().red());
                                 }
-                                transaction.rollback().await?;
-                                return Err("Pre-drop failed - all changes rolled back".into());
+                                return Err("Pre-drop failed".into());
                             }
                         }
                     }
@@ -360,7 +397,7 @@ async fn execute_apply_internal(
         
         if let Some(ref migrations_dir) = migrations_dir {
             for migration_name in &plan_result.new_migrations {
-                match apply_migration(&transaction, migrations_dir, migration_name, test_mode).await {
+                match apply_migration(client, migrations_dir, migration_name, test_mode).await {
                     Ok(_) => {
                         apply_result.migrations_applied.push(migration_name.clone());
                         if !test_mode {
@@ -381,12 +418,11 @@ async fn execute_apply_internal(
 
     // Check for migration errors before proceeding to object changes
     if !apply_result.errors.is_empty() {
-        transaction.rollback().await?;
-        eprintln!("\n{} {} {}", "Rolled back due to".red().bold(), apply_result.errors.len().to_string().yellow(), "migration error:".red().bold());
+        eprintln!("\n{} {} {}", "Failed due to".red().bold(), apply_result.errors.len().to_string().yellow(), "migration error:".red().bold());
         for error in &apply_result.errors {
             eprintln!("{}", error);
         }
-        return Err("Migration failed - all changes rolled back".into());
+        return Err("Migration failed".into());
     }
 
     // Track modified objects for plpgsql_check
@@ -454,7 +490,7 @@ async fn execute_apply_internal(
                         continue;
                     }
 
-                    match apply_drop_for_update(&transaction, object).await {
+                    match apply_drop_for_update(client, object).await {
                         Ok(_) => {
                             println!("  {} Dropped {}: {} (for update)",
                                 "✓".green().bold(),
@@ -498,7 +534,7 @@ async fn execute_apply_internal(
                             continue;
                         }
 
-                        match apply_delete_object(&transaction, object_type, object_name).await {
+                        match apply_delete_object(client, object_type, object_name).await {
                             Ok(_) => {
                                 apply_result.objects_deleted.push(object_name.clone());
                                 println!("  {} Deleted {}: {}",
@@ -564,7 +600,7 @@ async fn execute_apply_internal(
                             continue;
                         }
 
-                        match apply_delete_object(&transaction, object_type, object_name).await {
+                        match apply_delete_object(client, object_type, object_name).await {
                             Ok(_) => {
                                 apply_result.objects_deleted.push(object_name.clone());
                                 println!("  {} Deleted {}: {}",
@@ -620,7 +656,7 @@ async fn execute_apply_internal(
             for (object, is_update) in all_creates {
                 if transaction_aborted { break; }
                 
-                match apply_create_object(&transaction, object, config, test_mode).await {
+                match apply_create_object(client, object, config, test_mode).await {
                     Ok(_) => {
                         // Track modified objects for plpgsql_check
                         modified_objects.push(object);
@@ -670,14 +706,13 @@ async fn execute_apply_internal(
         }
     }
 
-    // Handle SQL errors with rollback first
+    // Handle SQL errors
     if !apply_result.errors.is_empty() {
-        transaction.rollback().await?;
-        eprintln!("{} {} {}", "Rolled back due to".red().bold(), apply_result.errors.len().to_string().yellow(), "errors:".red().bold());
+        eprintln!("{} {} {}", "Failed due to".red().bold(), apply_result.errors.len().to_string().yellow(), "errors:".red().bold());
         for error in &apply_result.errors {
             eprintln!("  {} {}", "-".red().bold(), error.red());
         }
-        return Err("Apply operation failed - all changes rolled back".into());
+        return Err("Apply operation failed".into());
     }
     
     // Step 4.5: Run plpgsql_check on modified functions if in development mode
@@ -690,7 +725,7 @@ async fn execute_apply_internal(
         let mut all_plpgsql_errors = Vec::new();
         
         // Check the modified functions themselves using the transaction
-        match check_modified_functions(&transaction, &modified_objects).await {
+        match check_modified_functions(client, &modified_objects).await {
             Ok(mut check_errors) => {
                 for error in &check_errors {
                     if let Some(level) = &error.check_result.level {
@@ -713,7 +748,7 @@ async fn execute_apply_internal(
         // Also check soft dependents if we have a dependency graph
         if let Some(ref dependency_graph) = plan_result.dependency_graph {
             match check_soft_dependent_functions(
-                &transaction,
+                client,
                 dependency_graph, 
                 &modified_objects,
                 &plan_result.file_objects
@@ -743,32 +778,23 @@ async fn execute_apply_internal(
             display_check_errors(&all_plpgsql_errors);
         }
         
-        // If there are plpgsql_check errors, rollback and fail
+        // If there are plpgsql_check errors, fail
         if apply_result.plpgsql_errors_found > 0 {
-            transaction.rollback().await?;
-            eprintln!("\n{} {} {}", 
-                "Apply blocked due to".red().bold(), 
-                apply_result.plpgsql_errors_found.to_string().yellow(), 
-                "PL/pgSQL errors. All changes rolled back. Fix the errors above and try again.".red().bold()
+            eprintln!("\n{} {} {}",
+                "Apply blocked due to".red().bold(),
+                apply_result.plpgsql_errors_found.to_string().yellow(),
+                "PL/pgSQL errors. Fix the errors above and try again.".red().bold()
             );
             return Err("Apply operation blocked due to PL/pgSQL compilation errors".into());
         }
-        
-        // If plpgsql_check passed, commit the transaction
-        transaction.commit().await?;
-        print_apply_success_message(&apply_result, test_mode);
-    } else {
-        // Step 5: Commit transaction if no plpgsql_check
-        transaction.commit().await?;
-        print_apply_success_message(&apply_result, test_mode);
     }
 
-    Ok(apply_result)
+    Ok(())
 }
 
 
-async fn apply_migration(
-    client: &tokio_postgres::Transaction<'_>,
+async fn apply_migration<C: GenericClient>(
+    client: &C,
     migrations_dir: &PathBuf,
     migration_name: &str,
     test_mode: bool,
@@ -780,7 +806,7 @@ async fn apply_migration(
     let statements = split_sql_file(&migration_content)?;
     
     // Check if we're on AWS RDS once at the beginning
-    let is_rds = is_aws_rds(client.client()).await;
+    let is_rds = is_aws_rds(client).await;
     if is_rds {
         info!("Detected AWS RDS environment - will skip plpgsql_check related statements");
     }
@@ -826,8 +852,8 @@ async fn apply_migration(
     Ok(())
 }
 
-async fn apply_create_object(
-    client: &tokio_postgres::Transaction<'_>,
+async fn apply_create_object<C: GenericClient>(
+    client: &C,
     object: &SqlObject,
     config: &PgmgConfig,
     test_mode: bool,
@@ -843,10 +869,10 @@ async fn apply_create_object(
     
     // Update state tracking with object hash
     let ddl_hash = calculate_ddl_hash(&object.ddl_statement);
-    update_object_hash_in_transaction(client, &object.object_type, &object.qualified_name, &ddl_hash).await?;
+    update_object_hash(client, &object.object_type, &object.qualified_name, &ddl_hash).await?;
     
     // Store object dependencies
-    store_object_dependencies_in_transaction(client, &object.object_type, &object.qualified_name, &object.dependencies).await?;
+    store_object_dependencies(client, &object.object_type, &object.qualified_name, &object.dependencies).await?;
     
     // Emit NOTIFY event if in development mode
     if config.development_mode.unwrap_or(false) && config.emit_notify_events.unwrap_or(false) {
@@ -866,8 +892,8 @@ async fn apply_create_object(
     Ok(())
 }
 
-async fn apply_drop_for_update(
-    client: &tokio_postgres::Transaction<'_>,
+async fn apply_drop_for_update<C: GenericClient>(
+    client: &C,
     object: &SqlObject,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Handle special cases for object types that can't be dropped normally
@@ -929,8 +955,8 @@ async fn apply_drop_for_update(
     Ok(())
 }
 
-async fn apply_delete_object(
-    client: &tokio_postgres::Transaction<'_>,
+async fn apply_delete_object<C: GenericClient>(
+    client: &C,
     object_type: &ObjectType,
     object_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -959,7 +985,7 @@ async fn apply_delete_object(
         
         // Always remove from state tracking, regardless of whether the SQL succeeded
         // This ensures we don't try to delete non-existent comments repeatedly
-        remove_object_from_state_in_transaction(client, object_type, &qualified_name).await?;
+        remove_object_from_state(client, object_type, &qualified_name).await?;
         return Ok(());
     } else if matches!(object_type, ObjectType::Function | ObjectType::Procedure | ObjectType::Aggregate | ObjectType::Operator) {
         // For functions, procedures, aggregates, and operators, drop all existing overloads
@@ -1028,7 +1054,7 @@ async fn apply_delete_object(
     }
     
     // Remove from state tracking
-    remove_object_from_state_in_transaction(client, object_type, &qualified_name).await?;
+    remove_object_from_state(client, object_type, &qualified_name).await?;
     
     Ok(())
 }
@@ -1178,8 +1204,8 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
     }
 }
 
-async fn update_object_hash_in_transaction(
-    client: &tokio_postgres::Transaction<'_>,
+async fn update_object_hash<C: GenericClient>(
+    client: &C,
     object_type: &ObjectType,
     object_name: &crate::sql::QualifiedIdent,
     ddl_hash: &str,
@@ -1218,8 +1244,8 @@ async fn update_object_hash_in_transaction(
     Ok(())
 }
 
-async fn store_object_dependencies_in_transaction(
-    client: &tokio_postgres::Transaction<'_>,
+async fn store_object_dependencies<C: GenericClient>(
+    client: &C,
     object_type: &ObjectType,
     object_name: &crate::sql::QualifiedIdent,
     dependencies: &crate::sql::Dependencies,
@@ -1308,8 +1334,8 @@ async fn store_object_dependencies_in_transaction(
     Ok(())
 }
 
-async fn remove_object_from_state_in_transaction(
-    client: &tokio_postgres::Transaction<'_>,
+async fn remove_object_from_state<C: GenericClient>(
+    client: &C,
     object_type: &ObjectType,
     object_name: &crate::sql::QualifiedIdent,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1404,8 +1430,8 @@ async fn remove_object_from_state_in_transaction(
     Ok(())
 }
 
-async fn get_object_oid(
-    client: &tokio_postgres::Transaction<'_>,
+async fn get_object_oid<C: GenericClient>(
+    client: &C,
     object_type: &ObjectType,
     qualified_name: &crate::sql::QualifiedIdent,
 ) -> Result<u32, Box<dyn std::error::Error>> {
@@ -1516,8 +1542,8 @@ fn format_object_name(object: &SqlObject) -> String {
 }
 
 
-async fn get_trigger_table_from_dependencies(
-    client: &tokio_postgres::Transaction<'_>,
+async fn get_trigger_table_from_dependencies<C: GenericClient>(
+    client: &C,
     trigger_name: &crate::sql::QualifiedIdent,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let qualified_trigger_name = match &trigger_name.schema {
@@ -1542,8 +1568,8 @@ async fn get_trigger_table_from_dependencies(
     Ok(table_name)
 }
 
-async fn get_existing_function_signatures(
-    client: &tokio_postgres::Transaction<'_>,
+async fn get_existing_function_signatures<C: GenericClient>(
+    client: &C,
     object_type: &ObjectType,
     qualified_name: &crate::sql::QualifiedIdent,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -1714,9 +1740,9 @@ fn quote_identifier(name: &str) -> String {
 }
 
 /// Check if we're running on AWS RDS by looking for the rdsadmin database
-async fn is_aws_rds(client: &tokio_postgres::Client) -> bool {
+async fn is_aws_rds<C: GenericClient>(client: &C) -> bool {
     match client.query_one(
-        "SELECT 1 FROM pg_database WHERE datname = 'rdsadmin'", 
+        "SELECT 1 FROM pg_database WHERE datname = 'rdsadmin'",
         &[]
     ).await {
         Ok(_) => true,
