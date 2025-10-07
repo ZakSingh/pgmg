@@ -129,7 +129,7 @@ async fn test_apply_updates_modified_objects() -> Result<(), Box<dyn std::error:
     
     // Track it with old hash
     env.execute_sql(indoc! {r#"
-        INSERT INTO pgmg_state (object_type, object_name, ddl_hash)
+        INSERT INTO pgmg.pgmg_state (object_type, object_name, ddl_hash)
         VALUES ('view', 'user_stats', 'old_hash');
     "#}).await?;
     
@@ -179,8 +179,8 @@ async fn test_apply_deletes_removed_objects() -> Result<(), Box<dyn std::error::
     
     // Track both objects
     env.execute_sql(indoc! {r#"
-        INSERT INTO pgmg_state (object_type, object_name, ddl_hash)
-        VALUES 
+        INSERT INTO pgmg.pgmg_state (object_type, object_name, ddl_hash)
+        VALUES
             ('view', 'to_delete', 'hash1'),
             ('view', 'to_keep', 'hash2');
     "#}).await?;
@@ -217,11 +217,21 @@ async fn test_apply_deletes_removed_objects() -> Result<(), Box<dyn std::error::
 #[tokio::test]
 async fn test_apply_rollback_on_migration_error() -> Result<(), Box<dyn std::error::Error>> {
     let env = TestEnvironment::new().await?;
-    
+
+    // Pre-seed database with a successful migration so it's not a "fresh build"
+    // This ensures transaction mode is used for rollback testing
+    env.write_migration("000_init", "SELECT 1;").await?;
+    execute_apply(
+        Some(env.migrations_dir.clone()),
+        None,
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+
     // Create migrations - second one has error
     env.write_migration("001_good", fixtures::sql::CREATE_USERS_TABLE).await?;
     env.write_migration("002_bad", fixtures::migrations::MIGRATION_WITH_ERROR).await?;
-    
+
     // Execute apply - should fail
     let result = execute_apply(
         Some(env.migrations_dir.clone()),
@@ -229,32 +239,43 @@ async fn test_apply_rollback_on_migration_error() -> Result<(), Box<dyn std::err
         env.connection_string.clone(),
         &PgmgConfig::default(),
     ).await;
-    
+
     // Should have failed
     assert!(result.is_err());
-    
+
     // Verify nothing was applied (transaction rolled back)
     assert!(!env.table_exists("users").await?);
     assert!(!env.table_exists("test_table").await?);
-    
-    // Verify no migrations were recorded
+
+    // Verify only the initial migration was recorded (not the failed ones)
     let applied = env.get_applied_migrations().await?;
-    assert_eq!(applied.len(), 0);
-    
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0], "000_init");
+
     Ok(())
 }
 
 #[tokio::test]
 async fn test_apply_rollback_on_object_error() -> Result<(), Box<dyn std::error::Error>> {
     let env = TestEnvironment::new().await?;
-    
+
+    // Pre-seed database with a successful migration so it's not a "fresh build"
+    // This ensures transaction mode is used for rollback testing
+    env.write_migration("000_init", "SELECT 1;").await?;
+    execute_apply(
+        Some(env.migrations_dir.clone()),
+        None,
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+
     // Create valid and invalid SQL files
     env.write_sql_file("users.sql", fixtures::sql::CREATE_USERS_TABLE).await?;
     env.write_sql_file("bad_view.sql", indoc! {r#"
         CREATE VIEW bad_view AS
         SELECT * FROM non_existent_table;
     "#}).await?;
-    
+
     // Execute apply - should fail
     let result = execute_apply(
         None,
@@ -262,18 +283,18 @@ async fn test_apply_rollback_on_object_error() -> Result<(), Box<dyn std::error:
         env.connection_string.clone(),
         &PgmgConfig::default(),
     ).await;
-    
+
     // Should have failed
     assert!(result.is_err());
-    
+
     // Verify nothing was created (transaction rolled back)
     assert!(!env.table_exists("users").await?);
     assert!(!env.view_exists("bad_view").await?);
-    
+
     // Verify no objects were tracked
     let tracked = env.get_tracked_objects().await?;
     assert_eq!(tracked.len(), 0);
-    
+
     Ok(())
 }
 
