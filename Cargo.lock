@@ -1377,6 +1377,7 @@ dependencies = [
 [[package]]
 name = "pg_query"
 version = "6.1.0"
+source = "git+https://github.com/ZakSingh/pg_query.git?branch=fix-typecast-node-traversal#147b7c4e4377c3bdf204e899a5cb9a34b75d0569"
 dependencies = [
  "bindgen 0.66.1",
  "cc",
