@@ -1,24 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="SqlDialectMappings">
-    <file url="file://$PROJECT_DIR$/migrations/00_currency.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/00_extensions.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/00_init.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/00_mq.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/00_schema.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/01_auth.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/03_seller_info.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/04_category.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/05_product.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/06_item.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/07_purchase.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/08_feedback.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/10_exchange_rate.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/11_wishlist.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/migrations/13_image.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/sql/api/account/contact.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/sql/api/get_account_by_id.sql" dialect="PostgreSQL" />
-    <file url="file://$PROJECT_DIR$/sql/api/purchase/orders.sql" dialect="PostgreSQL" />
     <file url="PROJECT" dialect="PostgreSQL" />
   </component>
 </project>

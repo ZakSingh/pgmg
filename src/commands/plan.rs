@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use crate::db::{StateManager, connect_with_url, scan_sql_files, scan_migrations};
-use crate::sql::{SqlObject, ObjectType, objects::calculate_ddl_hash};
+use crate::sql::{SqlObject, ObjectType, QualifiedIdent, objects::calculate_ddl_hash, extract_altered_tables};
 use crate::analysis::{DependencyGraph, ObjectRef};
 use crate::BuiltinCatalog;
 #[cfg(feature = "cli")]
@@ -93,10 +93,82 @@ pub async fn execute_plan(
         let db_objects = state_manager.get_tracked_objects().await?;
         
         let mut object_changes = detect_object_changes(&file_objects, &db_objects).await?;
-        
+
         // Store file objects in the result
         plan_result.file_objects = file_objects.clone();
-        
+
+        // Step 2.5: Analyze migrations for tables they will alter
+        // Find managed objects that depend on these tables and mark them for update
+        if !plan_result.new_migrations.is_empty() {
+            if let Some(migrations_dir) = &migrations_dir {
+                let mut affected_tables: HashSet<QualifiedIdent> = HashSet::new();
+
+                for migration_name in &plan_result.new_migrations {
+                    let path = migrations_dir.join(format!("{}.sql", migration_name));
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        if let Ok(tables) = extract_altered_tables(&content) {
+                            affected_tables.extend(tables);
+                        }
+                    }
+                }
+
+                if !affected_tables.is_empty() {
+                    debug!("Migrations alter {} tables", affected_tables.len());
+                    for table in &affected_tables {
+                        debug!("  - {}", format_qualified_name(table));
+                    }
+
+                    // Convert to "schema.table" format for database query
+                    let table_names: Vec<String> = affected_tables.iter()
+                        .map(|t| format_qualified_name(t))
+                        .collect();
+
+                    // Find all managed objects depending on these tables
+                    let dependents = state_manager
+                        .find_dependents_of_relations(&table_names)
+                        .await?;
+
+                    debug!("Found {} managed objects depending on altered tables", dependents.len());
+
+                    // Add these as UpdateObject operations (to trigger pre-drop/recreate)
+                    for (obj_type, obj_name) in dependents {
+                        let obj_qualified = QualifiedIdent::from_qualified_name(&obj_name);
+
+                        // Skip if already in changes
+                        let already_included = object_changes.iter().any(|change| match change {
+                            ChangeOperation::UpdateObject { object, .. } |
+                            ChangeOperation::CreateObject { object, .. } => {
+                                object.object_type == obj_type &&
+                                object.qualified_name == obj_qualified
+                            }
+                            ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                                let qname = QualifiedIdent::from_qualified_name(object_name);
+                                object_type == &obj_type && qname == obj_qualified
+                            }
+                            _ => false,
+                        });
+
+                        if !already_included {
+                            // Find the object in file_objects to get its DDL
+                            if let Some(file_obj) = file_objects.iter().find(|obj|
+                                obj.object_type == obj_type &&
+                                obj.qualified_name == obj_qualified
+                            ) {
+                                debug!("  Adding {:?} {} for recreation (migration alters dependent table)",
+                                    obj_type, format_qualified_name(&obj_qualified));
+                                object_changes.push(ChangeOperation::UpdateObject {
+                                    object: file_obj.clone(),
+                                    old_hash: String::new(),
+                                    new_hash: calculate_ddl_hash(&file_obj.ddl_statement),
+                                    reason: "Migration alters dependent table".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Step 3: Build dependency graph for affected objects
         if !file_objects.is_empty() || !object_changes.is_empty() {
             // First, identify deleted objects to get their stored dependencies

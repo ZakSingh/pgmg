@@ -481,6 +481,61 @@ impl<'a> StateManager<'a> {
             None => name.name.clone(),
         }
     }
+
+    // Helper method to convert string back to ObjectType
+    fn string_to_object_type(&self, s: &str) -> Option<ObjectType> {
+        match s {
+            "table" => Some(ObjectType::Table),
+            "view" => Some(ObjectType::View),
+            "materialized_view" => Some(ObjectType::MaterializedView),
+            "function" => Some(ObjectType::Function),
+            "procedure" => Some(ObjectType::Procedure),
+            "type" => Some(ObjectType::Type),
+            "domain" => Some(ObjectType::Domain),
+            "index" => Some(ObjectType::Index),
+            "trigger" => Some(ObjectType::Trigger),
+            "comment" => Some(ObjectType::Comment),
+            "cron_job" => Some(ObjectType::CronJob),
+            "aggregate" => Some(ObjectType::Aggregate),
+            "operator" => Some(ObjectType::Operator),
+            _ => None,
+        }
+    }
+
+    /// Find all managed objects that depend on the given relations (tables).
+    ///
+    /// This is used to identify objects that need to be pre-dropped before
+    /// migrations that alter these tables.
+    pub async fn find_dependents_of_relations(
+        &self,
+        relations: &[String],
+    ) -> Result<Vec<(ObjectType, String)>, Box<dyn std::error::Error>> {
+        if relations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = self.client.query(
+            r#"
+            SELECT DISTINCT dependent_type, dependent_name
+            FROM pgmg.pgmg_dependencies
+            WHERE dependency_type = 'relation'
+            AND dependency_name = ANY($1)
+            "#,
+            &[&relations],
+        ).await?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let dep_type_str: String = row.get(0);
+            let dep_name: String = row.get(1);
+
+            if let Some(obj_type) = self.string_to_object_type(&dep_type_str) {
+                result.push((obj_type, dep_name));
+            }
+        }
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
