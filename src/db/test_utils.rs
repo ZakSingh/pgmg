@@ -158,9 +158,9 @@ impl TestDatabase {
         let admin_conn_str = build_connection_string(&components, "postgres");
         
         // Check if template exists and is current
-        let migrations_checksum = calculate_migrations_checksum(&migrations_dir)?;
+        let template_checksum = calculate_template_checksum(&migrations_dir, &code_dir)?;
         
-        if !template_exists_and_current(&admin_conn_str, &template_name, &migrations_checksum).await? {
+        if !template_exists_and_current(&admin_conn_str, &template_name, &template_checksum).await? {
             println!("  {} Creating or updating template database...", "→".cyan());
             create_template_database(
                 &admin_conn_str,
@@ -169,7 +169,7 @@ impl TestDatabase {
                 migrations_dir,
                 code_dir,
                 config,
-                &migrations_checksum,
+                &template_checksum,
             ).await?;
             println!("  {} Template database ready", "✓".green());
         }
@@ -203,34 +203,86 @@ impl Drop for TestDatabase {
     }
 }
 
-/// Calculate a checksum of all migration files
-fn calculate_migrations_checksum(migrations_dir: &Option<PathBuf>) -> Result<String, Box<dyn std::error::Error>> {
+/// Calculate a checksum of all migration AND code files
+fn calculate_template_checksum(
+    migrations_dir: &Option<PathBuf>,
+    code_dir: &Option<PathBuf>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut hasher = Sha256::new();
-    
+
+    // Hash migrations (non-recursive, just top-level .sql files)
     if let Some(dir) = migrations_dir {
-        if dir.exists() {
-            let mut entries: Vec<_> = fs::read_dir(dir)?
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path().extension()
-                        .and_then(|ext| ext.to_str())
-                        .map(|ext| ext == "sql")
-                        .unwrap_or(false)
-                })
-                .collect();
-            
-            // Sort for consistent ordering
-            entries.sort_by_key(|e| e.path());
-            
-            for entry in entries {
-                let content = fs::read_to_string(entry.path())?;
-                hasher.update(content.as_bytes());
-                hasher.update(b"\n");
-            }
+        hash_sql_directory(&mut hasher, dir)?;
+    }
+
+    // Hash code directory (recursively)
+    if let Some(dir) = code_dir {
+        hash_sql_directory_recursive(&mut hasher, dir)?;
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Hash all .sql files in a directory (non-recursive)
+fn hash_sql_directory(hasher: &mut Sha256, dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let mut entries: Vec<_> = fs::read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext == "sql")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // Sort for consistent ordering
+    entries.sort_by_key(|e| e.path());
+
+    for entry in entries {
+        let content = fs::read_to_string(entry.path())?;
+        hasher.update(content.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    Ok(())
+}
+
+/// Hash all .sql files in a directory recursively
+fn hash_sql_directory_recursive(hasher: &mut Sha256, dir: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+    collect_sql_files_recursive(dir, &mut paths)?;
+    paths.sort(); // Consistent ordering
+
+    for path in paths {
+        let content = fs::read_to_string(&path)?;
+        hasher.update(content.as_bytes());
+        hasher.update(b"\n");
+    }
+
+    Ok(())
+}
+
+/// Recursively collect all .sql files from a directory
+fn collect_sql_files_recursive(dir: &PathBuf, paths: &mut Vec<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            collect_sql_files_recursive(&path, paths)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("sql") {
+            paths.push(path);
         }
     }
-    
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(())
 }
 
 /// Check if template database exists and has current migrations

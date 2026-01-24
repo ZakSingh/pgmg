@@ -293,20 +293,20 @@ async fn execute_all_changes<C: GenericClient>(
     let mut pre_dropped_objects: HashSet<String> = HashSet::new();
 
     if !plan_result.new_migrations.is_empty() && !plan_result.changes.is_empty() {
-        // Collect objects that need pre-dropping (updates and deletes)
-        let updates_to_predrop: Vec<&ChangeOperation> = plan_result.changes.iter()
-            .filter(|change| matches!(change, ChangeOperation::UpdateObject { .. }))
+        // Collect all objects that need dropping (both updates and deletes)
+        // These must be combined and sorted together by dependency order because
+        // dependencies can cross between the two groups
+        let all_to_drop: Vec<&ChangeOperation> = plan_result.changes.iter()
+            .filter(|change| matches!(change,
+                ChangeOperation::UpdateObject { .. } | ChangeOperation::DeleteObject { .. }
+            ))
             .collect();
 
-        let deletes_to_predrop: Vec<&ChangeOperation> = plan_result.changes.iter()
-            .filter(|change| matches!(change, ChangeOperation::DeleteObject { .. }))
-            .collect();
-
-        if !updates_to_predrop.is_empty() || !deletes_to_predrop.is_empty() {
+        if !all_to_drop.is_empty() {
             if !test_mode {
                 println!("{} {} {}",
                     "Pre-dropping".blue().bold(),
-                    (updates_to_predrop.len() + deletes_to_predrop.len()).to_string().yellow(),
+                    all_to_drop.len().to_string().yellow(),
                     "managed objects to unblock migrations...".blue().bold()
                 );
             }
@@ -315,15 +315,16 @@ async fn execute_all_changes<C: GenericClient>(
             let deletion_order = plan_result.dependency_graph.as_ref()
                 .and_then(|g| g.deletion_order().ok());
 
-            // Phase A: Drop objects for update (reverse dependency order)
-            if !updates_to_predrop.is_empty() {
-                let ordered_updates = order_changes_by_deletion(&updates_to_predrop, &deletion_order);
+            // Sort ALL objects together by deletion order (dependents first, then dependencies)
+            // This ensures correct ordering regardless of whether objects are being deleted or updated
+            let ordered_drops = order_changes_by_deletion(&all_to_drop, &deletion_order);
 
-                for change in ordered_updates {
-                    if let ChangeOperation::UpdateObject { object, .. } = change {
+            for change in ordered_drops {
+                match change {
+                    ChangeOperation::UpdateObject { object, .. } => {
+                        // Pre-drop for update (will be recreated after migrations)
                         match apply_drop_for_update(client, object).await {
                             Ok(_) => {
-                                // Track that we pre-dropped this object
                                 pre_dropped_objects.insert(format!("{:?}:{}",
                                     object.object_type,
                                     format_object_name(object)
@@ -338,33 +339,28 @@ async fn execute_all_changes<C: GenericClient>(
                                 }
                             }
                             Err(e) => {
-                                apply_result.errors.push(format!("Failed to pre-drop {} for update: {}", format_object_name(object), e));
+                                let error_msg = format_db_error_details(&e);
+                                apply_result.errors.push(format!("Failed to pre-drop {} for update: {}", format_object_name(object), error_msg));
                                 if !test_mode {
-                                    println!("  {} Failed to pre-drop {}: {}", "✗".red().bold(), format_object_name(object).cyan(), e.to_string().red());
+                                    println!("  {} Failed to pre-drop {}:\n    {}",
+                                        "✗".red().bold(),
+                                        format_object_name(object).cyan(),
+                                        error_msg.red()
+                                    );
                                 }
                                 return Err("Pre-drop failed".into());
                             }
                         }
                     }
-                }
-            }
-
-            // Phase B: Delete objects marked for deletion (reverse dependency order)
-            if !deletes_to_predrop.is_empty() {
-                let ordered_deletes = order_changes_by_deletion(&deletes_to_predrop, &deletion_order);
-
-                for change in ordered_deletes {
-                    if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
+                    ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                        // Permanent deletion
                         match apply_delete_object(client, object_type, object_name).await {
                             Ok(_) => {
-                                // Track that we pre-dropped this object
                                 pre_dropped_objects.insert(format!("{:?}:{}", object_type, object_name));
-
-                                // Mark as deleted in result
                                 apply_result.objects_deleted.push(object_name.clone());
 
                                 if !test_mode {
-                                    println!("  {} Pre-dropped {}: {} (will be deleted)",
+                                    println!("  {} Deleted {}: {}",
                                         "✓".green().bold(),
                                         format!("{:?}", object_type).to_lowercase().yellow(),
                                         object_name.cyan()
@@ -372,18 +368,24 @@ async fn execute_all_changes<C: GenericClient>(
                                 }
                             }
                             Err(e) => {
-                                apply_result.errors.push(format!("Failed to pre-drop {}: {}", object_name, e));
+                                let error_msg = format_db_error_details(&e);
+                                apply_result.errors.push(format!("Failed to delete {}: {}", object_name, error_msg));
                                 if !test_mode {
-                                    println!("  {} Failed to pre-drop {}: {}", "✗".red().bold(), object_name.cyan(), e.to_string().red());
+                                    println!("  {} Failed to delete {}:\n    {}",
+                                        "✗".red().bold(),
+                                        object_name.cyan(),
+                                        error_msg.red()
+                                    );
                                 }
                                 return Err("Pre-drop failed".into());
                             }
                         }
                     }
+                    _ => {} // Skip other change types (creates, migrations)
                 }
             }
 
-            if !test_mode && (!updates_to_predrop.is_empty() || !deletes_to_predrop.is_empty()) {
+            if !test_mode {
                 println!();  // Blank line for readability
             }
         }
@@ -1539,6 +1541,26 @@ fn format_object_name(object: &SqlObject) -> String {
         Some(schema) => format!("{}.{}", schema, object.qualified_name.name),
         None => object.qualified_name.name.clone(),
     }
+}
+
+/// Format a database error with full PostgreSQL details for better debugging.
+/// This extracts the error message, detail, hint, and error code from PostgreSQL errors.
+fn format_db_error_details(e: &Box<dyn std::error::Error>) -> String {
+    // Try to downcast to tokio_postgres::Error
+    if let Some(pg_err) = e.downcast_ref::<tokio_postgres::Error>() {
+        if let Some(details) = crate::error::extract_postgres_error_details(pg_err) {
+            let mut msg = details.message.clone();
+            if let Some(detail) = &details.detail {
+                msg.push_str(&format!("\n    Detail: {}", detail));
+            }
+            if let Some(hint) = &details.hint {
+                msg.push_str(&format!("\n    Hint: {}", hint));
+            }
+            msg.push_str(&format!("\n    Code: {} ({})", details.code, details.severity));
+            return msg;
+        }
+    }
+    e.to_string()
 }
 
 
