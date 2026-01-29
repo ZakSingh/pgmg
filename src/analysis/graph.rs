@@ -4,6 +4,7 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use crate::sql::{QualifiedIdent, SqlObject, ObjectType};
 use crate::builtin_catalog::BuiltinCatalog;
+use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ObjectRef {
@@ -39,11 +40,13 @@ impl DependencyGraph {
 
     /// Build dependency graph from SQL objects using existing parser output
     pub fn build_from_objects(
-        objects: &[SqlObject], 
+        objects: &[SqlObject],
         builtin_catalog: &BuiltinCatalog
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut graph = Self::new();
-        
+
+        debug!("Building dependency graph from {} objects", objects.len());
+
         // Add nodes for each object
         for obj in objects {
             let object_ref = ObjectRef {
@@ -52,31 +55,42 @@ impl DependencyGraph {
             };
             graph.add_node(object_ref);
         }
-        
+
         // Add edges based on dependencies from parser
         for obj in objects {
             let obj_ref = ObjectRef {
                 object_type: obj.object_type.clone(),
                 qualified_name: obj.qualified_name.clone(),
             };
-            
+
             // Filter out built-ins using existing functionality
             let filtered_deps = crate::sql::filter_builtins(
-                obj.dependencies.clone(), 
+                obj.dependencies.clone(),
                 builtin_catalog
             );
-            
+
+            let obj_name = format!("{}.{}",
+                obj.qualified_name.schema.as_deref().unwrap_or("public"),
+                obj.qualified_name.name
+            );
+
             // Add edges for relation dependencies
             for dep in &filtered_deps.relations {
                 // Relations could be tables, views, or materialized views
-                if let Some(dep_obj) = objects.iter().find(|o| 
-                    &o.qualified_name == dep && 
+                if let Some(dep_obj) = objects.iter().find(|o|
+                    &o.qualified_name == dep &&
                     matches!(o.object_type, ObjectType::Table | ObjectType::View | ObjectType::MaterializedView)
                 ) {
                     let dep_ref = ObjectRef {
                         object_type: dep_obj.object_type.clone(),
                         qualified_name: dep_obj.qualified_name.clone(),
                     };
+                    debug!("  Creating edge: {:?} {} -> {:?} {}",
+                        dep_ref.object_type,
+                        format!("{}.{}", dep_ref.qualified_name.schema.as_deref().unwrap_or("public"), dep_ref.qualified_name.name),
+                        obj_ref.object_type,
+                        obj_name
+                    );
                     graph.add_edge(dep_ref, obj_ref.clone(), DependencyType::Hard)?;
                 }
             }
@@ -200,28 +214,54 @@ impl DependencyGraph {
     /// Find all objects that would be affected by changes to the given objects
     /// (i.e., all transitive dependents through HARD dependencies only)
     pub fn affected_by_changes(&self, changed_objects: &[ObjectRef]) -> Vec<ObjectRef> {
+        debug!("affected_by_changes called with {} objects", changed_objects.len());
+        for obj in changed_objects {
+            let obj_name = format!("{}.{}",
+                obj.qualified_name.schema.as_deref().unwrap_or("public"),
+                obj.qualified_name.name
+            );
+            debug!("  - {:?} {}", obj.object_type, obj_name);
+        }
+
         let mut affected = std::collections::HashSet::new();
         let mut to_visit: Vec<ObjectRef> = changed_objects.to_vec();
-        
+
         while let Some(obj_ref) = to_visit.pop() {
             if affected.contains(&obj_ref) {
                 continue;
             }
-            
+
+            let obj_name = format!("{}.{}",
+                obj_ref.qualified_name.schema.as_deref().unwrap_or("public"),
+                obj_ref.qualified_name.name
+            );
+
             affected.insert(obj_ref.clone());
-            
+
             // Only follow HARD dependencies for recreation
-            for dependent in self.hard_dependents_of(&obj_ref) {
+            let dependents = self.hard_dependents_of(&obj_ref);
+
+            for dependent in dependents {
                 if !affected.contains(&dependent) {
                     to_visit.push(dependent);
                 }
             }
         }
-        
-        // Remove the originally changed objects from the result
-        affected.into_iter()
+
+        let result: Vec<ObjectRef> = affected.into_iter()
             .filter(|obj| !changed_objects.contains(obj))
-            .collect()
+            .collect();
+
+        debug!("affected_by_changes returning {} affected objects", result.len());
+        for obj in &result {
+            debug!("  - {:?} {}.{}",
+                obj.object_type,
+                obj.qualified_name.schema.as_deref().unwrap_or("public"),
+                obj.qualified_name.name
+            );
+        }
+
+        result
     }
     
     /// Get dependents of a specific object that have HARD dependencies only

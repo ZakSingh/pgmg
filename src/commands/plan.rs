@@ -180,16 +180,59 @@ pub async fn execute_plan(
                     _ => None,
                 })
                 .collect();
-            
+
             // Get stored dependencies for deleted objects
             let deleted_object_deps = if !deleted_objects.is_empty() {
                 state_manager.get_deleted_object_dependencies(&deleted_objects).await?
             } else {
                 Vec::new()
             };
-            
-            // Convert deleted objects with dependencies to SqlObjects for graph building
-            let mut all_objects_for_graph = file_objects.clone();
+
+            // Also get stored dependencies for updated objects
+            // This is critical for pre-drop ordering: the database still has the OLD dependencies,
+            // so we need to consider them when determining drop order
+            let updated_objects_for_deps: Vec<(ObjectType, String)> = object_changes.iter()
+                .filter_map(|change| match change {
+                    ChangeOperation::UpdateObject { object, .. } => {
+                        Some((object.object_type.clone(), format_qualified_name(&object.qualified_name)))
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            let updated_object_stored_deps = if !updated_objects_for_deps.is_empty() {
+                state_manager.get_deleted_object_dependencies(&updated_objects_for_deps).await?
+            } else {
+                Vec::new()
+            };
+
+            // Build a map of stored dependencies for updated objects
+            let mut stored_deps_map: HashMap<(ObjectType, String), crate::sql::Dependencies> = HashMap::new();
+            for (obj_type, obj_name, deps) in updated_object_stored_deps {
+                let key = (obj_type, format_qualified_name(&obj_name));
+                stored_deps_map.insert(key, deps);
+            }
+
+            // Build the "file-only" graph first - this is used for VALIDATION
+            // (checking if the new state after apply will be consistent)
+            let file_graph = DependencyGraph::build_from_objects(&file_objects, &builtin_catalog)?;
+
+            // Now build the "merged" graph for PRE-DROP ORDERING
+            // This includes stored dependencies so we know what the database currently has
+            let mut all_objects_for_ordering = file_objects.clone();
+
+            // Merge stored dependencies into file objects for updated objects
+            // This ensures the ordering graph includes both old (database) and new (file) dependencies
+            for obj in &mut all_objects_for_ordering {
+                let key = (obj.object_type.clone(), format_qualified_name(&obj.qualified_name));
+                if let Some(stored_deps) = stored_deps_map.get(&key) {
+                    // Merge stored dependencies with parsed dependencies
+                    obj.dependencies.relations.extend(stored_deps.relations.clone());
+                    obj.dependencies.functions.extend(stored_deps.functions.clone());
+                    obj.dependencies.types.extend(stored_deps.types.clone());
+                }
+            }
+
             for (obj_type, obj_name, deps) in deleted_object_deps {
                 // Create a minimal SqlObject for deleted objects
                 let deleted_obj = SqlObject::new(
@@ -199,14 +242,16 @@ pub async fn execute_plan(
                     deps,
                     None, // No file path for deleted objects
                 );
-                all_objects_for_graph.push(deleted_obj);
+                all_objects_for_ordering.push(deleted_obj);
             }
-            
-            // Build graph from both file objects and deleted objects with stored dependencies
-            let graph = DependencyGraph::build_from_objects(&all_objects_for_graph, &builtin_catalog)?;
+
+            // Build ordering graph from merged dependencies
+            let graph = DependencyGraph::build_from_objects(&all_objects_for_ordering, &builtin_catalog)?;
             
             // Step 3.25: Validate that deletions are safe
             // Check if any objects being deleted have dependents that aren't also being deleted
+            // IMPORTANT: Use file_graph (not graph) for validation - we want to check
+            // the NEW dependencies from source files, not the old stored dependencies
             let mut deletion_errors = Vec::new();
             let deleted_object_refs: HashSet<ObjectRef> = object_changes.iter()
                 .filter_map(|change| match change {
@@ -220,9 +265,10 @@ pub async fn execute_plan(
                     _ => None,
                 })
                 .collect();
-            
+
             for deleted_ref in &deleted_object_refs {
-                let dependents = graph.dependents_of(deleted_ref);
+                // Use file_graph for validation - this checks if the NEW state is consistent
+                let dependents = file_graph.dependents_of(deleted_ref);
                 for dependent in dependents {
                     // Check if this dependent is also being deleted
                     if !deleted_object_refs.contains(&dependent) {
@@ -231,7 +277,7 @@ pub async fn execute_plan(
                             obj.object_type == dependent.object_type &&
                             obj.qualified_name == dependent.qualified_name
                         });
-                        
+
                         if dependent_exists_in_files {
                             deletion_errors.push(format!(
                                 "Cannot delete {} '{}' because {} '{}' depends on it",
@@ -244,7 +290,7 @@ pub async fn execute_plan(
                     }
                 }
             }
-            
+
             if !deletion_errors.is_empty() {
                 return Err(deletion_errors.join("\n").into());
             }
