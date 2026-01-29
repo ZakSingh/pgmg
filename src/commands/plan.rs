@@ -6,7 +6,7 @@ use crate::analysis::{DependencyGraph, ObjectRef};
 use crate::BuiltinCatalog;
 #[cfg(feature = "cli")]
 use owo_colors::OwoColorize;
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct PlanResult {
@@ -362,7 +362,7 @@ pub async fn execute_plan(
             if let Some(output_path) = output_graph {
                 let graphviz_output = graph.to_graphviz();
                 std::fs::write(&output_path, graphviz_output)?;
-                println!("Dependency graph written to: {:?}", output_path);
+                info!("Dependency graph written to: {:?}", output_path);
             }
             
             plan_result.dependency_graph = Some(graph);

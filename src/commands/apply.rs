@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 use std::collections::HashSet;
-use crate::db::{StateManager, connect_with_url, AdvisoryLockManager, AdvisoryLockError};
+use crate::db::{StateManager, connect_to_database, DatabaseConfig, AdvisoryLockManager, AdvisoryLockError};
 use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file};
 use crate::commands::plan::{execute_plan, ChangeOperation, PlanResult};
 use crate::config::PgmgConfig;
@@ -150,12 +150,20 @@ async fn execute_apply_with_lock_management(
     config: &PgmgConfig,
     test_mode: bool,
 ) -> Result<ApplyResult, Box<dyn std::error::Error>> {
-    // Connect to database
-    let (client, connection) = connect_with_url(&connection_string).await?;
-    
+    // Parse base config from URL
+    let mut db_config = DatabaseConfig::from_url(&connection_string)?;
+
+    // Merge TLS config from PgmgConfig if present
+    if let Ok(file_tls) = config.build_tls_config() {
+        db_config = db_config.merge_tls_config(file_tls);
+    }
+
+    // Connect with merged TLS config
+    let (client, connection) = connect_to_database(&db_config).await?;
+
     // Spawn connection handler
     connection.spawn();
-    
+
     // Pass test_mode through to the inner function
     execute_apply_inner(client, migrations_dir, code_dir, connection_string, config, test_mode).await
 }
@@ -243,7 +251,7 @@ async fn execute_apply_internal(
     ).await?;
 
     if plan_result.changes.is_empty() && plan_result.new_migrations.is_empty() {
-        println!("{}", "No changes to apply. Database is up to date.".green());
+        info!("No changes to apply. Database is up to date.");
         return Ok(apply_result);
     }
 
@@ -255,10 +263,10 @@ async fn execute_apply_internal(
 
     if !test_mode {
         if use_transaction {
-            println!("{}", "Running in transactional mode (safe rollback on error)".dimmed());
+            debug!("Running in transactional mode (safe rollback on error)");
         } else {
-            println!("{}", "Running in auto-commit mode (fresh build detected)".yellow());
-            println!("{}", "  Note: Changes cannot be rolled back".yellow().dimmed());
+            info!("Running in auto-commit mode (fresh build detected)");
+            debug!("Note: Changes cannot be rolled back");
         }
     }
 
@@ -304,11 +312,7 @@ async fn execute_all_changes<C: GenericClient>(
 
         if !all_to_drop.is_empty() {
             if !test_mode {
-                println!("{} {} {}",
-                    "Pre-dropping".blue().bold(),
-                    all_to_drop.len().to_string().yellow(),
-                    "managed objects to unblock migrations...".blue().bold()
-                );
+                info!(count = all_to_drop.len(), "Pre-dropping managed objects to unblock migrations");
             }
 
             // Get dependency order for proper dropping
@@ -331,10 +335,10 @@ async fn execute_all_changes<C: GenericClient>(
                                 ));
 
                                 if !test_mode {
-                                    println!("  {} Pre-dropped {}: {} (will be recreated after migration)",
-                                        "✓".green().bold(),
-                                        format!("{:?}", object.object_type).to_lowercase().yellow(),
-                                        format_object_name(object).cyan()
+                                    info!(
+                                        object_type = %format!("{:?}", object.object_type).to_lowercase(),
+                                        object_name = %format_object_name(object),
+                                        "Pre-dropped object (will be recreated after migration)"
                                     );
                                 }
                             }
@@ -342,10 +346,10 @@ async fn execute_all_changes<C: GenericClient>(
                                 let error_msg = format_db_error_details(&e);
                                 apply_result.errors.push(format!("Failed to pre-drop {} for update: {}", format_object_name(object), error_msg));
                                 if !test_mode {
-                                    println!("  {} Failed to pre-drop {}:\n    {}",
-                                        "✗".red().bold(),
-                                        format_object_name(object).cyan(),
-                                        error_msg.red()
+                                    error!(
+                                        object_name = %format_object_name(object),
+                                        error = %error_msg,
+                                        "Failed to pre-drop object"
                                     );
                                 }
                                 return Err("Pre-drop failed".into());
@@ -360,10 +364,10 @@ async fn execute_all_changes<C: GenericClient>(
                                 apply_result.objects_deleted.push(object_name.clone());
 
                                 if !test_mode {
-                                    println!("  {} Deleted {}: {}",
-                                        "✓".green().bold(),
-                                        format!("{:?}", object_type).to_lowercase().yellow(),
-                                        object_name.cyan()
+                                    info!(
+                                        object_type = %format!("{:?}", object_type).to_lowercase(),
+                                        object_name = %object_name,
+                                        "Deleted object"
                                     );
                                 }
                             }
@@ -371,10 +375,10 @@ async fn execute_all_changes<C: GenericClient>(
                                 let error_msg = format_db_error_details(&e);
                                 apply_result.errors.push(format!("Failed to delete {}: {}", object_name, error_msg));
                                 if !test_mode {
-                                    println!("  {} Failed to delete {}:\n    {}",
-                                        "✗".red().bold(),
-                                        object_name.cyan(),
-                                        error_msg.red()
+                                    error!(
+                                        object_name = %object_name,
+                                        error = %error_msg,
+                                        "Failed to delete object"
                                     );
                                 }
                                 return Err("Pre-drop failed".into());
@@ -386,7 +390,7 @@ async fn execute_all_changes<C: GenericClient>(
             }
 
             if !test_mode {
-                println!();  // Blank line for readability
+                debug!("Pre-drop phase completed");
             }
         }
     }
@@ -394,7 +398,7 @@ async fn execute_all_changes<C: GenericClient>(
     // Step 3: Apply migrations first (they need to be applied in order)
     if !plan_result.new_migrations.is_empty() {
         if !test_mode {
-            println!("{} {} {}", "Applying".blue().bold(), plan_result.new_migrations.len().to_string().yellow(), "new migrations...".blue().bold());
+            info!(count = plan_result.new_migrations.len(), "Applying new migrations");
         }
         
         if let Some(ref migrations_dir) = migrations_dir {
@@ -403,14 +407,13 @@ async fn execute_all_changes<C: GenericClient>(
                     Ok(_) => {
                         apply_result.migrations_applied.push(migration_name.clone());
                         if !test_mode {
-                            println!("  {} Applied migration: {}", "✓".green().bold(), migration_name.cyan());
+                            info!(migration = %migration_name, "Applied migration");
                         }
                     }
                     Err(e) => {
                         // The error from apply_migration already contains detailed formatting
                         apply_result.errors.push(e.to_string());
-                        println!("  {} Failed migration: {}", "✗".red().bold(), migration_name.cyan());
-                        println!("{}", e.to_string().red());
+                        error!(migration = %migration_name, error = %e, "Failed migration");
                         break; // Stop processing migrations on first error
                     }
                 }
@@ -420,9 +423,9 @@ async fn execute_all_changes<C: GenericClient>(
 
     // Check for migration errors before proceeding to object changes
     if !apply_result.errors.is_empty() {
-        eprintln!("\n{} {} {}", "Failed due to".red().bold(), apply_result.errors.len().to_string().yellow(), "migration error:".red().bold());
-        for error in &apply_result.errors {
-            eprintln!("{}", error);
+        error!(error_count = apply_result.errors.len(), "Failed due to migration errors");
+        for err in &apply_result.errors {
+            error!(error = %err, "Migration error");
         }
         return Err("Migration failed".into());
     }
@@ -433,7 +436,7 @@ async fn execute_all_changes<C: GenericClient>(
     // Step 4: Apply object changes based on dependency order
     if !plan_result.changes.is_empty() {
         if !test_mode {
-            println!("{} {} {}", "Applying".blue().bold(), plan_result.changes.len().to_string().yellow(), "object changes...".blue().bold());
+            info!(count = plan_result.changes.len(), "Applying object changes");
         }
         
         // Separate the changes into phases
@@ -451,7 +454,7 @@ async fn execute_all_changes<C: GenericClient>(
             match (dependency_graph.creation_order(), dependency_graph.deletion_order()) {
                 (Ok(create_ord), Ok(delete_ord)) => (Some(create_ord), Some(delete_ord)),
                 _ => {
-                    eprintln!("Warning: Could not determine dependency order. Applying changes in original order.");
+                    warn!("Could not determine dependency order. Applying changes in original order.");
                     (None, None)
                 }
             }
@@ -465,7 +468,7 @@ async fn execute_all_changes<C: GenericClient>(
         // Phase 1: Drop objects that need updating (in reverse dependency order)
         if !updates.is_empty() && deletion_order.is_some() {
             if !test_mode {
-                println!("\n{}: {}", "Phase 1".blue().bold(), "Dropping objects for update...".blue());
+                debug!("Phase 1: Dropping objects for update");
             }
             let del_order = deletion_order.as_ref().expect("deletion_order was checked to be Some");
             
@@ -494,15 +497,19 @@ async fn execute_all_changes<C: GenericClient>(
 
                     match apply_drop_for_update(client, object).await {
                         Ok(_) => {
-                            println!("  {} Dropped {}: {} (for update)",
-                                "✓".green().bold(),
-                                format!("{:?}", object.object_type).to_lowercase().yellow(),
-                                format_object_name(object).cyan()
+                            debug!(
+                                object_type = %format!("{:?}", object.object_type).to_lowercase(),
+                                object_name = %format_object_name(object),
+                                "Dropped object for update"
                             );
                         }
                         Err(e) => {
                             apply_result.errors.push(format!("Failed to drop {} for update: {}", format_object_name(object), e));
-                            println!("  {} Failed to drop {}: {}", "✗".red().bold(), format_object_name(object).cyan(), e.to_string().red());
+                            error!(
+                                object_name = %format_object_name(object),
+                                error = %e,
+                                "Failed to drop object for update"
+                            );
                             transaction_aborted = true;
                         }
                     }
@@ -513,7 +520,7 @@ async fn execute_all_changes<C: GenericClient>(
         // Phase 2: Delete objects marked for deletion (in dependency order)
         if !deletes.is_empty() && !transaction_aborted {
             if !test_mode {
-                println!("\n{}: {}", "Phase 2".blue().bold(), "Deleting objects...".blue());
+                debug!("Phase 2: Deleting objects");
             }
             
             // Separate comments from other deletions
@@ -525,7 +532,7 @@ async fn execute_all_changes<C: GenericClient>(
             
             // Process comments first (they need their parent objects to exist)
             if !comment_deletes.is_empty() {
-                println!("  {}", "Processing comments first...".dimmed());
+                debug!("Processing comments first");
                 for change in comment_deletes {
                     if transaction_aborted { break; }
 
@@ -539,22 +546,26 @@ async fn execute_all_changes<C: GenericClient>(
                         match apply_delete_object(client, object_type, object_name).await {
                             Ok(_) => {
                                 apply_result.objects_deleted.push(object_name.clone());
-                                println!("  {} Deleted {}: {}",
-                                    "✓".green().bold(),
-                                    format!("{:?}", object_type).to_lowercase().yellow(),
-                                    object_name.cyan()
+                                info!(
+                                    object_type = %format!("{:?}", object_type).to_lowercase(),
+                                    object_name = %object_name,
+                                    "Deleted object"
                                 );
                             }
                             Err(e) => {
                                 apply_result.errors.push(format!("Failed to delete {}: {}", object_name, e));
-                                println!("  {} Failed to delete {}: {}", "✗".red().bold(), object_name.cyan(), e.to_string().red());
+                                error!(
+                                    object_name = %object_name,
+                                    error = %e,
+                                    "Failed to delete object"
+                                );
                                 transaction_aborted = true;
                             }
                         }
                     }
                 }
             }
-            
+
             // Then process non-comment deletions in dependency order
             if !non_comment_deletes.is_empty() && !transaction_aborted {
                 // Sort deletions by dependency order if available
@@ -605,15 +616,19 @@ async fn execute_all_changes<C: GenericClient>(
                         match apply_delete_object(client, object_type, object_name).await {
                             Ok(_) => {
                                 apply_result.objects_deleted.push(object_name.clone());
-                                println!("  {} Deleted {}: {}",
-                                    "✓".green().bold(),
-                                    format!("{:?}", object_type).to_lowercase().yellow(),
-                                    object_name.cyan()
+                                info!(
+                                    object_type = %format!("{:?}", object_type).to_lowercase(),
+                                    object_name = %object_name,
+                                    "Deleted object"
                                 );
                             }
                             Err(e) => {
                                 apply_result.errors.push(format!("Failed to delete {}: {}", object_name, e));
-                                println!("  {} Failed to delete {}: {}", "✗".red().bold(), object_name.cyan(), e.to_string().red());
+                                error!(
+                                    object_name = %object_name,
+                                    error = %e,
+                                    "Failed to delete object"
+                                );
                                 transaction_aborted = true;
                             }
                         }
@@ -621,11 +636,11 @@ async fn execute_all_changes<C: GenericClient>(
                 }
             }
         }
-        
+
         // Phase 3: Create new objects and recreate updated objects (in dependency order)
         if !transaction_aborted && (creates.len() + updates.len() > 0) {
             if !test_mode {
-                println!("\n{}: {}", "Phase 3".blue().bold(), "Creating objects...".blue());
+                debug!("Phase 3: Creating objects");
             }
             
             // Combine creates and updates (which need recreation)
@@ -662,30 +677,30 @@ async fn execute_all_changes<C: GenericClient>(
                     Ok(_) => {
                         // Track modified objects for plpgsql_check
                         modified_objects.push(object);
-                        
+
                         if is_update {
                             apply_result.objects_updated.push(format_object_name(object));
                             if !test_mode {
-                                println!("  {} Recreated {}: {} (updated)", 
-                                    "✓".green().bold(),
-                                    format!("{:?}", object.object_type).to_lowercase().yellow(),
-                                    format_object_name(object).cyan()
+                                info!(
+                                    object_type = %format!("{:?}", object.object_type).to_lowercase(),
+                                    object_name = %format_object_name(object),
+                                    "Recreated object (updated)"
                                 );
                             }
                         } else {
                             apply_result.objects_created.push(format_object_name(object));
                             if !test_mode {
-                                println!("  {} Created {}: {}", 
-                                    "✓".green().bold(),
-                                    format!("{:?}", object.object_type).to_lowercase().yellow(),
-                                    format_object_name(object).cyan()
+                                info!(
+                                    object_type = %format!("{:?}", object.object_type).to_lowercase(),
+                                    object_name = %format_object_name(object),
+                                    "Created object"
                                 );
                             }
                         }
                     }
                     Err(e) => {
                         let action = if is_update { "recreate" } else { "create" };
-                        
+
                         // Try to downcast to tokio_postgres::Error for detailed formatting
                         let detailed_error = if let Some(pg_err) = e.downcast_ref::<tokio_postgres::Error>() {
                             format_postgres_error_with_details(
@@ -698,9 +713,9 @@ async fn execute_all_changes<C: GenericClient>(
                         } else {
                             format!("Failed to {} {}: {}", action, format_object_name(object), e)
                         };
-                        
+
                         apply_result.errors.push(detailed_error.clone());
-                        println!("  {} {}", "✗".red().bold(), detailed_error);
+                        error!(error = %detailed_error, "Object creation failed");
                         transaction_aborted = true;
                     }
                 }
@@ -710,9 +725,9 @@ async fn execute_all_changes<C: GenericClient>(
 
     // Handle SQL errors
     if !apply_result.errors.is_empty() {
-        eprintln!("{} {} {}", "Failed due to".red().bold(), apply_result.errors.len().to_string().yellow(), "errors:".red().bold());
-        for error in &apply_result.errors {
-            eprintln!("  {} {}", "-".red().bold(), error.red());
+        error!(error_count = apply_result.errors.len(), "Failed due to errors");
+        for err in &apply_result.errors {
+            error!(error = %err, "Apply error");
         }
         return Err("Apply operation failed".into());
     }
@@ -742,8 +757,7 @@ async fn execute_all_changes<C: GenericClient>(
             }
             Err(e) => {
                 // Log but don't fail the operation
-                eprintln!("{}: Failed to run plpgsql_check: {}", 
-                    "Warning".yellow().bold(), e);
+                warn!(error = %e, "Failed to run plpgsql_check");
             }
         }
         
@@ -769,8 +783,7 @@ async fn execute_all_changes<C: GenericClient>(
                 }
                 Err(e) => {
                     // Log but don't fail the operation
-                    eprintln!("{}: Failed to check dependent functions: {}", 
-                        "Warning".yellow().bold(), e);
+                    warn!(error = %e, "Failed to check dependent functions");
                 }
             }
         }
@@ -782,10 +795,9 @@ async fn execute_all_changes<C: GenericClient>(
         
         // If there are plpgsql_check errors, fail
         if apply_result.plpgsql_errors_found > 0 {
-            eprintln!("\n{} {} {}",
-                "Apply blocked due to".red().bold(),
-                apply_result.plpgsql_errors_found.to_string().yellow(),
-                "PL/pgSQL errors. Fix the errors above and try again.".red().bold()
+            error!(
+                error_count = apply_result.plpgsql_errors_found,
+                "Apply blocked due to PL/pgSQL errors. Fix the errors above and try again."
             );
             return Err("Apply operation blocked due to PL/pgSQL compilation errors".into());
         }
@@ -824,7 +836,7 @@ async fn apply_migration<C: GenericClient>(
             // Skip plpgsql_check related statements on RDS
             if is_rds && should_skip_plpgsql_check_on_rds(&statement.sql) {
                 debug!("Skipping plpgsql_check statement on RDS: {}", statement.sql.lines().next().unwrap_or(""));
-                eprintln!("  {} Skipping plpgsql_check statement (not available on AWS RDS)", "⚠".yellow().bold());
+                warn!("Skipping plpgsql_check statement (not available on AWS RDS)");
                 continue;
             }
             
@@ -879,15 +891,15 @@ async fn apply_create_object<C: GenericClient>(
     // Emit NOTIFY event if in development mode
     if config.development_mode.unwrap_or(false) && config.emit_notify_events.unwrap_or(false) {
         let mut notification = ObjectLoadedNotification::from_sql_object(object);
-        
+
         // Try to get the OID of the created object
         if let Ok(oid) = get_object_oid(client, &object.object_type, &object.qualified_name).await {
             notification.oid = Some(oid);
         }
-        
+
         if let Err(e) = emit_object_loaded_notification(client, &notification).await {
             // Log the error but don't fail the operation
-            eprintln!("Warning: Failed to emit NOTIFY event: {}", e);
+            warn!(error = %e, "Failed to emit NOTIFY event");
         }
     }
     
@@ -1521,18 +1533,20 @@ fn print_apply_success_message(result: &ApplyResult, test_mode: bool) {
     if test_mode {
         return; // Don't print success messages in test mode
     }
-    
+
     if result.plpgsql_errors_found > 0 {
-        println!("{}", "Changes applied with errors in PL/pgSQL functions!".red().bold());
-        println!("  {} {} PL/pgSQL errors found", "✗".red(), result.plpgsql_errors_found.to_string().red().bold());
-        if result.plpgsql_warnings_found > 0 {
-            println!("  {} {} PL/pgSQL warnings found", "⚠".yellow(), result.plpgsql_warnings_found.to_string().yellow().bold());
-        }
+        error!(
+            plpgsql_errors = result.plpgsql_errors_found,
+            plpgsql_warnings = result.plpgsql_warnings_found,
+            "Changes applied with errors in PL/pgSQL functions"
+        );
     } else if result.plpgsql_warnings_found > 0 {
-        println!("{}", "Changes applied successfully with warnings!".yellow().bold());
-        println!("  {} {} PL/pgSQL warnings found", "⚠".yellow(), result.plpgsql_warnings_found.to_string().yellow().bold());
+        warn!(
+            plpgsql_warnings = result.plpgsql_warnings_found,
+            "Changes applied successfully with warnings"
+        );
     } else {
-        println!("{}", "All changes applied successfully!".green().bold());
+        info!("All changes applied successfully");
     }
 }
 
