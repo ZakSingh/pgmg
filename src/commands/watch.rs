@@ -194,33 +194,55 @@ pub async fn execute_watch(config: WatchConfig) -> Result<()> {
 
 /// Process a set of file changes
 async fn process_changes(
-    config: &WatchConfig, 
+    config: &WatchConfig,
     paths: HashSet<PathBuf>,
     test_dep_map: Arc<Mutex<Option<TestDependencyMap>>>,
 ) {
     output::step(&format!("Detected changes in {} file(s)", paths.len()));
-    
-    // Separate test files from database object files
+
+    // Separate files into categories: test files, code files (managed objects), and migration files
     let mut test_files = Vec::new();
-    let mut db_files = Vec::new();
-    
+    let mut code_files = Vec::new();
+    let mut migration_files = Vec::new();
+
     for path in &paths {
         info!("  - {}", path.display());
-        
+
+        // Check if this is a migration file
+        if let Some(ref migrations_dir) = config.migrations_dir {
+            if path.starts_with(migrations_dir) {
+                migration_files.push(path.clone());
+                continue;
+            }
+        }
+
         if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
             if file_name.contains(".test.") {
                 test_files.push(path.clone());
             } else {
-                db_files.push(path.clone());
+                code_files.push(path.clone());
             }
         }
     }
-    
-    // Process database object changes first (if any)
+
+    // Notify about migration changes (don't auto-apply - migrations require explicit 'pgmg apply')
+    if !migration_files.is_empty() {
+        output::info(&format!(
+            "Migration file(s) changed ({}). Run 'pgmg apply' to apply migrations.",
+            migration_files.len()
+        ));
+        for path in &migration_files {
+            if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                println!("  - {}", name);
+            }
+        }
+    }
+
+    // Process managed object changes (auto-apply these - they're idempotent and safe)
     let mut changed_objects = Vec::new();
-    if !db_files.is_empty() {
-        output::step("Processing database object changes...");
-        changed_objects = process_db_changes(config, db_files).await;
+    if !code_files.is_empty() {
+        output::step("Processing managed object changes...");
+        changed_objects = process_db_changes(config, code_files).await;
     }
     
     // Rebuild test dependency map if any test files changed
@@ -271,33 +293,26 @@ async fn process_db_changes(config: &WatchConfig, _paths: Vec<PathBuf>) -> Vec<O
     output::step("Running plan...");
     
     match execute_plan(
-        config.migrations_dir.clone(),
+        None, // Don't process migrations in watch mode - they require explicit 'pgmg apply'
         config.code_dir.clone(),
         config.connection_string.clone(),
         None, // No graph output in watch mode
     ).await {
         Ok(plan_result) => {
-            // Check if there are any changes
-            if plan_result.changes.is_empty() && plan_result.new_migrations.is_empty() {
+            // Check if there are any changes (migrations are not processed in watch mode)
+            if plan_result.changes.is_empty() {
                 output::info("No changes detected");
                 return Vec::new();
             }
-            
+
             // Collect changed objects for test dependency analysis
             let mut changed_objects = Vec::new();
-            
+
             // Show plan summary
             output::subheader("Changes detected:");
-            
-            if !plan_result.new_migrations.is_empty() {
-                println!("New migrations:");
-                for migration in &plan_result.new_migrations {
-                    println!("  + {}", migration);
-                }
-            }
-            
+
             if !plan_result.changes.is_empty() {
-                println!("Object changes:");
+                println!("Managed object changes:");
                 for change in &plan_result.changes {
                     match change {
                         crate::commands::plan::ChangeOperation::CreateObject { object, .. } => {
@@ -318,9 +333,8 @@ async fn process_db_changes(config: &WatchConfig, _paths: Vec<PathBuf>) -> Vec<O
                             println!("  - {:?} {}", object_type, object_name);
                             // Deleted objects don't need test runs
                         }
-                        crate::commands::plan::ChangeOperation::ApplyMigration { name, .. } => {
-                            println!("  > Migration {}", name);
-                        }
+                        // ApplyMigration won't appear since we pass None for migrations_dir
+                        crate::commands::plan::ChangeOperation::ApplyMigration { .. } => {}
                     }
                 }
             }
@@ -330,7 +344,7 @@ async fn process_db_changes(config: &WatchConfig, _paths: Vec<PathBuf>) -> Vec<O
                 output::step("Applying changes...");
                 
                 match execute_apply(
-                    config.migrations_dir.clone(),
+                    None, // Don't process migrations in watch mode - they require explicit 'pgmg apply'
                     config.code_dir.clone(),
                     config.connection_string.clone(),
                     &config.pgmg_config,
