@@ -28,6 +28,10 @@ impl<'a> StateManager<'a> {
 
     /// Initialize the state tracking tables if they don't exist
     pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Suppress NOTICE messages during initialization
+        // (PostgreSQL emits "already exists, skipping" for IF NOT EXISTS)
+        self.client.execute("SET LOCAL client_min_messages = 'WARNING'", &[]).await?;
+
         // Create pgmg schema if it doesn't exist
         self.client.execute(
             r#"
