@@ -30,7 +30,7 @@ impl<'a> StateManager<'a> {
     pub async fn initialize(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Suppress NOTICE messages during initialization
         // (PostgreSQL emits "already exists, skipping" for IF NOT EXISTS)
-        self.client.execute("SET LOCAL client_min_messages = 'WARNING'", &[]).await?;
+        self.client.execute("SET client_min_messages = 'WARNING'", &[]).await?;
 
         // Create pgmg schema if it doesn't exist
         self.client.execute(
@@ -84,7 +84,7 @@ impl<'a> StateManager<'a> {
         // Index on object_type for filtering queries by type
         self.client.execute(
             r#"
-            CREATE INDEX IF NOT EXISTS idx_pgmg_state_object_type 
+            CREATE INDEX IF NOT EXISTS idx_pgmg_state_object_type
             ON pgmg.pgmg_state (object_type)
             "#,
             &[],
@@ -93,7 +93,7 @@ impl<'a> StateManager<'a> {
         // Index on last_applied for time-based queries
         self.client.execute(
             r#"
-            CREATE INDEX IF NOT EXISTS idx_pgmg_state_last_applied 
+            CREATE INDEX IF NOT EXISTS idx_pgmg_state_last_applied
             ON pgmg.pgmg_state (last_applied)
             "#,
             &[],
@@ -102,7 +102,7 @@ impl<'a> StateManager<'a> {
         // Index on migrations applied_at for chronological queries
         self.client.execute(
             r#"
-            CREATE INDEX IF NOT EXISTS idx_pgmg_migrations_applied_at 
+            CREATE INDEX IF NOT EXISTS idx_pgmg_migrations_applied_at
             ON pgmg.pgmg_migrations (applied_at)
             "#,
             &[],
@@ -111,7 +111,7 @@ impl<'a> StateManager<'a> {
         // Indexes for dependency lookups
         self.client.execute(
             r#"
-            CREATE INDEX IF NOT EXISTS idx_pgmg_dependencies_dependent 
+            CREATE INDEX IF NOT EXISTS idx_pgmg_dependencies_dependent
             ON pgmg.pgmg_dependencies (dependent_type, dependent_name)
             "#,
             &[],
@@ -119,11 +119,14 @@ impl<'a> StateManager<'a> {
 
         self.client.execute(
             r#"
-            CREATE INDEX IF NOT EXISTS idx_pgmg_dependencies_dependency 
+            CREATE INDEX IF NOT EXISTS idx_pgmg_dependencies_dependency
             ON pgmg.pgmg_dependencies (dependency_type, dependency_name)
             "#,
             &[],
         ).await?;
+
+        // Restore default message level
+        self.client.execute("SET client_min_messages = 'NOTICE'", &[]).await?;
 
         Ok(())
     }
