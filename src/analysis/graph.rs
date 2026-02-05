@@ -121,10 +121,11 @@ impl DependencyGraph {
             
             // Add edges for type dependencies
             for dep in &filtered_deps.types {
-                // Type dependencies can be satisfied by types, domains, or views (used as composite types)
-                if let Some(dep_obj) = objects.iter().find(|o| 
-                    &o.qualified_name == dep && 
-                    matches!(o.object_type, ObjectType::Type | ObjectType::Domain | ObjectType::View | ObjectType::Table)
+                // Type dependencies can be satisfied by types, domains, views, materialized views, or tables
+                // (all of these create implicit row types in PostgreSQL)
+                if let Some(dep_obj) = objects.iter().find(|o|
+                    &o.qualified_name == dep &&
+                    matches!(o.object_type, ObjectType::Type | ObjectType::Domain | ObjectType::View | ObjectType::MaterializedView | ObjectType::Table)
                 ) {
                     let dep_ref = ObjectRef {
                         object_type: dep_obj.object_type.clone(),
@@ -614,5 +615,68 @@ mod tests {
         assert!(graphviz_output.contains("lightblue")); // View color
         assert!(graphviz_output.contains("lightgreen")); // Function color
         assert!(graphviz_output.contains("->"));  // Edge indicator
+    }
+
+    #[test]
+    fn test_composite_type_depends_on_materialized_view() {
+        // Test that a composite type with a type dependency on a materialized view
+        // is correctly tracked in the dependency graph
+        let mv_deps = Dependencies {
+            relations: HashSet::new(),
+            functions: HashSet::new(),
+            types: HashSet::new(),
+        };
+
+        let mut type_deps = Dependencies {
+            relations: HashSet::new(),
+            functions: HashSet::new(),
+            types: HashSet::new(),
+        };
+        // Composite type depends on materialized view's implicit row type
+        type_deps.types.insert(QualifiedIdent::new(Some("core".to_string()), "seller_stats".to_string()));
+
+        let objects = vec![
+            create_test_object(ObjectType::MaterializedView, "seller_stats", Some("core"), mv_deps),
+            create_test_object(ObjectType::Type, "seller_feedback_summary", Some("api"), type_deps),
+        ];
+
+        let builtin_catalog = BuiltinCatalog::new();
+        let graph = DependencyGraph::build_from_objects(&objects, &builtin_catalog).unwrap();
+
+        // Verify the dependency edge was created
+        assert_eq!(graph.node_count(), 2);
+        assert_eq!(graph.edge_count(), 1);
+        assert!(!graph.has_cycles());
+
+        let mv_ref = ObjectRef::new(
+            ObjectType::MaterializedView,
+            QualifiedIdent::new(Some("core".to_string()), "seller_stats".to_string())
+        );
+        let type_ref = ObjectRef::new(
+            ObjectType::Type,
+            QualifiedIdent::new(Some("api".to_string()), "seller_feedback_summary".to_string())
+        );
+
+        // Verify the composite type is a dependent of the materialized view
+        let dependents = graph.dependents_of(&mv_ref);
+        assert_eq!(dependents.len(), 1);
+        assert_eq!(dependents[0].qualified_name.name, "seller_feedback_summary");
+
+        // Verify the materialized view is a dependency of the composite type
+        let dependencies = graph.dependencies_of(&type_ref);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].qualified_name.name, "seller_stats");
+
+        // Verify deletion order: composite type should come before materialized view
+        let deletion_order = graph.deletion_order().unwrap();
+        let type_pos = deletion_order.iter().position(|obj| obj.qualified_name.name == "seller_feedback_summary").unwrap();
+        let mv_pos = deletion_order.iter().position(|obj| obj.qualified_name.name == "seller_stats").unwrap();
+        assert!(type_pos < mv_pos, "Composite type should be deleted before materialized view");
+
+        // Verify creation order: materialized view should come before composite type
+        let creation_order = graph.creation_order().unwrap();
+        let type_pos_create = creation_order.iter().position(|obj| obj.qualified_name.name == "seller_feedback_summary").unwrap();
+        let mv_pos_create = creation_order.iter().position(|obj| obj.qualified_name.name == "seller_stats").unwrap();
+        assert!(mv_pos_create < type_pos_create, "Materialized view should be created before composite type");
     }
 }
