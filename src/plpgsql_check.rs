@@ -66,7 +66,12 @@ where
                            ON (pg_trigger.tgfoid = pg_proc.oid)
             WHERE
               prolang = (SELECT lang.oid FROM pg_language lang WHERE lang.lanname = 'plpgsql') AND
-              pronamespace <> (SELECT nsp.oid FROM pg_namespace nsp WHERE nsp.nspname = 'pg_catalog')";
+              pronamespace <> (SELECT nsp.oid FROM pg_namespace nsp WHERE nsp.nspname = 'pg_catalog') AND
+              pg_proc.oid NOT IN (
+                  SELECT objid FROM pg_depend
+                  WHERE deptype = 'e'
+                  AND classid = 'pg_proc'::regclass
+              )";
 
     // Build dynamic WHERE conditions
     let mut where_conditions = Vec::new();
