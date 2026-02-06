@@ -300,7 +300,7 @@ async fn execute_all_changes<C: GenericClient>(
     // This unblocks migrations that would otherwise be blocked by dependent objects
     let mut pre_dropped_objects: HashSet<String> = HashSet::new();
 
-    if !plan_result.new_migrations.is_empty() && !plan_result.changes.is_empty() {
+    if !plan_result.changes.is_empty() {
         // Collect all objects that need dropping (both updates and deletes)
         // These must be combined and sorted together by dependency order because
         // dependencies can cross between the two groups
@@ -312,7 +312,7 @@ async fn execute_all_changes<C: GenericClient>(
 
         if !all_to_drop.is_empty() {
             if !test_mode {
-                info!(count = all_to_drop.len(), "Pre-dropping managed objects to unblock migrations");
+                info!(count = all_to_drop.len(), "Dropping objects for update/delete");
             }
 
             // Get dependency order for proper dropping
@@ -446,201 +446,29 @@ async fn execute_all_changes<C: GenericClient>(
         let (creates, non_creates): (Vec<_>, Vec<_>) = non_migrations.into_iter()
             .partition(|change| matches!(change, ChangeOperation::CreateObject { .. }));
         
-        let (updates, deletes): (Vec<_>, Vec<_>) = non_creates.into_iter()
+        let (updates, _deletes): (Vec<_>, Vec<_>) = non_creates.into_iter()
             .partition(|change| matches!(change, ChangeOperation::UpdateObject { .. }));
-        
-        // Get dependency order if available
-        let (creation_order, deletion_order) = if let Some(ref dependency_graph) = plan_result.dependency_graph {
-            match (dependency_graph.creation_order(), dependency_graph.deletion_order()) {
-                (Ok(create_ord), Ok(delete_ord)) => (Some(create_ord), Some(delete_ord)),
+
+        // Get creation order if available (deletion order is handled in the unified drop phase above)
+        let creation_order = if let Some(ref dependency_graph) = plan_result.dependency_graph {
+            match dependency_graph.creation_order() {
+                Ok(create_ord) => Some(create_ord),
                 _ => {
                     warn!("Could not determine dependency order. Applying changes in original order.");
-                    (None, None)
+                    None
                 }
             }
         } else {
-            (None, None)
+            None
         };
 
         // Track if transaction has been aborted
         let mut transaction_aborted = false;
 
-        // Phase 1: Drop objects that need updating (in reverse dependency order)
-        if !updates.is_empty() && deletion_order.is_some() {
-            if !test_mode {
-                debug!("Phase 1: Dropping objects for update");
-            }
-            let del_order = deletion_order.as_ref().expect("deletion_order was checked to be Some");
-            
-            // Sort updates by deletion order
-            let mut ordered_updates_for_drop = Vec::new();
-            for object_ref in del_order {
-                if let Some(update) = updates.iter().find(|u| match u {
-                    ChangeOperation::UpdateObject { object, .. } => 
-                        object.object_type == object_ref.object_type &&
-                        object.qualified_name == object_ref.qualified_name,
-                    _ => false,
-                }) {
-                    ordered_updates_for_drop.push(*update);
-                }
-            }
-            
-            for change in ordered_updates_for_drop {
-                if transaction_aborted { break; }
-
-                if let ChangeOperation::UpdateObject { object, .. } = change {
-                    // Skip if already pre-dropped
-                    let object_key = format!("{:?}:{}", object.object_type, format_object_name(object));
-                    if pre_dropped_objects.contains(&object_key) {
-                        continue;
-                    }
-
-                    match apply_drop_for_update(client, object).await {
-                        Ok(_) => {
-                            debug!(
-                                object_type = %format!("{:?}", object.object_type).to_lowercase(),
-                                object_name = %format_object_name(object),
-                                "Dropped object for update"
-                            );
-                        }
-                        Err(e) => {
-                            apply_result.errors.push(format!("Failed to drop {} for update: {}", format_object_name(object), e));
-                            error!(
-                                object_name = %format_object_name(object),
-                                error = %e,
-                                "Failed to drop object for update"
-                            );
-                            transaction_aborted = true;
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Phase 2: Delete objects marked for deletion (in dependency order)
-        if !deletes.is_empty() && !transaction_aborted {
-            if !test_mode {
-                debug!("Phase 2: Deleting objects");
-            }
-            
-            // Separate comments from other deletions
-            let (comment_deletes, non_comment_deletes): (Vec<_>, Vec<_>) = deletes.into_iter()
-                .partition(|change| match change {
-                    ChangeOperation::DeleteObject { object_type, .. } => object_type == &ObjectType::Comment,
-                    _ => false,
-                });
-            
-            // Process comments first (they need their parent objects to exist)
-            if !comment_deletes.is_empty() {
-                debug!("Processing comments first");
-                for change in comment_deletes {
-                    if transaction_aborted { break; }
-
-                    if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
-                        // Skip if already pre-dropped
-                        let object_key = format!("{:?}:{}", object_type, object_name);
-                        if pre_dropped_objects.contains(&object_key) {
-                            continue;
-                        }
-
-                        match apply_delete_object(client, object_type, object_name).await {
-                            Ok(_) => {
-                                apply_result.objects_deleted.push(object_name.clone());
-                                info!(
-                                    object_type = %format!("{:?}", object_type).to_lowercase(),
-                                    object_name = %object_name,
-                                    "Deleted object"
-                                );
-                            }
-                            Err(e) => {
-                                apply_result.errors.push(format!("Failed to delete {}: {}", object_name, e));
-                                error!(
-                                    object_name = %object_name,
-                                    error = %e,
-                                    "Failed to delete object"
-                                );
-                                transaction_aborted = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Then process non-comment deletions in dependency order
-            if !non_comment_deletes.is_empty() && !transaction_aborted {
-                // Sort deletions by dependency order if available
-                let ordered_deletes = if let Some(ref del_order) = deletion_order {
-                    let mut ordered = Vec::new();
-                    // Process in deletion order (dependents first)
-                    for object_ref in del_order {
-                        if let Some(delete_op) = non_comment_deletes.iter().find(|d| match d {
-                            ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                                let qname = crate::sql::QualifiedIdent::from_qualified_name(object_name);
-                                object_type == &object_ref.object_type && qname == object_ref.qualified_name
-                            }
-                            _ => false,
-                        }) {
-                            ordered.push(*delete_op);
-                        }
-                    }
-                    // Add any deletes not in the dependency graph at the end
-                    for delete_op in &non_comment_deletes {
-                        let already_added = ordered.iter().any(|o| {
-                            match (o, delete_op) {
-                                (ChangeOperation::DeleteObject { object_type: t1, object_name: n1, .. },
-                                 ChangeOperation::DeleteObject { object_type: t2, object_name: n2, .. }) => {
-                                    t1 == t2 && n1 == n2
-                                }
-                                _ => false,
-                            }
-                        });
-                        if !already_added {
-                            ordered.push(*delete_op);
-                        }
-                    }
-                    ordered
-                } else {
-                    non_comment_deletes
-                };
-                
-                for change in ordered_deletes {
-                    if transaction_aborted { break; }
-
-                    if let ChangeOperation::DeleteObject { object_type, object_name, .. } = change {
-                        // Skip if already pre-dropped
-                        let object_key = format!("{:?}:{}", object_type, object_name);
-                        if pre_dropped_objects.contains(&object_key) {
-                            continue;
-                        }
-
-                        match apply_delete_object(client, object_type, object_name).await {
-                            Ok(_) => {
-                                apply_result.objects_deleted.push(object_name.clone());
-                                info!(
-                                    object_type = %format!("{:?}", object_type).to_lowercase(),
-                                    object_name = %object_name,
-                                    "Deleted object"
-                                );
-                            }
-                            Err(e) => {
-                                apply_result.errors.push(format!("Failed to delete {}: {}", object_name, e));
-                                error!(
-                                    object_name = %object_name,
-                                    error = %e,
-                                    "Failed to delete object"
-                                );
-                                transaction_aborted = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Phase 3: Create new objects and recreate updated objects (in dependency order)
+        // Phase 2: Create new objects and recreate updated objects (in dependency order)
         if !transaction_aborted && (creates.len() + updates.len() > 0) {
             if !test_mode {
-                debug!("Phase 3: Creating objects");
+                debug!("Phase 2: Creating objects");
             }
             
             // Combine creates and updates (which need recreation)
