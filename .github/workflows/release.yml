@@ -1,0 +1,49 @@
+name: Build Linux Binary
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: linux-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --features tls
+
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pgmg-linux-x86_64
+          path: target/release/pgmg
+
+      - name: Create or update latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp target/release/pgmg pgmg-linux-x86_64
+          if gh release view latest > /dev/null 2>&1; then
+            gh release upload latest pgmg-linux-x86_64 --clobber
+          else
+            gh release create latest pgmg-linux-x86_64 \
+              --title "Latest Build" \
+              --notes "Automatically built from the latest commit on main." \
+              --prerelease
+          fi
