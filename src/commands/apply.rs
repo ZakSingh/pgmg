@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::collections::HashSet;
 use crate::db::{StateManager, connect_to_database, DatabaseConfig, AdvisoryLockManager, AdvisoryLockError};
-use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file};
+use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file, migration_analyzer::extract_enum_add_value_statements};
 use crate::commands::plan::{execute_plan, ChangeOperation, PlanResult};
 use crate::config::PgmgConfig;
 use crate::analysis::ObjectRef;
@@ -270,16 +270,57 @@ async fn execute_apply_internal(
         }
     }
 
+    // Step 2.5: Pre-commit ALTER TYPE ADD VALUE statements outside the transaction.
+    // PostgreSQL prohibits using newly added enum values within the same transaction
+    // they were added in. We extract these statements, run them with IF NOT EXISTS
+    // in auto-commit mode, then skip them during the main migration.
+    let mut pre_committed_enum_stmts: HashSet<String> = HashSet::new();
+
+    if use_transaction {
+        if let Some(ref migrations_dir) = migrations_dir {
+            for migration_name in &plan_result.new_migrations {
+                let migration_path = migrations_dir.join(format!("{}.sql", migration_name));
+                if let Ok(content) = std::fs::read_to_string(&migration_path) {
+                    if let Ok(enum_stmts) = extract_enum_add_value_statements(&content) {
+                        for (original, rewritten) in &enum_stmts {
+                            match client.execute(rewritten.as_str(), &[]).await {
+                                Ok(_) => {
+                                    debug!(sql = %rewritten, "Pre-committed enum value");
+                                    pre_committed_enum_stmts.insert(original.clone());
+                                }
+                                Err(e) => {
+                                    return Err(format!(
+                                        "Failed to pre-commit enum value: {}\nSQL: {}",
+                                        e, rewritten
+                                    ).into());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !pre_committed_enum_stmts.is_empty() {
+            info!(
+                count = pre_committed_enum_stmts.len(),
+                "Pre-committed enum values outside transaction"
+            );
+        }
+    }
+
     // Step 3: Execute changes in either transaction or auto-commit mode
     if use_transaction {
         let transaction = client.transaction().await?;
         execute_all_changes(&transaction, &mut apply_result, &plan_result,
-                           &migrations_dir, &code_dir, config, test_mode).await?;
+                           &migrations_dir, &code_dir, config, test_mode,
+                           &pre_committed_enum_stmts).await?;
         transaction.commit().await?;
         print_apply_success_message(&apply_result, test_mode);
     } else {
         execute_all_changes(client, &mut apply_result, &plan_result,
-                           &migrations_dir, &code_dir, config, test_mode).await?;
+                           &migrations_dir, &code_dir, config, test_mode,
+                           &pre_committed_enum_stmts).await?;
         print_apply_success_message(&apply_result, test_mode);
     }
 
@@ -295,6 +336,7 @@ async fn execute_all_changes<C: GenericClient>(
     _code_dir: &Option<PathBuf>,
     config: &PgmgConfig,
     test_mode: bool,
+    pre_committed_enum_stmts: &HashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Step 2.5: Pre-drop managed objects if there are migrations
     // This unblocks migrations that would otherwise be blocked by dependent objects
@@ -403,7 +445,7 @@ async fn execute_all_changes<C: GenericClient>(
         
         if let Some(ref migrations_dir) = migrations_dir {
             for migration_name in &plan_result.new_migrations {
-                match apply_migration(client, migrations_dir, migration_name, test_mode).await {
+                match apply_migration(client, migrations_dir, migration_name, test_mode, pre_committed_enum_stmts).await {
                     Ok(_) => {
                         apply_result.migrations_applied.push(migration_name.clone());
                         if !test_mode {
@@ -640,6 +682,7 @@ async fn apply_migration<C: GenericClient>(
     migrations_dir: &PathBuf,
     migration_name: &str,
     test_mode: bool,
+    pre_committed_enum_stmts: &HashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let migration_path = migrations_dir.join(format!("{}.sql", migration_name));
     let migration_content = std::fs::read_to_string(&migration_path)?;
@@ -667,7 +710,27 @@ async fn apply_migration<C: GenericClient>(
                 warn!("Skipping plpgsql_check statement (not available on AWS RDS)");
                 continue;
             }
-            
+
+            // Skip ALTER TYPE ADD VALUE statements that were pre-committed
+            if !pre_committed_enum_stmts.is_empty() {
+                if let Ok(parsed) = pg_query::parse(&statement.sql) {
+                    let is_pre_committed = parsed.protobuf.stmts.iter().any(|s| {
+                        if let Some(node) = &s.stmt {
+                            if let Some(pg_query::NodeEnum::AlterEnumStmt(alter_enum)) = &node.node {
+                                if let Ok(deparsed) = pg_query::NodeEnum::AlterEnumStmt(alter_enum.clone()).deparse() {
+                                    return pre_committed_enum_stmts.contains(&deparsed);
+                                }
+                            }
+                        }
+                        false
+                    });
+                    if is_pre_committed {
+                        debug!(sql = %statement.sql, "Skipping pre-committed enum value statement");
+                        continue;
+                    }
+                }
+            }
+
             match client.execute(&statement.sql, &[]).await {
                 Ok(_) => {},
                 Err(e) => {

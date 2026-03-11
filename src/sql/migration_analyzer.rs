@@ -1,7 +1,10 @@
-//! Analyze migration SQL to extract tables affected by ALTER TABLE statements.
+//! Analyze migration SQL to extract tables affected by ALTER TABLE statements
+//! and enum values added by ALTER TYPE ... ADD VALUE statements.
 //!
 //! This module helps identify which managed objects need to be pre-dropped
-//! before migrations that alter tables they depend on.
+//! before migrations that alter tables they depend on, and which enum ADD VALUE
+//! statements need to be pre-committed outside a transaction to avoid PostgreSQL's
+//! "unsafe use of new value" error.
 
 use std::collections::HashSet;
 use crate::sql::QualifiedIdent;
@@ -32,6 +35,42 @@ pub fn extract_altered_tables(sql: &str) -> Result<HashSet<QualifiedIdent>, Box<
     }
 
     Ok(tables)
+}
+
+/// Extract `ALTER TYPE ... ADD VALUE` statements from migration SQL and return
+/// them rewritten with `IF NOT EXISTS`.
+///
+/// These statements cannot be used inside a transaction alongside statements that
+/// reference the new enum value. By extracting and pre-committing them before the
+/// main migration transaction, we avoid PostgreSQL's "unsafe use of new value" error.
+///
+/// Returns a vec of (original_sql, rewritten_sql) pairs. The original SQL is used
+/// to identify which statements to skip during the main migration, and the rewritten
+/// SQL (with IF NOT EXISTS) is executed in the pre-commit phase for idempotency.
+pub fn extract_enum_add_value_statements(sql: &str) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let parsed = pg_query::parse(sql)?;
+    let mut results = Vec::new();
+
+    for stmt in &parsed.protobuf.stmts {
+        if let Some(node) = &stmt.stmt {
+            if let Some(NodeEnum::AlterEnumStmt(alter_enum)) = &node.node {
+                // Only handle ADD VALUE (new_val is non-empty, old_val is empty)
+                if !alter_enum.new_val.is_empty() && alter_enum.old_val.is_empty() {
+                    // Get the original statement text
+                    let original = NodeEnum::AlterEnumStmt(alter_enum.clone()).deparse()?;
+
+                    // Create a modified version with IF NOT EXISTS
+                    let mut modified = alter_enum.clone();
+                    modified.skip_if_new_val_exists = true;
+                    let rewritten = NodeEnum::AlterEnumStmt(modified).deparse()?;
+
+                    results.push((original, rewritten));
+                }
+            }
+        }
+    }
+
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -107,5 +146,56 @@ mod tests {
 
         assert_eq!(tables.len(), 1);
         assert!(tables.contains(&QualifiedIdent::new(None, "orders".to_string())));
+    }
+
+    #[test]
+    fn test_extract_enum_add_value() {
+        let sql = r#"ALTER TYPE "public"."enum_status" ADD VALUE 'active' BEFORE 'inactive';"#;
+        let results = extract_enum_add_value_statements(sql).unwrap();
+
+        assert_eq!(results.len(), 1);
+        // The rewritten SQL should contain IF NOT EXISTS
+        assert!(results[0].1.to_uppercase().contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_extract_enum_add_value_already_if_not_exists() {
+        let sql = r#"ALTER TYPE status ADD VALUE IF NOT EXISTS 'active';"#;
+        let results = extract_enum_add_value_statements(sql).unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.to_uppercase().contains("IF NOT EXISTS"));
+    }
+
+    #[test]
+    fn test_extract_enum_add_value_multiple() {
+        let sql = r#"
+            ALTER TYPE "public"."enum_status" ADD VALUE 'active' BEFORE 'inactive';
+            ALTER TABLE users ADD COLUMN status text;
+            ALTER TYPE "public"."enum_role" ADD VALUE 'admin';
+        "#;
+        let results = extract_enum_add_value_statements(sql).unwrap();
+
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_extract_enum_add_value_none_present() {
+        let sql = r#"
+            ALTER TABLE users ADD COLUMN status text;
+            CREATE TABLE orders (id serial primary key);
+        "#;
+        let results = extract_enum_add_value_statements(sql).unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_extract_enum_rename_value_not_extracted() {
+        // RENAME VALUE should not be extracted - it's not ADD VALUE
+        let sql = r#"ALTER TYPE status RENAME VALUE 'old' TO 'new';"#;
+        let results = extract_enum_add_value_statements(sql).unwrap();
+
+        assert!(results.is_empty());
     }
 }
