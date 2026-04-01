@@ -1,14 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use crate::db::connect_with_url;
-use crate::sql::splitter::split_sql_file;
 use owo_colors::OwoColorize;
 use tracing::{debug, info};
 
 #[derive(Debug)]
 pub struct SeedResult {
     pub files_processed: Vec<String>,
-    pub total_statements: usize,
     pub errors: Vec<String>,
 }
 
@@ -24,7 +22,6 @@ pub async fn execute_seed(
 
     let mut result = SeedResult {
         files_processed: Vec::new(),
-        total_statements: 0,
         errors: Vec::new(),
     };
 
@@ -55,13 +52,11 @@ pub async fn execute_seed(
         debug!("Processing seed file: {}", file_name);
         
         match process_seed_file(&transaction, seed_file).await {
-            Ok(statement_count) => {
+            Ok(()) => {
                 result.files_processed.push(file_name.to_string());
-                result.total_statements += statement_count;
-                println!("  {} Executed {}: {} statements", 
+                println!("  {} Executed {}",
                     "✓".green().bold(),
                     file_name.cyan(),
-                    statement_count.to_string().yellow()
                 );
             }
             Err(e) => {
@@ -114,26 +109,14 @@ fn scan_seed_files(seed_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::
     Ok(sql_files)
 }
 
-/// Process a single seed file by executing all its statements
+/// Process a single seed file by executing all its statements via batch_execute
 async fn process_seed_file(
     client: &tokio_postgres::Transaction<'_>,
     file_path: &Path,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let content = fs::read_to_string(file_path)?;
-    
-    // Split file into individual statements
-    let statements = split_sql_file(&content)?;
-    
-    let mut statement_count = 0;
-    
-    for statement in statements {
-        if !statement.sql.trim().is_empty() {
-            client.execute(&statement.sql, &[]).await?;
-            statement_count += 1;
-        }
-    }
-    
-    Ok(statement_count)
+    client.batch_execute(&content).await?;
+    Ok(())
 }
 
 pub fn print_seed_summary(result: &SeedResult) {
@@ -145,10 +128,9 @@ pub fn print_seed_summary(result: &SeedResult) {
             println!("  {} {}", "✓".green().bold(), file.cyan());
         }
         
-        println!("\n{}: {} files, {} total statements", 
+        println!("\n{}: {} files",
             "Summary".bold(),
             result.files_processed.len().to_string().yellow(),
-            result.total_statements.to_string().yellow()
         );
     }
     
