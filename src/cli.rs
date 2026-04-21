@@ -165,6 +165,11 @@ pub enum Commands {
     
     /// Create a new migration file
     New {
+        /// Name for the migration (alphanumeric, underscores, and hyphens only).
+        /// If omitted, you will be prompted interactively.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+
         /// Directory containing sequential migration files
         #[arg(long)]
         migrations_dir: Option<PathBuf>,

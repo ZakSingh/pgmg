@@ -458,22 +458,23 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         
-        Commands::New { migrations_dir } => {
+        Commands::New { name, migrations_dir } => {
             logging::output::header("Creating New Migration");
-            
+
             // Merge CLI args with config file
             let merged_config = PgmgConfig::merge_with_cli_new(
                 config_file,
                 migrations_dir,
             );
-            
+
             // Log configuration
             if let Some(ref dir) = merged_config.migrations_dir {
                 debug!("Migrations directory: {}", dir.display());
             }
-            
+
             // Execute new migration creation
             let result = execute_new(
+                name,
                 merged_config.migrations_dir.clone(),
                 &merged_config,
             ).await

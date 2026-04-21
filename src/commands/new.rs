@@ -12,6 +12,7 @@ pub struct NewResult {
 }
 
 pub async fn execute_new(
+    name: Option<String>,
     migrations_dir: Option<PathBuf>,
     config: &PgmgConfig,
 ) -> Result<NewResult, Box<dyn std::error::Error>> {
@@ -23,20 +24,26 @@ pub async fn execute_new(
     // Ensure migrations directory exists
     if !migrations_dir.exists() {
         fs::create_dir_all(&migrations_dir)?;
-        println!("{} Created migrations directory: {}", 
-            "✓".green().bold(), 
+        println!("{} Created migrations directory: {}",
+            "✓".green().bold(),
             migrations_dir.display().to_string().cyan()
         );
     }
 
-    // Prompt for migration name
-    print!("Enter a name for the migration: ");
-    io::stdout().flush()?;
-    
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    let migration_name = input.trim();
-    
+    // Get migration name from argument or prompt interactively
+    let input_name = match name {
+        Some(n) => n,
+        None => {
+            print!("Enter a name for the migration: ");
+            io::stdout().flush()?;
+
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            input.trim().to_string()
+        }
+    };
+    let migration_name = input_name.trim();
+
     if migration_name.is_empty() {
         return Err("Migration name cannot be empty".into());
     }
