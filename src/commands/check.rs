@@ -1,6 +1,8 @@
-use crate::db::connect_with_url;
-use crate::plpgsql_check::{check_all_functions, is_plpgsql_check_available, PlpgsqlCheckError, display_check_errors};
+use crate::db::{connect_with_url, scan_sql_files};
+use crate::plpgsql_check::{check_all_functions, is_plpgsql_check_available, resolve_source_location, PlpgsqlCheckError, display_check_errors};
+use crate::BuiltinCatalog;
 use owo_colors::OwoColorize;
+use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Debug)]
@@ -17,20 +19,39 @@ pub async fn execute_check(
     function_name: Option<String>,
     schemas: Option<Vec<String>>,
     errors_only: bool,
+    code_dir: Option<PathBuf>,
 ) -> Result<CheckResult, Box<dyn std::error::Error>> {
     let start_time = Instant::now();
-    
+
     // Connect to database
     let (client, connection) = connect_with_url(&connection_string).await?;
-    
+
     // Spawn connection handler
     connection.spawn();
-    
+
     // Check if plpgsql_check is available first
     if !is_plpgsql_check_available(&client).await? {
         return Err("plpgsql_check extension is not installed. Please install it with: CREATE EXTENSION plpgsql_check;".into());
     }
-    
+
+    // Scan source files so we can map plpgsql_check's function-relative lineno
+    // back to file:line. Best-effort — if scanning fails or the dir is missing,
+    // we fall back to function-name-only locations.
+    let source_objects = match code_dir.as_ref() {
+        Some(dir) if dir.exists() => {
+            let catalog = BuiltinCatalog::new();
+            match scan_sql_files(dir, &catalog).await {
+                Ok(objs) => objs,
+                Err(e) => {
+                    eprintln!("{} Failed to scan {}: {} — line numbers will be function-relative",
+                        "warning:".yellow().bold(), dir.display(), e);
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+
     // Build schema filter
     let schema_filter = if let Some(ref schema_list) = schemas {
         if schema_list.is_empty() {
@@ -42,11 +63,11 @@ pub async fn execute_check(
         // Default: check all user schemas (excluding pg_* and information_schema)
         None
     };
-    
+
     // Use the new bulk query approach
-    let all_results = check_all_functions(&client, schema_filter.as_deref(), function_name.as_deref()).await?;
-    
-    if all_results.is_empty() {
+    let (all_results, functions_checked) = check_all_functions(&client, schema_filter.as_deref(), function_name.as_deref()).await?;
+
+    if functions_checked == 0 {
         return Ok(CheckResult {
             functions_checked: 0,
             errors_found: 0,
@@ -55,39 +76,36 @@ pub async fn execute_check(
             duration: start_time.elapsed(),
         });
     }
-    
-    // Group results by function to count how many functions were checked
-    let mut function_names = std::collections::HashSet::new();
-    for result in &all_results {
-        if let Some(functionid) = &result.functionid {
-            function_names.insert(functionid.clone());
-        }
-    }
-    
-    let functions_checked = function_names.len();
+
     println!("{} Checking {} PL/pgSQL functions/procedures...", "→".cyan(), functions_checked.to_string().yellow());
-    
+
     let mut all_errors = Vec::new();
     let mut errors_found = 0;
     let mut warnings_found = 0;
-    
-    // Process results
+
+    // Process results. plpgsql_check emits levels like "warning extra",
+    // "warning performance", "warning security" — match on prefix, not equality.
     for result in all_results {
         if let Some(level) = &result.level {
-            // Count errors and warnings
-            match level.as_str() {
-                "error" => errors_found += 1,
-                "warning" => warnings_found += 1,
-                _ => {}
+            let is_error = level.starts_with("error");
+            let is_warning = level.starts_with("warning");
+
+            if is_error {
+                errors_found += 1;
+            } else if is_warning {
+                warnings_found += 1;
             }
-            
-            // Collect errors and warnings (unless errors_only mode)
-            if level == "error" || (level == "warning" && !errors_only) {
+
+            if is_error || (is_warning && !errors_only) {
                 let function_name = result.functionid.as_deref().unwrap_or("unknown");
+                let (source_file, source_line) = match &result.functionid {
+                    Some(fid) => resolve_source_location(&source_objects, fid, result.lineno),
+                    None => (None, None),
+                };
                 let error = PlpgsqlCheckError {
                     function_name: function_name.to_string(),
-                    source_file: None, // No source file info for direct checks
-                    source_line: None,
+                    source_file,
+                    source_line,
                     check_result: result,
                 };
                 all_errors.push(error);

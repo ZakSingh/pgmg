@@ -486,7 +486,10 @@ async fn run(cli: Cli) -> Result<()> {
         
         Commands::Check { function_name, connection_string, schema, errors_only } => {
             logging::output::header("Checking Functions with plpgsql_check");
-            
+
+            // Pull code_dir out of config (used to map plpgsql_check linenos to file:line).
+            let code_dir = config_file.as_ref().and_then(|c| c.code_dir.clone());
+
             // Get connection string from CLI, env, or config
             let conn_str = connection_string
                 .or(config_file.and_then(|c| c.connection_string))
@@ -494,21 +497,21 @@ async fn run(cli: Cli) -> Result<()> {
                 .ok_or_else(|| PgmgError::Configuration(
                     "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
                 ))?;
-            
+
             // Validate connection string format
             if !conn_str.starts_with("postgres://") && !conn_str.starts_with("postgresql://") {
                 return Err(PgmgError::InvalidConnectionString(conn_str));
             }
-            
+
             // Log configuration
             debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
             if let Some(ref schemas) = schema {
                 debug!("Schemas: {:?}", schemas);
             }
             debug!("Errors only: {}", errors_only);
-            
+
             // Execute check
-            let result = execute_check(conn_str, function_name, schema, errors_only).await
+            let result = execute_check(conn_str, function_name, schema, errors_only, code_dir).await
                 .map_err(|e| PgmgError::Other(format!("Check failed: {}", e)))?;
             
             print_check_summary(&result);

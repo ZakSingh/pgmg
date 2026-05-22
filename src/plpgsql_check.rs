@@ -40,38 +40,31 @@ where
     Ok(result.get(0))
 }
 
-/// Run plpgsql_check on all functions using the bulk query approach
+/// Run plpgsql_check on all functions using the bulk query approach.
+/// Returns (results, functions_examined) — `functions_examined` is the count of
+/// eligible PL/pgSQL functions plpgsql_check ran against, which is needed because
+/// clean functions return zero rows from plpgsql_check_function_tb().
 pub async fn check_all_functions<C>(
     client: &C,
     schema_filter: Option<&[String]>,
     function_name_filter: Option<&str>,
-) -> Result<Vec<PlpgsqlCheckResult>, Box<dyn std::error::Error>>
+) -> Result<(Vec<PlpgsqlCheckResult>, usize), Box<dyn std::error::Error>>
 where
     C: tokio_postgres::GenericClient,
 {
-    // Base query from plpgsql_check README
-    let base_query = "
-        SELECT
-          (pcf).functionid::regprocedure::text, (pcf).lineno, (pcf).statement,
-          (pcf).sqlstate, (pcf).message, (pcf).detail, (pcf).hint, (pcf).level,
-          (pcf).\"position\", (pcf).query, (pcf).context
-        FROM
-          (
-            SELECT
-              plpgsql_check_function_tb(pg_proc.oid, COALESCE(pg_trigger.tgrelid, 0),
-                                        oldtable=>pg_trigger.tgoldtable,
-                                        newtable=>pg_trigger.tgnewtable) AS pcf
-            FROM pg_proc
-                 LEFT JOIN pg_trigger
-                           ON (pg_trigger.tgfoid = pg_proc.oid)
-            WHERE
-              prolang = (SELECT lang.oid FROM pg_language lang WHERE lang.lanname = 'plpgsql') AND
-              pronamespace <> (SELECT nsp.oid FROM pg_namespace nsp WHERE nsp.nspname = 'pg_catalog') AND
-              pg_proc.oid NOT IN (
-                  SELECT objid FROM pg_depend
-                  WHERE deptype = 'e'
-                  AND classid = 'pg_proc'::regclass
-              )";
+    // Shared FROM/WHERE used by both the check query and the count query.
+    let from_clause = "
+        FROM pg_proc
+             LEFT JOIN pg_trigger
+                       ON (pg_trigger.tgfoid = pg_proc.oid)
+        WHERE
+          prolang = (SELECT lang.oid FROM pg_language lang WHERE lang.lanname = 'plpgsql') AND
+          pronamespace <> (SELECT nsp.oid FROM pg_namespace nsp WHERE nsp.nspname = 'pg_catalog') AND
+          pg_proc.oid NOT IN (
+              SELECT objid FROM pg_depend
+              WHERE deptype = 'e'
+              AND classid = 'pg_proc'::regclass
+          )";
 
     // Build dynamic WHERE conditions
     let mut where_conditions = Vec::new();
@@ -90,7 +83,7 @@ where
         where_conditions.push("AND pronamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname LIKE 'pg_%' OR nspname = 'information_schema')".to_string());
     }
 
-    // Add function name filtering  
+    // Add function name filtering
     if let Some(function_name) = function_name_filter {
         // Parse schema-qualified function names
         if function_name.contains('.') {
@@ -110,26 +103,59 @@ where
         where_conditions.push("AND proname NOT LIKE '\\_%'".to_string());
     }
 
-    // Complete the query
-    let full_query = format!("{}
-              {}
-              -- ignore unused triggers
-              AND (pg_proc.prorettype <> (SELECT typ.oid FROM pg_type typ WHERE typ.typname = 'trigger') OR
-                   pg_trigger.tgfoid IS NOT NULL)
+    let trigger_filter = "AND (pg_proc.prorettype <> (SELECT typ.oid FROM pg_type typ WHERE typ.typname = 'trigger') OR
+                               pg_trigger.tgfoid IS NOT NULL)";
+
+    let full_query = format!(
+        "SELECT
+          (pcf).functionid::regprocedure::text, (pcf).lineno, (pcf).statement,
+          (pcf).sqlstate, (pcf).message, (pcf).detail, (pcf).hint, (pcf).level,
+          (pcf).\"position\", (pcf).query, (pcf).context
+        FROM
+          (
+            SELECT
+              plpgsql_check_function_tb(pg_proc.oid, COALESCE(pg_trigger.tgrelid, 0),
+                                        oldtable=>pg_trigger.tgoldtable,
+                                        newtable=>pg_trigger.tgnewtable) AS pcf
+            {from_clause}
+              {extra_where}
+              {trigger_filter}
             OFFSET 0
           ) ss
         ORDER BY (pcf).functionid::regprocedure::text, (pcf).lineno",
-        base_query,
-        where_conditions.join(" ")
+        from_clause = from_clause,
+        extra_where = where_conditions.join(" "),
+        trigger_filter = trigger_filter,
     );
 
-    let rows = if params.is_empty() {
-        client.query(&full_query, &[] as &[&(dyn tokio_postgres::types::ToSql + Sync)]).await?
+    // Count the eligible functions separately — plpgsql_check_function_tb returns
+    // zero rows for clean functions, so we can't infer the total from results.
+    let count_query = format!(
+        "SELECT COUNT(DISTINCT pg_proc.oid)
+        {from_clause}
+          {extra_where}
+          {trigger_filter}",
+        from_clause = from_clause,
+        extra_where = where_conditions.join(" "),
+        trigger_filter = trigger_filter,
+    );
+
+    let (rows, count_row) = if params.is_empty() {
+        let empty: &[&(dyn tokio_postgres::types::ToSql + Sync)] = &[];
+        let rows = client.query(&full_query, empty).await?;
+        let count_row = client.query_one(&count_query, empty).await?;
+        (rows, count_row)
     } else {
-        let params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = 
+        let params_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
             params.iter().map(|p| &**p as &(dyn tokio_postgres::types::ToSql + Sync)).collect();
-        client.query(&full_query, &params_refs).await?
+        let rows = client.query(&full_query, &params_refs).await?;
+        let count_row = client.query_one(&count_query, &params_refs).await?;
+        (rows, count_row)
     };
+
+    let functions_examined: i64 = count_row.get(0);
+    let functions_examined = usize::try_from(functions_examined).unwrap_or(0);
+
     let mut results = Vec::new();
 
     for row in rows {
@@ -154,7 +180,7 @@ where
         }
     }
 
-    Ok(results)
+    Ok((results, functions_examined))
 }
 
 /// Check all functions that were created or updated using the bulk query approach
@@ -184,8 +210,8 @@ where
     }
     
     // Use bulk query to check all functions, then filter results
-    let all_results = check_all_functions(client, None, None).await?;
-    
+    let (all_results, _) = check_all_functions(client, None, None).await?;
+
     // Create a map of modified function names for quick lookup
     let mut modified_function_names = std::collections::HashSet::new();
     for function in &functions {
@@ -209,9 +235,10 @@ where
             
             // Check if this function was modified
             if modified_function_names.contains(&function_name) {
-                // Only report errors and warnings (skip notices)
+                // Only report errors and warnings (skip notices). plpgsql_check
+                // emits levels like "warning extra"/"warning performance" — use prefix.
                 if let Some(level) = &result.level {
-                    if level == "error" || level == "warning" {
+                    if level.starts_with("error") || level.starts_with("warning") {
                         // Find the corresponding SqlObject for source file info
                         let source_info = functions.iter()
                             .find(|f| {
@@ -283,7 +310,7 @@ where
     let num_functions_to_check = functions_to_check.len();
     
     // Use bulk query to check all functions, then filter to dependents
-    let all_results = check_all_functions(client, None, None).await?;
+    let (all_results, _) = check_all_functions(client, None, None).await?;
     
     // Create a map of function names to check
     let mut dependent_function_names = std::collections::HashSet::new();
@@ -309,7 +336,7 @@ where
             if dependent_function_names.contains(&function_name) {
                 // Only report errors (not warnings for dependent functions)
                 if let Some(level) = &result.level {
-                    if level == "error" {
+                    if level.starts_with("error") {
                         // Find the corresponding SqlObject for source file info
                         let source_info = all_file_objects.iter()
                             .find(|f| {
@@ -340,15 +367,94 @@ where
     Ok(errors)
 }
 
-/// Calculate the source file line number from function line number
-fn calculate_source_line(function: &SqlObject, function_line: Option<i32>) -> Option<usize> {
-    match (function.start_line, function_line) {
-        (Some(start), Some(line)) => {
-            // Function line numbers start at 1, we need to add to start_line
-            Some(start + (line as usize) - 1)
+/// Find the line offset (0-based, relative to the first line of the CREATE
+/// statement) of the body's opening dollar-quote tag. Returns `None` if no
+/// dollar-quoted body is found (e.g. SQL-language functions).
+///
+/// Searches for the first `AS $tag$` after a `LANGUAGE plpgsql` keyword anywhere
+/// in the statement. Dollar tags can be empty (`$$`) or named (`$body$`).
+fn body_opener_line_offset(ddl_statement: &str) -> Option<usize> {
+    // Walk char-by-char looking for the first dollar-tag. We only care about a
+    // simple structural match — the SQL parser already validated the statement.
+    let bytes = ddl_statement.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            // Check for valid dollar-tag: $[tag]$ where tag is [A-Za-z0-9_]*
+            let mut j = i + 1;
+            while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                // Found a dollar-tag at position i..=j. Count newlines in [0..i).
+                return Some(ddl_statement[..i].bytes().filter(|&b| b == b'\n').count());
+            }
         }
-        _ => None,
+        i += 1;
     }
+    None
+}
+
+/// Strip the argument list from a regprocedure-style functionid such as
+/// `api.create_chat(bigint,nanoid)` -> `api.create_chat`.
+fn strip_function_args(functionid: &str) -> &str {
+    match functionid.split_once('(') {
+        Some((name, _)) => name,
+        None => functionid,
+    }
+}
+
+/// Find the scanned SqlObject (function/procedure) whose qualified name matches
+/// the regprocedure-style `functionid` returned by plpgsql_check.
+pub fn find_source_object<'a>(
+    objects: &'a [SqlObject],
+    functionid: &str,
+) -> Option<&'a SqlObject> {
+    let bare = strip_function_args(functionid);
+    objects.iter().find(|obj| {
+        if !matches!(obj.object_type, ObjectType::Function | ObjectType::Procedure) {
+            return false;
+        }
+        let obj_name = match &obj.qualified_name.schema {
+            Some(schema) => format!("{}.{}", schema, obj.qualified_name.name),
+            None => obj.qualified_name.name.clone(),
+        };
+        obj_name == bare
+    })
+}
+
+/// Compute the source file (path, 1-based line) for a plpgsql_check result,
+/// looking up the function in the scanned source objects.
+pub fn resolve_source_location(
+    objects: &[SqlObject],
+    functionid: &str,
+    lineno: Option<i32>,
+) -> (Option<String>, Option<usize>) {
+    match find_source_object(objects, functionid) {
+        Some(obj) => (
+            obj.source_file.as_ref().map(|p| p.to_string_lossy().to_string()),
+            calculate_source_line(obj, lineno),
+        ),
+        None => (None, None),
+    }
+}
+
+/// Calculate the source file line number from the function-relative line number
+/// reported by plpgsql_check.
+///
+/// plpgsql_check's `lineno` is 1-indexed within `pg_proc.prosrc`. Because the
+/// body's opening `$tag$` is followed by a newline that gets stored in prosrc,
+/// prosrc line 1 is empty and prosrc line N corresponds to the source file line
+/// `D + N - 1` where D is the source file line containing `AS $tag$`.
+///
+/// D = function.start_line + (line offset from CREATE to the opening `$tag$`).
+fn calculate_source_line(function: &SqlObject, function_line: Option<i32>) -> Option<usize> {
+    let (start, line) = match (function.start_line, function_line) {
+        (Some(s), Some(l)) => (s, l as usize),
+        _ => return None,
+    };
+    let body_offset = body_opener_line_offset(&function.ddl_statement).unwrap_or(0);
+    Some(start + body_offset + line.saturating_sub(1))
 }
 
 /// Format and display plpgsql_check errors, sorted by severity (warnings first, then errors)
@@ -359,33 +465,33 @@ pub fn display_check_errors(errors: &[PlpgsqlCheckError]) {
     
     println!("\n{}", "=== PL/pgSQL Check Results ===".bold().yellow());
     
-    // Sort errors by level - warnings first, then errors
+    // Sort errors by level - warnings first, then errors. plpgsql_check emits
+    // variants like "warning extra", so match on prefix.
+    fn level_order(level: &str) -> u8 {
+        if level.starts_with("warning") {
+            0
+        } else if level.starts_with("error") {
+            1
+        } else {
+            2
+        }
+    }
+
     let mut sorted_errors = errors.to_vec();
     sorted_errors.sort_by(|a, b| {
         let level_a = a.check_result.level.as_deref().unwrap_or("error");
         let level_b = b.check_result.level.as_deref().unwrap_or("error");
-        
-        // Define sort order: warning = 0, error = 1, other = 2
-        let order_a = match level_a {
-            "warning" => 0,
-            "error" => 1,
-            _ => 2,
-        };
-        let order_b = match level_b {
-            "warning" => 0,
-            "error" => 1,
-            _ => 2,
-        };
-        
-        order_a.cmp(&order_b)
+        level_order(level_a).cmp(&level_order(level_b))
     });
     
     for error in &sorted_errors {
         let level_str = error.check_result.level.as_deref().unwrap_or("error");
-        let level_colored = match level_str {
-            "error" => format!("{}", level_str.red().bold()),
-            "warning" => format!("{}", level_str.yellow().bold()),
-            _ => format!("{}", level_str.blue().bold()),
+        let level_colored = if level_str.starts_with("error") {
+            format!("{}", level_str.red().bold())
+        } else if level_str.starts_with("warning") {
+            format!("{}", level_str.yellow().bold())
+        } else {
+            format!("{}", level_str.blue().bold())
         };
         
         // Format location
@@ -422,9 +528,13 @@ pub fn display_check_errors(errors: &[PlpgsqlCheckError]) {
         }
     }
     
-    // Count warnings and errors
-    let warnings = sorted_errors.iter().filter(|e| e.check_result.level.as_deref() == Some("warning")).count();
-    let errors_count = sorted_errors.iter().filter(|e| e.check_result.level.as_deref() == Some("error")).count();
+    // Count warnings and errors (match prefix to include "warning extra", etc.)
+    let warnings = sorted_errors.iter()
+        .filter(|e| e.check_result.level.as_deref().is_some_and(|l| l.starts_with("warning")))
+        .count();
+    let errors_count = sorted_errors.iter()
+        .filter(|e| e.check_result.level.as_deref().is_some_and(|l| l.starts_with("error")))
+        .count();
     
     // Display summary
     print!("\n{} ", sorted_errors.len().to_string().yellow().bold());
@@ -446,29 +556,67 @@ mod tests {
     use crate::sql::QualifiedIdent;
     use std::path::PathBuf;
     
-    #[test]
-    fn test_calculate_source_line() {
+    fn make_function(ddl: &str, start_line: usize) -> SqlObject {
         let mut function = SqlObject::new(
             ObjectType::Function,
             QualifiedIdent::new(Some("test".to_string()), "my_func".to_string()),
-            "CREATE FUNCTION...".to_string(),
+            ddl.to_string(),
             Default::default(),
             Some(PathBuf::from("test.sql")),
         );
-        function.start_line = Some(10);
-        
-        // Function line 1 maps to source line 10
+        function.start_line = Some(start_line);
+        function
+    }
+
+    #[test]
+    fn test_body_opener_line_offset_single_line() {
+        let ddl = "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$ BEGIN END; $$";
+        assert_eq!(body_opener_line_offset(ddl), Some(0));
+    }
+
+    #[test]
+    fn test_body_opener_line_offset_multi_line_signature() {
+        // Body opens on line 5 (0-indexed: 4) of the statement.
+        let ddl = "CREATE FUNCTION f(\n    a integer,\n    b integer\n)\nRETURNS void LANGUAGE plpgsql AS $body$\nBEGIN\nEND;\n$body$";
+        assert_eq!(body_opener_line_offset(ddl), Some(4));
+    }
+
+    #[test]
+    fn test_body_opener_line_offset_no_dollar_quote() {
+        let ddl = "CREATE FUNCTION f() RETURNS integer LANGUAGE sql AS 'SELECT 1'";
+        assert_eq!(body_opener_line_offset(ddl), None);
+    }
+
+    #[test]
+    fn test_calculate_source_line_single_line_header() {
+        // CREATE on source line 10; body opens on the same line (offset 0).
+        // prosrc line 1 is the empty line right after `$$`, which sits on source
+        // line 10. prosrc line 5 -> source line 10 + 0 + (5 - 1) = 14.
+        let function = make_function(
+            "CREATE FUNCTION f() RETURNS void LANGUAGE plpgsql AS $$\nBEGIN\n    PERFORM 1;\n    SELECT bad FROM t;\nEND;\n$$",
+            10,
+        );
         assert_eq!(calculate_source_line(&function, Some(1)), Some(10));
-        
-        // Function line 5 maps to source line 14
         assert_eq!(calculate_source_line(&function, Some(5)), Some(14));
-        
-        // No function line number
+    }
+
+    #[test]
+    fn test_calculate_source_line_multi_line_header() {
+        // Signature spans lines 10..=14; `AS $body$` on source line 14.
+        // prosrc line 3 -> source line 14 + (3 - 1) = 16.
+        let ddl = "CREATE FUNCTION f(\n    a integer,\n    b integer\n)\nRETURNS void LANGUAGE plpgsql AS $body$\nBEGIN\n    SELECT bad FROM t;\nEND;\n$body$";
+        let function = make_function(ddl, 10);
+        // Body offset is 4 lines from CREATE. start=10, offset=4, lineno=3 -> 16.
+        assert_eq!(calculate_source_line(&function, Some(3)), Some(16));
+    }
+
+    #[test]
+    fn test_calculate_source_line_no_inputs() {
+        let function = make_function("CREATE FUNCTION f() ...", 10);
         assert_eq!(calculate_source_line(&function, None), None);
-        
-        // No start line
+
+        let mut function = function;
         function.start_line = None;
         assert_eq!(calculate_source_line(&function, Some(1)), None);
     }
-    
 }
