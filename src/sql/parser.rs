@@ -599,6 +599,21 @@ fn extract_from_node_recursive(
                 }
             }
         }
+        NodeEnum::AIndirection(indirection) => {
+            // (expr).field or expr[subscript] — e.g. (schema.fn(...)).price.
+            // The indirected expression (the function call) lives in `arg`,
+            // and any subscript expressions live in `indirection`.
+            if let Some(arg) = &indirection.arg {
+                if let Some(node) = &arg.node {
+                    extract_from_node_with_types(node, relations, functions, types);
+                }
+            }
+            for item in &indirection.indirection {
+                if let Some(node) = &item.node {
+                    extract_from_node_with_types(node, relations, functions, types);
+                }
+            }
+        }
         _ => {
             // For any other node types, just extract normally without type tracking
             extract_from_node(node, relations, functions);
@@ -897,6 +912,21 @@ fn extract_from_node(
             }
             if let Some(end_offset) = &window_def.end_offset {
                 extract_from_node(end_offset.node.as_ref().unwrap(), relations, functions);
+            }
+        }
+        NodeEnum::AIndirection(indirection) => {
+            // (expr).field or expr[subscript] — e.g. (schema.fn(...)).price.
+            // The indirected expression (the function call) lives in `arg`,
+            // and any subscript expressions live in `indirection`.
+            if let Some(arg) = &indirection.arg {
+                if let Some(node) = &arg.node {
+                    extract_from_node(node, relations, functions);
+                }
+            }
+            for item in &indirection.indirection {
+                if let Some(node) = &item.node {
+                    extract_from_node(node, relations, functions);
+                }
             }
         }
         NodeEnum::AConst(_) | NodeEnum::ColumnRef(_) | NodeEnum::ParamRef(_) => {
@@ -1914,5 +1944,75 @@ create type api.order_shipment as (
         
         assert!(order_item.is_some(), "Should find api.order_item");
         assert!(order_shipment.is_some(), "Should find api.order_shipment");
+    }
+
+    #[test]
+    fn test_parenthesized_call_field_access_in_select() {
+        // (fn(...)).field in a plain SELECT must register fn as a dependency.
+        // This parses as an A_Indirection wrapping the FuncCall.
+        let sql = "select (core.quote_cheapest_service(1, 2)).price from things";
+        let result = analyze_statement(sql).unwrap();
+
+        let expected = QualifiedIdent::new(
+            Some("core".to_string()),
+            "quote_cheapest_service".to_string(),
+        );
+        assert!(
+            result.functions.contains(&expected),
+            "Expected (fn(...)).field to register core.quote_cheapest_service as a dependency, but functions were: {:?}",
+            result.functions
+        );
+    }
+
+    #[test]
+    fn test_parenthesized_call_field_access_in_plpgsql() {
+        // Reproduces the reported bug: a PL/pgSQL function that references a
+        // managed function via (schema.fn(...)).field. The reference must be
+        // tracked so the dependency edge exists for cold (from-scratch) builds.
+        let sql = r#"
+            CREATE OR REPLACE FUNCTION api.quote_listing_shipping_bulk(p_dest_country text)
+            RETURNS numeric AS $$
+            DECLARE
+                v_price numeric;
+            BEGIN
+                select (core.quote_cheapest_service(p_dest_country, 'x')).price
+                  into v_price;
+                return v_price;
+            END;
+            $$ LANGUAGE plpgsql;
+        "#;
+
+        let result = analyze_statement(sql).unwrap();
+
+        let expected = QualifiedIdent::new(
+            Some("core".to_string()),
+            "quote_cheapest_service".to_string(),
+        );
+        assert!(
+            result.functions.contains(&expected),
+            "Expected (fn(...)).field in PL/pgSQL body to register core.quote_cheapest_service, but functions were: {:?}",
+            result.functions
+        );
+    }
+
+    #[test]
+    fn test_parenthesized_call_field_access_nested() {
+        // A function call buried inside the indirection arguments / nested calls
+        // must also be discovered.
+        let sql = "select (core.outer(core.inner(x))).field from t";
+        let result = analyze_statement(sql).unwrap();
+
+        let outer = QualifiedIdent::new(Some("core".to_string()), "outer".to_string());
+        let inner = QualifiedIdent::new(Some("core".to_string()), "inner".to_string());
+        assert!(
+            result.functions.contains(&outer),
+            "Expected core.outer, functions were: {:?}",
+            result.functions
+        );
+        assert!(
+            result.functions.contains(&inner),
+            "Expected core.inner, functions were: {:?}",
+            result.functions
+        );
     }
 }
