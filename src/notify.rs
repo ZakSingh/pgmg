@@ -65,19 +65,78 @@ pub async fn emit_object_loaded_notification<C: tokio_postgres::GenericClient>(
     notification: &ObjectLoadedNotification,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let payload = notification.to_json()?;
-    
+
     // PostgreSQL NOTIFY has a limit on payload size (8000 bytes)
     // In practice our payloads should be much smaller
     if payload.len() > 7900 {
         return Err("Notification payload too large".into());
     }
-    
+
     // Use parameterized query to safely handle the payload
     client.execute(
         "SELECT pg_notify($1, $2)",
         &[&"pgmg.object_loaded", &payload],
     ).await?;
-    
+
+    Ok(())
+}
+
+/// Channel that pgmg notifies after an apply run successfully changes the schema.
+///
+/// Clients should `LISTEN "pgmg.apply_succeeded"` and reset any cached statement
+/// plans / prepared statements when a message arrives, since the schema may have
+/// changed underneath them. Unlike the object-loaded events, this fires in every
+/// environment, not just development mode.
+pub const APPLY_SUCCEEDED_CHANNEL: &str = "pgmg.apply_succeeded";
+
+/// Summary of what an apply run changed. Sent as the payload of the
+/// `pgmg.apply_succeeded` NOTIFY so clients can log/inspect the change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApplySucceededNotification {
+    pub migrations_applied: usize,
+    pub objects_created: usize,
+    pub objects_updated: usize,
+    pub objects_deleted: usize,
+}
+
+impl ApplySucceededNotification {
+    /// True if the apply run made no changes. We skip the NOTIFY in that case
+    /// so clients only invalidate caches when the schema actually changed.
+    pub fn is_empty(&self) -> bool {
+        self.migrations_applied == 0
+            && self.objects_created == 0
+            && self.objects_updated == 0
+            && self.objects_deleted == 0
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// Emit a NOTIFY on the `pgmg.apply_succeeded` channel so clients can reset
+/// their statement caches after a schema change.
+///
+/// This is best-effort from the caller's perspective, but when issued inside the
+/// apply transaction the NOTIFY is delivered atomically on commit (and discarded
+/// on rollback), so listeners never see a change that didn't land.
+pub async fn emit_apply_succeeded_notification<C: tokio_postgres::GenericClient>(
+    client: &C,
+    notification: &ApplySucceededNotification,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = notification.to_json()?;
+
+    // PostgreSQL NOTIFY caps the payload at 8000 bytes; this summary is tiny,
+    // but guard anyway to surface a clear error rather than a Postgres failure.
+    if payload.len() > 7900 {
+        return Err("Notification payload too large".into());
+    }
+
+    client.execute(
+        "SELECT pg_notify($1, $2)",
+        &[&APPLY_SUCCEEDED_CHANNEL, &payload],
+    ).await?;
+
     Ok(())
 }
 
@@ -160,5 +219,48 @@ mod tests {
         assert!(json.contains(r#""oid":null"#));
         assert!(json.contains(r#""file":null"#));
         assert!(json.contains(r#""span":null"#));
+    }
+
+    #[test]
+    fn test_apply_succeeded_is_empty() {
+        let empty = ApplySucceededNotification {
+            migrations_applied: 0,
+            objects_created: 0,
+            objects_updated: 0,
+            objects_deleted: 0,
+        };
+        assert!(empty.is_empty());
+
+        let changed = ApplySucceededNotification {
+            migrations_applied: 0,
+            objects_created: 1,
+            objects_updated: 0,
+            objects_deleted: 0,
+        };
+        assert!(!changed.is_empty());
+    }
+
+    #[test]
+    fn test_apply_succeeded_to_json() {
+        let notification = ApplySucceededNotification {
+            migrations_applied: 2,
+            objects_created: 3,
+            objects_updated: 1,
+            objects_deleted: 0,
+        };
+
+        let json = notification.to_json().unwrap();
+        assert!(json.contains(r#""migrations_applied":2"#));
+        assert!(json.contains(r#""objects_created":3"#));
+        assert!(json.contains(r#""objects_updated":1"#));
+        assert!(json.contains(r#""objects_deleted":0"#));
+
+        let roundtrip: ApplySucceededNotification = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, notification);
+    }
+
+    #[test]
+    fn test_apply_succeeded_channel_name() {
+        assert_eq!(APPLY_SUCCEEDED_CHANNEL, "pgmg.apply_succeeded");
     }
 }

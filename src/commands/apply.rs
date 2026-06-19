@@ -6,7 +6,7 @@ use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_tr
 use crate::commands::plan::{execute_plan, ChangeOperation, PlanResult};
 use crate::config::PgmgConfig;
 use crate::analysis::ObjectRef;
-use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification};
+use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification, ApplySucceededNotification, emit_apply_succeeded_notification};
 use crate::plpgsql_check::{check_modified_functions, check_soft_dependent_functions, display_check_errors};
 use crate::error::format_postgres_error_with_details;
 use tracing::{info, warn, debug, error};
@@ -315,16 +315,46 @@ async fn execute_apply_internal(
         execute_all_changes(&transaction, &mut apply_result, &plan_result,
                            &migrations_dir, &code_dir, config, test_mode,
                            &pre_committed_enum_stmts).await?;
+        // Emit the schema-changed NOTIFY inside the transaction so it is delivered
+        // atomically on commit (and discarded if the commit below were to fail).
+        emit_apply_succeeded_if_changed(&transaction, &apply_result).await;
         transaction.commit().await?;
         print_apply_success_message(&apply_result, test_mode);
     } else {
         execute_all_changes(client, &mut apply_result, &plan_result,
                            &migrations_dir, &code_dir, config, test_mode,
                            &pre_committed_enum_stmts).await?;
+        // Auto-commit mode: changes are already committed, so emit immediately.
+        emit_apply_succeeded_if_changed(client, &apply_result).await;
         print_apply_success_message(&apply_result, test_mode);
     }
 
     Ok(apply_result)
+}
+
+/// Emit the `pgmg.apply_succeeded` NOTIFY when an apply run actually changed the
+/// schema, so listening clients can reset their statement caches. Fires in all
+/// environments (not gated by development mode). Best-effort: failures are logged
+/// but never abort the apply.
+async fn emit_apply_succeeded_if_changed<C: GenericClient>(
+    client: &C,
+    apply_result: &ApplyResult,
+) {
+    let notification = ApplySucceededNotification {
+        migrations_applied: apply_result.migrations_applied.len(),
+        objects_created: apply_result.objects_created.len(),
+        objects_updated: apply_result.objects_updated.len(),
+        objects_deleted: apply_result.objects_deleted.len(),
+    };
+
+    // Nothing changed — don't ask clients to invalidate caches needlessly.
+    if notification.is_empty() {
+        return;
+    }
+
+    if let Err(e) = emit_apply_succeeded_notification(client, &notification).await {
+        warn!(error = %e, "Failed to emit pgmg.apply_succeeded NOTIFY event");
+    }
 }
 
 // Helper function to execute all changes using GenericClient (works with both Transaction and Client)
