@@ -638,14 +638,15 @@ pub fn print_plan_summary(plan: &PlanResult) {
                         println!("    {} {} {} (will be recreated)",
                             "↓".yellow(),
                             format!("{:?}", object.object_type).to_lowercase().dimmed(),
-                            format_qualified_name(&object.qualified_name).cyan()
+                            human_object_name(&object.object_type, &object.qualified_name, object.trigger_table.as_ref()).cyan()
                         );
                     }
                     ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                        let (qname, ttable) = parse_state_object_name(object_type, object_name);
                         println!("    {} {} {} (will be deleted)",
                             "↓".red(),
                             format!("{:?}", object_type).to_lowercase().dimmed(),
-                            object_name.cyan()
+                            human_object_name(object_type, &qname, ttable.as_ref()).cyan()
                         );
                     }
                     _ => {}
@@ -682,14 +683,14 @@ pub fn print_plan_summary(plan: &PlanResult) {
                         );
                     } else {
                         // Regular object - check if it has an associated comment
-                        println!("  {} {} {} {} ({})", 
+                        println!("  {} {} {} {} ({})",
                             "+".green().bold(),
                             "CREATE".green().bold(),
                             object.object_type.to_string().yellow(),
-                            format_qualified_name(&object.qualified_name).cyan(),
+                            human_object_name(&object.object_type, &object.qualified_name, object.trigger_table.as_ref()).cyan(),
                             reason.dimmed()
                         );
-                        
+
                         // Look for associated comment in subsequent changes
                         print_associated_comments(plan, i, &mut printed_comments, object);
                     }
@@ -706,11 +707,11 @@ pub fn print_plan_summary(plan: &PlanResult) {
                             reason.dimmed()
                         );
                     } else {
-                        println!("  {} {} {} {} ({})", 
+                        println!("  {} {} {} {} ({})",
                             "~".yellow().bold(),
                             "UPDATE".yellow().bold(),
                             object.object_type.to_string().yellow(),
-                            format_qualified_name(&object.qualified_name).cyan(),
+                            human_object_name(&object.object_type, &object.qualified_name, object.trigger_table.as_ref()).cyan(),
                             reason.dimmed()
                         );
                         if !old_hash.is_empty() && old_hash.len() >= 8 {
@@ -725,11 +726,12 @@ pub fn print_plan_summary(plan: &PlanResult) {
                     }
                 }
                 ChangeOperation::DeleteObject { object_type, object_name, reason } => {
-                    println!("  {} {} {} {} ({})", 
+                    let (qname, ttable) = parse_state_object_name(object_type, object_name);
+                    println!("  {} {} {} {} ({})",
                         "-".red().bold(),
                         "DELETE".red().bold(),
                         object_type.to_string().yellow(),
-                        object_name.cyan(),
+                        human_object_name(object_type, &qname, ttable.as_ref()).cyan(),
                         reason.dimmed()
                     );
                 }
@@ -789,15 +791,32 @@ fn print_associated_comments(
     };
     
     let parent_name = format_qualified_name(&parent_object.qualified_name);
-    let expected_comment_name = format!("{}:{}", object_type_str, parent_name);
-    
+
+    // Trigger comments are keyed "trigger:<name>:<table>"; accept both the
+    // qualified and unqualified spelling of the table.
+    let mut expected_names = vec![
+        format!("{}:{}", object_type_str, parent_name),
+        format!("{}:{}()", object_type_str, parent_name),
+    ];
+    if parent_object.object_type == ObjectType::Trigger {
+        if let Some(table) = &parent_object.trigger_table {
+            let table_str = format_qualified_name(table);
+            expected_names.clear();
+            expected_names.push(format!("trigger:{}:{}", parent_name, table_str));
+            if let Some(stripped) = table_str.strip_prefix("public.") {
+                expected_names.push(format!("trigger:{}:{}", parent_name, stripped));
+            } else if !table_str.contains('.') {
+                expected_names.push(format!("trigger:{}:public.{}", parent_name, table_str));
+            }
+        }
+    }
+
     // Look for comments in subsequent changes
     for (j, change) in plan.changes.iter().enumerate().skip(current_index + 1) {
         if let Some(obj) = get_object_from_change(change) {
             if obj.object_type == ObjectType::Comment {
                 // Check if this comment belongs to our parent object
-                if obj.qualified_name.name == expected_comment_name ||
-                   obj.qualified_name.name == format!("{}:{}()", object_type_str, parent_name) {
+                if expected_names.iter().any(|expected| &obj.qualified_name.name == expected) {
                     // Mark this comment as printed
                     printed_comments.insert(j);
                     
