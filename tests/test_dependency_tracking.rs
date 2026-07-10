@@ -170,7 +170,8 @@ async fn test_basic_trigger_function_dependency() -> Result<(), Box<dyn std::err
     ]).await?;
     
     // Verify dependencies were stored (trigger depends on both function and table)
-    let deps = get_stored_dependencies(&env, "trigger", "test_trigger").await?;
+    // Triggers are keyed by name:table in pgmg_dependencies
+    let deps = get_stored_dependencies(&env, "trigger", "test_trigger:test_table").await?;
     assert_eq!(deps.len(), 2, "Expected 2 dependencies for test_trigger, found {}", deps.len());
     
     // Check that both function and table dependencies are present
@@ -193,7 +194,7 @@ async fn test_basic_trigger_function_dependency() -> Result<(), Box<dyn std::err
     ).await?;
     
     assert_apply_successful(&apply_result2);
-    assert_objects_deleted(&apply_result2, &["test_trigger", "test_trigger_func"]);
+    assert_objects_deleted(&apply_result2, &["test_trigger:test_table", "test_trigger_func"]);
     
     // Verify correct deletion order by checking they're both gone
     verify_objects_not_exist(&env, &[

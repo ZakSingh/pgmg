@@ -1,7 +1,8 @@
 mod common;
 
 use common::TestEnvironment;
-use pgmg::commands::execute_plan;
+use pgmg::commands::{execute_apply, execute_plan};
+use pgmg::config::PgmgConfig;
 use indoc::indoc;
 
 #[tokio::test]
@@ -253,56 +254,155 @@ async fn test_no_error_for_different_object_names() -> Result<(), Box<dyn std::e
 #[tokio::test]
 async fn test_comments_and_triggers_allowed_to_duplicate() -> Result<(), Box<dyn std::error::Error>> {
     let env = TestEnvironment::new().await?;
-    
-    // Create a function and two files that might have comments or triggers with same names
-    // These should be allowed as they are contextual
-    let base_function = indoc! {r#"
-        CREATE OR REPLACE FUNCTION test_func()
-        RETURNS TEXT
-        LANGUAGE sql
-        AS $$
-            SELECT 'test';
-        $$;
+
+    // Two triggers sharing a name on different tables are legitimate — each is
+    // its own object keyed by name:table and both must apply and track.
+    env.execute_sql("CREATE TABLE table1 (id SERIAL PRIMARY KEY, updated_at TIMESTAMPTZ)").await?;
+    env.execute_sql("CREATE TABLE table2 (id SERIAL PRIMARY KEY, updated_at TIMESTAMPTZ)").await?;
+
+    let trigger_function = indoc! {r#"
+        CREATE OR REPLACE FUNCTION update_modified()
+        RETURNS trigger AS $$
+        BEGIN
+            NEW.updated_at = NOW();
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
     "#};
-    
-    // Comments and triggers should be allowed to have same identifiers
+
     let trigger1 = indoc! {r#"
-        CREATE TRIGGER update_timestamp 
+        CREATE TRIGGER update_timestamp
         BEFORE UPDATE ON table1
         FOR EACH ROW EXECUTE FUNCTION update_modified();
     "#};
-    
+
     let trigger2 = indoc! {r#"
         CREATE TRIGGER update_timestamp
-        BEFORE UPDATE ON table2  
+        BEFORE UPDATE ON table2
         FOR EACH ROW EXECUTE FUNCTION update_modified();
     "#};
-    
-    env.write_sql_file("func.sql", base_function).await?;
+
+    env.write_sql_file("func.sql", trigger_function).await?;
     env.write_sql_file("trigger1.sql", trigger1).await?;
     env.write_sql_file("trigger2.sql", trigger2).await?;
-    
-    // Should succeed - triggers with same name on different tables should be allowed
+
+    let apply_result = execute_apply(
+        None,
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert!(apply_result.errors.is_empty(), "apply failed: {:?}", apply_result.errors);
+
+    // Both triggers live in the database
+    let live_count: i64 = env.query_scalar(
+        "SELECT COUNT(*) FROM pg_trigger WHERE tgname = 'update_timestamp'"
+    ).await?;
+    assert_eq!(live_count, 2, "both same-named triggers should exist");
+
+    // Both tracked under distinct composite keys
+    let tracked = env.get_tracked_objects().await?;
+    assert!(tracked.contains(&("trigger".to_string(), "update_timestamp:table1".to_string())),
+        "missing composite state row for table1: {:?}", tracked);
+    assert!(tracked.contains(&("trigger".to_string(), "update_timestamp:table2".to_string())),
+        "missing composite state row for table2: {:?}", tracked);
+
+    // A second plan sees no changes — neither trigger is perpetually "changed"
+    let plan = execute_plan(
+        None,
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        None,
+    ).await?;
+    assert!(plan.changes.is_empty(), "expected empty plan, got: {} changes", plan.changes.len());
+
+    // Editing one trigger recreates only that one
+    let table1_oid_before: u32 = env.query_scalar(
+        "SELECT t.oid FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         WHERE t.tgname = 'update_timestamp' AND c.relname = 'table1'"
+    ).await?;
+
+    let trigger2_changed = indoc! {r#"
+        CREATE TRIGGER update_timestamp
+        BEFORE INSERT OR UPDATE ON table2
+        FOR EACH ROW EXECUTE FUNCTION update_modified();
+    "#};
+    env.write_sql_file("trigger2.sql", trigger2_changed).await?;
+
+    let apply_result2 = execute_apply(
+        None,
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert!(apply_result2.errors.is_empty(), "apply failed: {:?}", apply_result2.errors);
+    assert_eq!(apply_result2.objects_updated, vec!["update_timestamp".to_string()],
+        "only the edited trigger should be recreated");
+
+    let table1_oid_after: u32 = env.query_scalar(
+        "SELECT t.oid FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         WHERE t.tgname = 'update_timestamp' AND c.relname = 'table1'"
+    ).await?;
+    assert_eq!(table1_oid_before, table1_oid_after, "table1's trigger must not be recreated");
+
+    // Deleting one file drops only that trigger
+    env.delete_sql_file("trigger1.sql").await?;
+    let apply_result3 = execute_apply(
+        None,
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert!(apply_result3.errors.is_empty(), "apply failed: {:?}", apply_result3.errors);
+    assert!(apply_result3.objects_deleted.contains(&"update_timestamp:table1".to_string()),
+        "expected composite delete name, got: {:?}", apply_result3.objects_deleted);
+
+    let table1_count: i64 = env.query_scalar(
+        "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         WHERE t.tgname = 'update_timestamp' AND c.relname = 'table1'"
+    ).await?;
+    let table2_count: i64 = env.query_scalar(
+        "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+         WHERE t.tgname = 'update_timestamp' AND c.relname = 'table2'"
+    ).await?;
+    assert_eq!(table1_count, 0, "table1's trigger should be dropped");
+    assert_eq!(table2_count, 1, "table2's trigger must survive");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_duplicate_trigger_same_table_rejected() -> Result<(), Box<dyn std::error::Error>> {
+    let env = TestEnvironment::new().await?;
+
+    // Same trigger name on the SAME table is a genuine duplicate
+    let trigger1 = indoc! {r#"
+        CREATE TRIGGER update_timestamp
+        BEFORE UPDATE ON table1
+        FOR EACH ROW EXECUTE FUNCTION update_modified();
+    "#};
+
+    let trigger2 = indoc! {r#"
+        CREATE TRIGGER update_timestamp
+        BEFORE INSERT ON table1
+        FOR EACH ROW EXECUTE FUNCTION update_modified();
+    "#};
+
+    env.write_sql_file("trigger1.sql", trigger1).await?;
+    env.write_sql_file("trigger2.sql", trigger2).await?;
+
     let result = execute_plan(
         None,
         Some(env.sql_dir.clone()),
         env.connection_string.clone(),
         None,
     ).await;
-    
-    // This should either succeed or fail for other reasons, but not duplicate detection
-    match result {
-        Ok(_) => {
-            // Success is expected
-        }
-        Err(e) => {
-            let error_msg = e.to_string();
-            // Should not fail due to duplicate detection
-            assert!(!error_msg.contains("Multiple definitions"));
-            assert!(!error_msg.contains("pgmg does not allow duplicate object names"));
-        }
-    }
-    
+
+    let err = result.expect_err("duplicate trigger on same table should be rejected");
+    let error_msg = err.to_string();
+    assert!(error_msg.contains("Multiple definitions of trigger"), "unexpected error: {}", error_msg);
+    assert!(error_msg.contains("update_timestamp on table1"), "unexpected error: {}", error_msg);
+
     Ok(())
 }
 
