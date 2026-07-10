@@ -59,6 +59,9 @@ pub struct SqlObject {
     pub ddl_hash: String,
     pub start_line: Option<usize>,
     pub end_line: Option<usize>,
+    /// For triggers only: the table the trigger is defined on. Part of the
+    /// trigger's identity — trigger names are only unique per table in Postgres.
+    pub trigger_table: Option<QualifiedIdent>,
 }
 
 /// Intermediate structure that holds both parsed AST and extracted metadata
@@ -91,12 +94,18 @@ impl SqlObject {
             ddl_hash,
             start_line: None,
             end_line: None,
+            trigger_table: None,
         }
     }
-    
+
     pub fn with_line_numbers(mut self, start_line: Option<usize>, end_line: Option<usize>) -> Self {
         self.start_line = start_line;
         self.end_line = end_line;
+        self
+    }
+
+    pub fn with_trigger_table(mut self, trigger_table: Option<QualifiedIdent>) -> Self {
+        self.trigger_table = trigger_table;
         self
     }
 }
@@ -438,7 +447,7 @@ pub fn identify_sql_object(statement: &str) -> Result<Option<SqlObject>, Box<dyn
                 normalize_ddl(statement),
                 dependencies,
                 None, // Set by caller
-            )))
+            ).with_trigger_table(parsed_obj.trigger_table)))
         }
         None => Ok(None), // Not a CREATE statement we track
     }
@@ -813,10 +822,69 @@ fn format_operator_signature(qualified_name: &QualifiedIdent, args: &[pg_query::
 }
 
 /// Helper to format a qualified name
-fn format_qualified_name(qualified_name: &QualifiedIdent) -> String {
+pub fn format_qualified_name(qualified_name: &QualifiedIdent) -> String {
     match &qualified_name.schema {
         Some(schema) => format!("{}.{}", schema, qualified_name.name),
         None => qualified_name.name.clone(),
+    }
+}
+
+/// Canonical state-key name for an object, as stored in pgmg_state.object_name
+/// and pgmg_dependencies.dependent_name.
+///
+/// Triggers are keyed as `name:table` (table may be schema-qualified) because
+/// trigger names are only unique per table. All other types use `schema.name`.
+pub fn state_object_name(
+    object_type: &ObjectType,
+    qualified_name: &QualifiedIdent,
+    trigger_table: Option<&QualifiedIdent>,
+) -> String {
+    match (object_type, trigger_table) {
+        (ObjectType::Trigger, Some(table)) => format!(
+            "{}:{}",
+            format_qualified_name(qualified_name),
+            format_qualified_name(table)
+        ),
+        _ => format_qualified_name(qualified_name),
+    }
+}
+
+/// Inverse of `state_object_name`: reconstruct an object's qualified name (and,
+/// for triggers, its table) from a stored state string.
+///
+/// Trigger state strings split on the FIRST ':' — the prefix is the trigger name
+/// (colon-free unquoted identifier), the suffix is the table and may contain '.'.
+/// A trigger string without ':' is a legacy (pre table-in-identity) key and
+/// yields no table.
+pub fn parse_state_object_name(
+    object_type: &ObjectType,
+    stored_name: &str,
+) -> (QualifiedIdent, Option<QualifiedIdent>) {
+    if *object_type == ObjectType::Trigger {
+        if let Some((name, table)) = stored_name.split_once(':') {
+            return (
+                QualifiedIdent::from_qualified_name(name),
+                Some(QualifiedIdent::from_qualified_name(table)),
+            );
+        }
+    }
+    (QualifiedIdent::from_qualified_name(stored_name), None)
+}
+
+/// Human-readable object name for logs and plan output: triggers read as
+/// `name on table`, never leaking the `name:table` state encoding.
+pub fn human_object_name(
+    object_type: &ObjectType,
+    qualified_name: &QualifiedIdent,
+    trigger_table: Option<&QualifiedIdent>,
+) -> String {
+    match (object_type, trigger_table) {
+        (ObjectType::Trigger, Some(table)) => format!(
+            "{} on {}",
+            format_qualified_name(qualified_name),
+            format_qualified_name(table)
+        ),
+        _ => format_qualified_name(qualified_name),
     }
 }
 
@@ -1091,6 +1159,62 @@ fn normalize_ddl_for_hashing(ddl: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_trigger_identity_includes_table() {
+        let sql = "CREATE TRIGGER update_ts BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION touch()";
+        let obj = identify_sql_object(sql).unwrap().unwrap();
+        assert_eq!(obj.object_type, ObjectType::Trigger);
+        assert_eq!(obj.qualified_name.name, "update_ts");
+        assert_eq!(obj.trigger_table, Some(QualifiedIdent::from_name("users".to_string())));
+
+        let sql = "CREATE TRIGGER update_ts BEFORE UPDATE ON api.users FOR EACH ROW EXECUTE FUNCTION touch()";
+        let obj = identify_sql_object(sql).unwrap().unwrap();
+        assert_eq!(obj.trigger_table, Some(QualifiedIdent::new(Some("api".to_string()), "users".to_string())));
+    }
+
+    #[test]
+    fn test_state_object_name_round_trip() {
+        let trig = QualifiedIdent::from_name("update_ts".to_string());
+        let bare_table = QualifiedIdent::from_name("users".to_string());
+        let qualified_table = QualifiedIdent::new(Some("api".to_string()), "users".to_string());
+
+        // Trigger with bare table
+        let stored = state_object_name(&ObjectType::Trigger, &trig, Some(&bare_table));
+        assert_eq!(stored, "update_ts:users");
+        let (name, table) = parse_state_object_name(&ObjectType::Trigger, &stored);
+        assert_eq!(name, trig);
+        assert_eq!(table, Some(bare_table.clone()));
+
+        // Trigger with schema-qualified table — the '.' must survive the round trip
+        let stored = state_object_name(&ObjectType::Trigger, &trig, Some(&qualified_table));
+        assert_eq!(stored, "update_ts:api.users");
+        let (name, table) = parse_state_object_name(&ObjectType::Trigger, &stored);
+        assert_eq!(name, trig);
+        assert_eq!(table, Some(qualified_table.clone()));
+
+        // Legacy trigger key (no table recorded) parses without a table
+        let (name, table) = parse_state_object_name(&ObjectType::Trigger, "update_ts");
+        assert_eq!(name, trig);
+        assert_eq!(table, None);
+
+        // Non-trigger types keep schema.name semantics
+        let func = QualifiedIdent::new(Some("api".to_string()), "touch".to_string());
+        let stored = state_object_name(&ObjectType::Function, &func, None);
+        assert_eq!(stored, "api.touch");
+        let (name, table) = parse_state_object_name(&ObjectType::Function, &stored);
+        assert_eq!(name, func);
+        assert_eq!(table, None);
+    }
+
+    #[test]
+    fn test_human_object_name() {
+        let trig = QualifiedIdent::from_name("update_ts".to_string());
+        let table = QualifiedIdent::new(Some("api".to_string()), "users".to_string());
+        assert_eq!(human_object_name(&ObjectType::Trigger, &trig, Some(&table)), "update_ts on api.users");
+        assert_eq!(human_object_name(&ObjectType::Trigger, &trig, None), "update_ts");
+        assert_eq!(human_object_name(&ObjectType::Function, &trig, None), "update_ts");
+    }
 
     #[test]
     fn test_identify_create_table() {

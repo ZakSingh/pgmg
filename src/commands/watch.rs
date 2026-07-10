@@ -317,17 +317,11 @@ async fn process_db_changes(config: &WatchConfig, _paths: Vec<PathBuf>) -> Vec<O
                     match change {
                         crate::commands::plan::ChangeOperation::CreateObject { object, .. } => {
                             println!("  + {:?} {}", object.object_type, object.qualified_name.name);
-                            changed_objects.push(ObjectRef {
-                                object_type: object.object_type.clone(),
-                                qualified_name: object.qualified_name.clone(),
-                            });
+                            changed_objects.push(ObjectRef::from(object));
                         }
                         crate::commands::plan::ChangeOperation::UpdateObject { object, .. } => {
                             println!("  ~ {:?} {}", object.object_type, object.qualified_name.name);
-                            changed_objects.push(ObjectRef {
-                                object_type: object.object_type.clone(),
-                                qualified_name: object.qualified_name.clone(),
-                            });
+                            changed_objects.push(ObjectRef::from(object));
                         }
                         crate::commands::plan::ChangeOperation::DeleteObject { object_type, object_name, .. } => {
                             println!("  - {:?} {}", object_type, object_name);

@@ -180,18 +180,9 @@ pub fn build_test_dependency_map(tests: Vec<TestFile>) -> TestDependencyMap {
             // We need to guess the object type since we only have the name
             // In practice, this would be matched against actual database objects
             let object_refs = vec![
-                ObjectRef {
-                    object_type: ObjectType::Table,
-                    qualified_name: relation.clone(),
-                },
-                ObjectRef {
-                    object_type: ObjectType::View,
-                    qualified_name: relation.clone(),
-                },
-                ObjectRef {
-                    object_type: ObjectType::MaterializedView,
-                    qualified_name: relation.clone(),
-                },
+                ObjectRef::new(ObjectType::Table, relation.clone()),
+                ObjectRef::new(ObjectType::View, relation.clone()),
+                ObjectRef::new(ObjectType::MaterializedView, relation.clone()),
             ];
             
             for obj_ref in object_refs {
@@ -206,14 +197,8 @@ pub fn build_test_dependency_map(tests: Vec<TestFile>) -> TestDependencyMap {
         for function in &test.dependencies.functions {
             // Check both as function and procedure since we don't know which it is
             let func_refs = vec![
-                ObjectRef {
-                    object_type: ObjectType::Function,
-                    qualified_name: function.clone(),
-                },
-                ObjectRef {
-                    object_type: ObjectType::Procedure,
-                    qualified_name: function.clone(),
-                },
+                ObjectRef::new(ObjectType::Function, function.clone()),
+                ObjectRef::new(ObjectType::Procedure, function.clone()),
             ];
             
             for obj_ref in func_refs {
@@ -227,14 +212,8 @@ pub fn build_test_dependency_map(tests: Vec<TestFile>) -> TestDependencyMap {
         // Types
         for type_name in &test.dependencies.types {
             let type_refs = vec![
-                ObjectRef {
-                    object_type: ObjectType::Type,
-                    qualified_name: type_name.clone(),
-                },
-                ObjectRef {
-                    object_type: ObjectType::Domain,
-                    qualified_name: type_name.clone(),
-                },
+                ObjectRef::new(ObjectType::Type, type_name.clone()),
+                ObjectRef::new(ObjectType::Domain, type_name.clone()),
             ];
             
             for obj_ref in type_refs {

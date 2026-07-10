@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use crate::db::{StateManager, connect_with_url, scan_sql_files, scan_migrations};
-use crate::sql::{SqlObject, ObjectType, QualifiedIdent, objects::calculate_ddl_hash, extract_altered_tables};
+use crate::sql::{SqlObject, ObjectType, QualifiedIdent, objects::calculate_ddl_hash, extract_altered_tables, state_object_name, parse_state_object_name, human_object_name};
 use crate::analysis::{DependencyGraph, ObjectRef};
 use crate::BuiltinCatalog;
 #[cfg(feature = "cli")]
@@ -256,10 +256,11 @@ pub async fn execute_plan(
             let deleted_object_refs: HashSet<ObjectRef> = object_changes.iter()
                 .filter_map(|change| match change {
                     ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                        let qname = crate::sql::QualifiedIdent::from_qualified_name(object_name);
+                        let (qname, trigger_table) = parse_state_object_name(object_type, object_name);
                         Some(ObjectRef {
                             object_type: object_type.clone(),
                             qualified_name: qname,
+                            trigger_table,
                         })
                     }
                     _ => None,
@@ -298,10 +299,7 @@ pub async fn execute_plan(
             // Step 3.5: Find all pgmg-managed objects affected by changes
             let updated_objects: Vec<ObjectRef> = object_changes.iter()
                 .filter_map(|change| match change {
-                    ChangeOperation::UpdateObject { object, .. } => Some(ObjectRef {
-                        object_type: object.object_type.clone(),
-                        qualified_name: object.qualified_name.clone(),
-                    }),
+                    ChangeOperation::UpdateObject { object, .. } => Some(ObjectRef::from(object)),
                     _ => None,
                 })
                 .collect();

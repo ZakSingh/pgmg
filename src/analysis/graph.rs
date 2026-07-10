@@ -10,6 +10,9 @@ use tracing::debug;
 pub struct ObjectRef {
     pub object_type: ObjectType,
     pub qualified_name: QualifiedIdent,
+    /// For triggers only: the table the trigger is defined on. Part of node
+    /// identity so same-named triggers on different tables stay distinct nodes.
+    pub trigger_table: Option<QualifiedIdent>,
 }
 
 #[derive(Debug, Clone)]
@@ -49,19 +52,12 @@ impl DependencyGraph {
 
         // Add nodes for each object
         for obj in objects {
-            let object_ref = ObjectRef {
-                object_type: obj.object_type.clone(),
-                qualified_name: obj.qualified_name.clone(),
-            };
-            graph.add_node(object_ref);
+            graph.add_node(ObjectRef::from(obj));
         }
 
         // Add edges based on dependencies from parser
         for obj in objects {
-            let obj_ref = ObjectRef {
-                object_type: obj.object_type.clone(),
-                qualified_name: obj.qualified_name.clone(),
-            };
+            let obj_ref = ObjectRef::from(obj);
 
             // Filter out built-ins using existing functionality
             let filtered_deps = crate::sql::filter_builtins(
@@ -81,10 +77,7 @@ impl DependencyGraph {
                     &o.qualified_name == dep &&
                     matches!(o.object_type, ObjectType::Table | ObjectType::View | ObjectType::MaterializedView)
                 ) {
-                    let dep_ref = ObjectRef {
-                        object_type: dep_obj.object_type.clone(),
-                        qualified_name: dep_obj.qualified_name.clone(),
-                    };
+                    let dep_ref = ObjectRef::from(dep_obj);
                     debug!("  Creating edge: {:?} {} -> {:?} {}",
                         dep_ref.object_type,
                         format!("{}.{}", dep_ref.qualified_name.schema.as_deref().unwrap_or("public"), dep_ref.qualified_name.name),
@@ -102,11 +95,8 @@ impl DependencyGraph {
                     &o.qualified_name == dep && 
                     matches!(o.object_type, ObjectType::Function | ObjectType::Procedure)
                 ) {
-                    let dep_ref = ObjectRef {
-                        object_type: dep_obj.object_type.clone(),
-                        qualified_name: dep_obj.qualified_name.clone(),
-                    };
-                    
+                    let dep_ref = ObjectRef::from(dep_obj);
+
                     // Determine dependency type based on the dependent object type
                     let dep_type = match &obj.object_type {
                         // Functions/procedures calling other functions/procedures use runtime lookup
@@ -127,10 +117,7 @@ impl DependencyGraph {
                     &o.qualified_name == dep &&
                     matches!(o.object_type, ObjectType::Type | ObjectType::Domain | ObjectType::View | ObjectType::MaterializedView | ObjectType::Table)
                 ) {
-                    let dep_ref = ObjectRef {
-                        object_type: dep_obj.object_type.clone(),
-                        qualified_name: dep_obj.qualified_name.clone(),
-                    };
+                    let dep_ref = ObjectRef::from(dep_obj);
                     graph.add_edge(dep_ref, obj_ref.clone(), DependencyType::Hard)?;
                 }
             }
@@ -316,11 +303,8 @@ impl DependencyGraph {
         // Add nodes with labels and colors based on object type
         for node_index in self.graph.node_indices() {
             let obj_ref = &self.graph[node_index];
-            let qualified_name = match &obj_ref.qualified_name.schema {
-                Some(schema) => format!("{}.{}", schema, obj_ref.qualified_name.name),
-                None => obj_ref.qualified_name.name.clone(),
-            };
-            
+            let qualified_name = obj_ref.display_name();
+
             let (color, shape) = match obj_ref.object_type {
                 ObjectType::Table => ("lightcyan", "rect"),
                 ObjectType::View => ("lightblue", "box"),
@@ -359,16 +343,9 @@ impl DependencyGraph {
                 let target_obj = &self.graph[target];
                 let edge_data = &self.graph[edge_index];
 
-                let source_name = match &source_obj.qualified_name.schema {
-                    Some(schema) => format!("{}.{}", schema, source_obj.qualified_name.name),
-                    None => source_obj.qualified_name.name.clone(),
-                };
+                let source_name = source_obj.display_name();
+                let target_name = target_obj.display_name();
 
-                let target_name = match &target_obj.qualified_name.schema {
-                    Some(schema) => format!("{}.{}", schema, target_obj.qualified_name.name),
-                    None => target_obj.qualified_name.name.clone(),
-                };
-                
                 // Create unique node IDs that include object type
                 let source_id = format!("{}::{}", format!("{:?}", source_obj.object_type), source_name);
                 let target_id = format!("{}::{}", format!("{:?}", target_obj.object_type), target_name);
@@ -395,7 +372,18 @@ impl ObjectRef {
         Self {
             object_type,
             qualified_name,
+            trigger_table: None,
         }
+    }
+
+    /// Display name for graph output; includes the table for triggers so
+    /// same-named triggers on different tables get distinct DOT node IDs.
+    pub fn display_name(&self) -> String {
+        crate::sql::human_object_name(
+            &self.object_type,
+            &self.qualified_name,
+            self.trigger_table.as_ref(),
+        )
     }
 }
 
@@ -404,6 +392,7 @@ impl From<&SqlObject> for ObjectRef {
         Self {
             object_type: obj.object_type.clone(),
             qualified_name: obj.qualified_name.clone(),
+            trigger_table: obj.trigger_table.clone(),
         }
     }
 }
