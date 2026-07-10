@@ -128,8 +128,80 @@ impl<'a> StateManager<'a> {
             &[],
         ).await?;
 
+        self.upgrade_legacy_trigger_identity().await?;
+
         // Restore default message level
         self.client.execute("SET client_min_messages = 'NOTICE'", &[]).await?;
+
+        Ok(())
+    }
+
+    /// One-time upgrade of legacy trigger state keys from `name` to `name:table`.
+    ///
+    /// Trigger identity used to be the bare trigger name, which collides when
+    /// two triggers share a name on different tables. Legacy rows (no ':' in
+    /// the key) are expanded into one row per recorded relation dependency,
+    /// carrying the legacy hash. A trigger with several relation deps (e.g. a
+    /// constraint trigger, or a name shared by two triggers whose deps merged
+    /// under the one key) gets one row per table — at worst a spurious row
+    /// that resolves as a no-op `DROP TRIGGER IF EXISTS` or a cheap recreate
+    /// on the next apply. Legacy rows with no relation dep are dropped; the
+    /// trigger re-plans as a create, which pre-drops defensively.
+    ///
+    /// Idempotent: upgraded keys contain ':', so re-runs match nothing.
+    /// Comment rows also contain ':' but have object_type = 'comment' and are
+    /// never touched.
+    async fn upgrade_legacy_trigger_identity(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // batch_execute runs all statements in one implicit transaction
+        self.client.batch_execute(
+            r#"
+            -- 1. Expand each legacy trigger state row into one row per relation dep.
+            INSERT INTO pgmg.pgmg_state (object_type, object_name, ddl_hash, last_applied)
+            SELECT s.object_type,
+                   s.object_name || ':' || d.dependency_name,
+                   s.ddl_hash,
+                   s.last_applied
+            FROM pgmg.pgmg_state s
+            JOIN pgmg.pgmg_dependencies d
+              ON d.dependent_type = 'trigger'
+             AND d.dependent_name = s.object_name
+             AND d.dependency_type = 'relation'
+            WHERE s.object_type = 'trigger'
+              AND position(':' in s.object_name) = 0
+            ON CONFLICT (object_type, object_name) DO NOTHING;
+
+            -- 2. Drop all legacy trigger state rows.
+            DELETE FROM pgmg.pgmg_state
+            WHERE object_type = 'trigger'
+              AND position(':' in object_name) = 0;
+
+            -- 3. Rewrite legacy trigger dependency rows: each relation dep
+            --    attaches to its own composite identity; function/type deps
+            --    replicate to every expanded identity (safe over-approximation,
+            --    replaced wholesale on the trigger's next recreate).
+            INSERT INTO pgmg.pgmg_dependencies
+              (dependent_type, dependent_name, dependency_type, dependency_name, dependency_kind)
+            SELECT d.dependent_type,
+                   d.dependent_name || ':' || r.dependency_name,
+                   d.dependency_type,
+                   d.dependency_name,
+                   d.dependency_kind
+            FROM pgmg.pgmg_dependencies d
+            JOIN pgmg.pgmg_dependencies r
+              ON r.dependent_type = 'trigger'
+             AND r.dependent_name = d.dependent_name
+             AND r.dependency_type = 'relation'
+            WHERE d.dependent_type = 'trigger'
+              AND position(':' in d.dependent_name) = 0
+              AND (d.dependency_type <> 'relation' OR d.dependency_name = r.dependency_name)
+            ON CONFLICT DO NOTHING;
+
+            -- 4. Drop all legacy trigger dependency rows.
+            DELETE FROM pgmg.pgmg_dependencies
+            WHERE dependent_type = 'trigger'
+              AND position(':' in dependent_name) = 0;
+            "#,
+        ).await?;
 
         Ok(())
     }
