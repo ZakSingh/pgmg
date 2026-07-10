@@ -1,6 +1,6 @@
 use tokio_postgres::Client;
 use std::collections::HashSet;
-use crate::sql::{ObjectType, QualifiedIdent};
+use crate::sql::{ObjectType, QualifiedIdent, state_object_name, parse_state_object_name};
 use std::time::SystemTime;
 
 #[derive(Debug, Clone)]
@@ -15,6 +15,9 @@ pub struct ObjectRecord {
     pub object_name: QualifiedIdent,
     pub ddl_hash: String,
     pub last_applied: SystemTime,
+    /// For triggers only: the table the trigger is defined on (parsed from the
+    /// `name:table` state key). None for legacy-format trigger rows.
+    pub trigger_table: Option<QualifiedIdent>,
 }
 
 pub struct StateManager<'a> {
@@ -185,13 +188,14 @@ impl<'a> StateManager<'a> {
             };
 
             let object_name_str: String = row.get(1);
-            let object_name = QualifiedIdent::from_qualified_name(&object_name_str);
+            let (object_name, trigger_table) = parse_state_object_name(&object_type, &object_name_str);
 
             objects.push(ObjectRecord {
                 object_type,
                 object_name,
                 ddl_hash: row.get(2),
                 last_applied: row.get(3),
+                trigger_table,
             });
         }
 
@@ -212,28 +216,11 @@ impl<'a> StateManager<'a> {
         &self,
         object_type: &ObjectType,
         object_name: &QualifiedIdent,
+        trigger_table: Option<&QualifiedIdent>,
         ddl_hash: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let object_type_str = match object_type {
-            ObjectType::Table => "table",
-            ObjectType::View => "view",
-            ObjectType::MaterializedView => "materialized_view",
-            ObjectType::Function => "function",
-            ObjectType::Procedure => "procedure",
-            ObjectType::Type => "type",
-            ObjectType::Domain => "domain",
-            ObjectType::Index => "index",
-            ObjectType::Trigger => "trigger",
-            ObjectType::Comment => "comment",
-            ObjectType::CronJob => "cron_job",
-            ObjectType::Aggregate => "aggregate",
-            ObjectType::Operator => "operator",
-        };
-
-        let qualified_name = match &object_name.schema {
-            Some(schema) => format!("{}.{}", schema, object_name.name),
-            None => object_name.name.clone(),
-        };
+        let object_type_str = self.object_type_to_string(object_type);
+        let qualified_name = state_object_name(object_type, object_name, trigger_table);
 
         self.client.execute(
             r#"
@@ -253,17 +240,18 @@ impl<'a> StateManager<'a> {
         &self,
         object_type: &ObjectType,
         object_name: &QualifiedIdent,
+        trigger_table: Option<&QualifiedIdent>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let object_type_str = self.object_type_to_string(object_type);
-        let qualified_name = self.format_qualified_name(object_name);
+        let qualified_name = state_object_name(object_type, object_name, trigger_table);
 
         self.client.execute(
             "DELETE FROM pgmg.pgmg_state WHERE object_type = $1 AND object_name = $2",
             &[&object_type_str, &qualified_name],
         ).await?;
-        
+
         // Also remove dependencies
-        self.remove_object_dependencies(object_type, object_name).await?;
+        self.remove_object_dependencies(object_type, object_name, trigger_table).await?;
 
         Ok(())
     }
@@ -273,27 +261,10 @@ impl<'a> StateManager<'a> {
         &self,
         object_type: &ObjectType,
         object_name: &QualifiedIdent,
+        trigger_table: Option<&QualifiedIdent>,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let object_type_str = match object_type {
-            ObjectType::Table => "table",
-            ObjectType::View => "view",
-            ObjectType::MaterializedView => "materialized_view",
-            ObjectType::Function => "function",
-            ObjectType::Procedure => "procedure",
-            ObjectType::Type => "type",
-            ObjectType::Domain => "domain",
-            ObjectType::Index => "index",
-            ObjectType::Trigger => "trigger",
-            ObjectType::Comment => "comment",
-            ObjectType::CronJob => "cron_job",
-            ObjectType::Aggregate => "aggregate",
-            ObjectType::Operator => "operator",
-        };
-
-        let qualified_name = match &object_name.schema {
-            Some(schema) => format!("{}.{}", schema, object_name.name),
-            None => object_name.name.clone(),
-        };
+        let object_type_str = self.object_type_to_string(object_type);
+        let qualified_name = state_object_name(object_type, object_name, trigger_table);
 
         let rows = self.client.query(
             "SELECT ddl_hash FROM pgmg.pgmg_state WHERE object_type = $1 AND object_name = $2",
@@ -327,11 +298,12 @@ impl<'a> StateManager<'a> {
         &self,
         object_type: &ObjectType,
         object_name: &QualifiedIdent,
+        trigger_table: Option<&QualifiedIdent>,
         dependencies: &crate::sql::Dependencies,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let object_type_str = self.object_type_to_string(object_type);
-        let qualified_name = self.format_qualified_name(object_name);
-        
+        let qualified_name = state_object_name(object_type, object_name, trigger_table);
+
         // First, remove existing dependencies for this object
         self.client.execute(
             "DELETE FROM pgmg.pgmg_dependencies WHERE dependent_type = $1 AND dependent_name = $2",
@@ -391,10 +363,11 @@ impl<'a> StateManager<'a> {
         &self,
         object_type: &ObjectType,
         object_name: &QualifiedIdent,
+        trigger_table: Option<&QualifiedIdent>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let object_type_str = self.object_type_to_string(object_type);
-        let qualified_name = self.format_qualified_name(object_name);
-        
+        let qualified_name = state_object_name(object_type, object_name, trigger_table);
+
         // Remove as dependent
         self.client.execute(
             "DELETE FROM pgmg.pgmg_dependencies WHERE dependent_type = $1 AND dependent_name = $2",
@@ -410,11 +383,14 @@ impl<'a> StateManager<'a> {
         Ok(())
     }
     
-    /// Get stored dependencies for deleted objects
+    /// Get stored dependencies for deleted objects.
+    ///
+    /// `deleted_objects` names are the raw state strings (`name:table` for
+    /// triggers); the returned tuples carry the parsed name and trigger table.
     pub async fn get_deleted_object_dependencies(
         &self,
         deleted_objects: &[(ObjectType, String)],
-    ) -> Result<Vec<(ObjectType, QualifiedIdent, crate::sql::Dependencies)>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<(ObjectType, QualifiedIdent, Option<QualifiedIdent>, crate::sql::Dependencies)>, Box<dyn std::error::Error>> {
         if deleted_objects.is_empty() {
             return Ok(Vec::new());
         }
@@ -455,8 +431,8 @@ impl<'a> StateManager<'a> {
                 }
             }
             
-            let object_qualified = QualifiedIdent::from_qualified_name(object_name);
-            result.push((object_type.clone(), object_qualified, dependencies));
+            let (object_qualified, trigger_table) = parse_state_object_name(object_type, object_name);
+            result.push((object_type.clone(), object_qualified, trigger_table, dependencies));
         }
         
         Ok(result)

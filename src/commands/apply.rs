@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::collections::HashSet;
 use crate::db::{StateManager, connect_to_database, DatabaseConfig, AdvisoryLockManager, AdvisoryLockError};
-use crate::sql::{SqlObject, ObjectType, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file, migration_analyzer::extract_enum_add_value_statements};
+use crate::sql::{SqlObject, ObjectType, state_object_name, parse_state_object_name, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file, migration_analyzer::extract_enum_add_value_statements};
 use crate::commands::plan::{execute_plan, ChangeOperation, PlanResult};
 use crate::config::PgmgConfig;
 use crate::analysis::ObjectRef;
@@ -403,7 +403,7 @@ async fn execute_all_changes<C: GenericClient>(
                             Ok(_) => {
                                 pre_dropped_objects.insert(format!("{:?}:{}",
                                     object.object_type,
-                                    format_object_name(object)
+                                    state_object_name(&object.object_type, &object.qualified_name, object.trigger_table.as_ref())
                                 ));
 
                                 if !test_mode {
@@ -563,9 +563,10 @@ async fn execute_all_changes<C: GenericClient>(
             // Sort by creation order if available
             if let Some(ref create_order) = creation_order {
                 all_creates.sort_by_key(|(obj, _)| {
-                    create_order.iter().position(|ref_| 
+                    create_order.iter().position(|ref_|
                         ref_.object_type == obj.object_type &&
-                        ref_.qualified_name == obj.qualified_name
+                        ref_.qualified_name == obj.qualified_name &&
+                        ref_.trigger_table == obj.trigger_table
                     ).unwrap_or(usize::MAX)
                 });
             }
@@ -798,16 +799,30 @@ async fn apply_create_object<C: GenericClient>(
         debug!("Skipping pg_cron object in test mode: {}", object.qualified_name.name);
         return Ok(());
     }
-    
+
+    // CREATE TRIGGER has no OR REPLACE (before PG14) and fails if the trigger
+    // already exists — e.g. a live trigger that lost its state row during the
+    // legacy trigger-identity upgrade. Drop defensively; recreation is cheap.
+    if object.object_type == ObjectType::Trigger {
+        if let Some(table) = &object.trigger_table {
+            let drop_statement = format!(
+                "DROP TRIGGER IF EXISTS {} ON {}",
+                quote_qualified_identifier(object.qualified_name.schema.as_deref(), &object.qualified_name.name),
+                quote_qualified_identifier(table.schema.as_deref(), &table.name)
+            );
+            client.execute(&drop_statement, &[]).await?;
+        }
+    }
+
     // Execute the DDL statement
     client.execute(&object.ddl_statement, &[]).await?;
-    
+
     // Update state tracking with object hash
     let ddl_hash = calculate_ddl_hash(&object.ddl_statement);
-    update_object_hash(client, &object.object_type, &object.qualified_name, &ddl_hash).await?;
-    
+    update_object_hash(client, &object.object_type, &object.qualified_name, object.trigger_table.as_ref(), &ddl_hash).await?;
+
     // Store object dependencies
-    store_object_dependencies(client, &object.object_type, &object.qualified_name, &object.dependencies).await?;
+    store_object_dependencies(client, &object.object_type, &object.qualified_name, object.trigger_table.as_ref(), &object.dependencies).await?;
     
     // Emit NOTIFY event if in development mode
     if config.development_mode.unwrap_or(false) && config.emit_notify_events.unwrap_or(false) {
@@ -842,23 +857,22 @@ async fn apply_drop_for_update<C: GenericClient>(
     // Just drop the object - creation will happen in a separate phase
     let drop_statement = match object.object_type {
         ObjectType::Trigger => {
-            // For triggers, we need to extract the table name from the DDL
-            match extract_trigger_table(&object.ddl_statement) {
-                Ok(table_name) => {
-                    let trigger_name = quote_qualified_identifier(
-                        object.qualified_name.schema.as_deref(),
-                        &object.qualified_name.name
-                    );
-                    let table_full_name = quote_qualified_identifier(
-                        table_name.schema.as_deref(),
-                        &table_name.name
-                    );
-                    format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, table_full_name)
-                }
-                Err(e) => {
-                    return Err(format!("Could not extract table name from trigger DDL: {}", e).into());
-                }
-            }
+            // The table is part of the trigger's identity; re-parse the DDL only
+            // if it's somehow missing (e.g. objects built outside the parser)
+            let table_name = match &object.trigger_table {
+                Some(table) => table.clone(),
+                None => extract_trigger_table(&object.ddl_statement)
+                    .map_err(|e| format!("Could not extract table name from trigger DDL: {}", e))?,
+            };
+            let trigger_name = quote_qualified_identifier(
+                object.qualified_name.schema.as_deref(),
+                &object.qualified_name.name
+            );
+            let table_full_name = quote_qualified_identifier(
+                table_name.schema.as_deref(),
+                &table_name.name
+            );
+            format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, table_full_name)
         }
         ObjectType::Function | ObjectType::Procedure | ObjectType::Aggregate => {
             // For functions, procedures, and aggregates, we need to drop all existing overloads
@@ -895,9 +909,9 @@ async fn apply_delete_object<C: GenericClient>(
     object_type: &ObjectType,
     object_name: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Parse the qualified name
-    let qualified_name = crate::sql::QualifiedIdent::from_qualified_name(object_name);
-    
+    // Parse the state name ("name:table" for triggers)
+    let (qualified_name, trigger_table) = parse_state_object_name(object_type, object_name);
+
     // Handle comment deletion specially - comments can't be dropped, only set to NULL
     if object_type == &ObjectType::Comment {
         let comment_null_statement = generate_comment_null_statement(object_name)?;
@@ -920,7 +934,7 @@ async fn apply_delete_object<C: GenericClient>(
         
         // Always remove from state tracking, regardless of whether the SQL succeeded
         // This ensures we don't try to delete non-existent comments repeatedly
-        remove_object_from_state(client, object_type, &qualified_name).await?;
+        remove_object_from_state(client, object_type, &qualified_name, trigger_table.as_ref()).await?;
         return Ok(());
     } else if matches!(object_type, ObjectType::Function | ObjectType::Procedure | ObjectType::Aggregate | ObjectType::Operator) {
         // For functions, procedures, aggregates, and operators, drop all existing overloads
@@ -959,27 +973,23 @@ async fn apply_delete_object<C: GenericClient>(
             }
         }
     } else if object_type == &ObjectType::Trigger {
-        // Triggers need special handling - we need to find the table they're on
-        let trigger_table = get_trigger_table_from_dependencies(client, &qualified_name).await?;
+        // The table is part of the trigger's state identity ("name:table").
+        // Fall back to the recorded relation dependency only for legacy-format
+        // rows that predate the table-in-identity keys.
+        let table = match &trigger_table {
+            Some(table) => table.clone(),
+            None => {
+                let stored = get_trigger_table_from_dependencies(client, &qualified_name).await?;
+                crate::sql::QualifiedIdent::from_qualified_name(&stored)
+            }
+        };
+
         let trigger_name = quote_qualified_identifier(
             qualified_name.schema.as_deref(),
             &qualified_name.name
         );
-        
-        // The trigger_table could be either "table_name" or "schema.table_name"
-        // We need to properly quote it
-        let quoted_table = if trigger_table.contains('.') {
-            // It's already qualified, split and quote each part
-            let parts: Vec<&str> = trigger_table.splitn(2, '.').collect();
-            if parts.len() == 2 {
-                quote_qualified_identifier(Some(parts[0]), parts[1])
-            } else {
-                quote_qualified_identifier(None, &trigger_table)
-            }
-        } else {
-            quote_qualified_identifier(None, &trigger_table)
-        };
-        
+        let quoted_table = quote_qualified_identifier(table.schema.as_deref(), &table.name);
+
         let drop_statement = format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, quoted_table);
         client.execute(&drop_statement, &[]).await?;
     } else {
@@ -989,8 +999,8 @@ async fn apply_delete_object<C: GenericClient>(
     }
     
     // Remove from state tracking
-    remove_object_from_state(client, object_type, &qualified_name).await?;
-    
+    remove_object_from_state(client, object_type, &qualified_name, trigger_table.as_ref()).await?;
+
     Ok(())
 }
 
@@ -1139,13 +1149,8 @@ fn generate_drop_statement(object_type: &ObjectType, qualified_name: &crate::sql
     }
 }
 
-async fn update_object_hash<C: GenericClient>(
-    client: &C,
-    object_type: &ObjectType,
-    object_name: &crate::sql::QualifiedIdent,
-    ddl_hash: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let object_type_str = match object_type {
+fn object_type_str(object_type: &ObjectType) -> &'static str {
+    match object_type {
         ObjectType::Table => "table",
         ObjectType::View => "view",
         ObjectType::MaterializedView => "materialized_view",
@@ -1159,12 +1164,18 @@ async fn update_object_hash<C: GenericClient>(
         ObjectType::CronJob => "cron_job",
         ObjectType::Aggregate => "aggregate",
         ObjectType::Operator => "operator",
-    };
+    }
+}
 
-    let qualified_name = match &object_name.schema {
-        Some(schema) => format!("{}.{}", schema, object_name.name),
-        None => object_name.name.clone(),
-    };
+async fn update_object_hash<C: GenericClient>(
+    client: &C,
+    object_type: &ObjectType,
+    object_name: &crate::sql::QualifiedIdent,
+    trigger_table: Option<&crate::sql::QualifiedIdent>,
+    ddl_hash: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let object_type_str = object_type_str(object_type);
+    let qualified_name = state_object_name(object_type, object_name, trigger_table);
 
     client.execute(
         r#"
@@ -1183,29 +1194,12 @@ async fn store_object_dependencies<C: GenericClient>(
     client: &C,
     object_type: &ObjectType,
     object_name: &crate::sql::QualifiedIdent,
+    trigger_table: Option<&crate::sql::QualifiedIdent>,
     dependencies: &crate::sql::Dependencies,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let object_type_str = match object_type {
-        ObjectType::Table => "table",
-        ObjectType::View => "view",
-        ObjectType::MaterializedView => "materialized_view",
-        ObjectType::Function => "function",
-        ObjectType::Procedure => "procedure",
-        ObjectType::Type => "type",
-        ObjectType::Domain => "domain",
-        ObjectType::Index => "index",
-        ObjectType::Trigger => "trigger",
-        ObjectType::Comment => "comment",
-        ObjectType::CronJob => "cron_job",
-        ObjectType::Aggregate => "aggregate",
-        ObjectType::Operator => "operator",
-    };
+    let object_type_str = object_type_str(object_type);
+    let qualified_name = state_object_name(object_type, object_name, trigger_table);
 
-    let qualified_name = match &object_name.schema {
-        Some(schema) => format!("{}.{}", schema, object_name.name),
-        None => object_name.name.clone(),
-    };
-    
     // First, remove existing dependencies for this object
     client.execute(
         "DELETE FROM pgmg.pgmg_dependencies WHERE dependent_type = $1 AND dependent_name = $2",
@@ -1273,27 +1267,10 @@ async fn remove_object_from_state<C: GenericClient>(
     client: &C,
     object_type: &ObjectType,
     object_name: &crate::sql::QualifiedIdent,
+    trigger_table: Option<&crate::sql::QualifiedIdent>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let object_type_str = match object_type {
-        ObjectType::Table => "table",
-        ObjectType::View => "view",
-        ObjectType::MaterializedView => "materialized_view",
-        ObjectType::Function => "function",
-        ObjectType::Procedure => "procedure",
-        ObjectType::Type => "type",
-        ObjectType::Domain => "domain",
-        ObjectType::Index => "index",
-        ObjectType::Trigger => "trigger",
-        ObjectType::Comment => "comment",
-        ObjectType::CronJob => "cron_job",
-        ObjectType::Aggregate => "aggregate",
-        ObjectType::Operator => "operator",
-    };
-
-    let qualified_name = match &object_name.schema {
-        Some(schema) => format!("{}.{}", schema, object_name.name),
-        None => object_name.name.clone(),
-    };
+    let object_type_str = object_type_str(object_type);
+    let qualified_name = state_object_name(object_type, object_name, trigger_table);
 
     client.execute(
         "DELETE FROM pgmg.pgmg_state WHERE object_type = $1 AND object_name = $2",
@@ -1337,20 +1314,34 @@ async fn remove_object_from_state<C: GenericClient>(
             ).await?;
         }
         ObjectType::Trigger => {
-            // Triggers have a special format: trigger:trigger_name:table_name
-            // When removing a trigger, remove its comment
-            // The qualified_name might include schema, so we need to handle both cases
-            let trigger_comment_pattern = format!("trigger:{}:", qualified_name);
-            
-            // Also try without schema prefix in case the comment was stored differently
-            let trigger_name_only = qualified_name.split('.').last().unwrap_or(&qualified_name);
-            let trigger_comment_pattern_no_schema = format!("trigger:{}:", trigger_name_only);
-            
-            // Delete using both patterns
-            client.execute(
-                "DELETE FROM pgmg.pgmg_state WHERE object_type = 'comment' AND (object_name LIKE $1 OR object_name LIKE $2)",
-                &[&format!("{}%", trigger_comment_pattern), &format!("{}%", trigger_comment_pattern_no_schema)],
-            ).await?;
+            // Trigger comments are keyed "trigger:<name>:<table>". Match the
+            // exact table (tolerating a public./bare qualification mismatch) so
+            // we don't wipe comments of same-named triggers on other tables.
+            // Only legacy rows with no recorded table fall back to the broad
+            // name-prefix match.
+            let trigger_name = crate::sql::format_qualified_name(object_name);
+            match trigger_table {
+                Some(table) => {
+                    let table_str = crate::sql::format_qualified_name(table);
+                    let mut variants = vec![format!("trigger:{}:{}", trigger_name, table_str)];
+                    if let Some(stripped) = table_str.strip_prefix("public.") {
+                        variants.push(format!("trigger:{}:{}", trigger_name, stripped));
+                    } else if !table_str.contains('.') {
+                        variants.push(format!("trigger:{}:public.{}", trigger_name, table_str));
+                    }
+                    client.execute(
+                        "DELETE FROM pgmg.pgmg_state WHERE object_type = 'comment' AND object_name = ANY($1)",
+                        &[&variants],
+                    ).await?;
+                }
+                None => {
+                    let pattern = format!("trigger:{}:%", trigger_name);
+                    client.execute(
+                        "DELETE FROM pgmg.pgmg_state WHERE object_type = 'comment' AND object_name LIKE $1",
+                        &[&pattern],
+                    ).await?;
+                }
+            }
         }
         _ => {
             // For other object types that might have comments
@@ -1761,10 +1752,13 @@ fn order_changes_by_deletion<'a>(
                 let matches = match change {
                     ChangeOperation::UpdateObject { object, .. } =>
                         object.object_type == object_ref.object_type &&
-                        object.qualified_name == object_ref.qualified_name,
+                        object.qualified_name == object_ref.qualified_name &&
+                        object.trigger_table == object_ref.trigger_table,
                     ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                        let qname = crate::sql::QualifiedIdent::from_qualified_name(object_name);
-                        object_type == &object_ref.object_type && qname == object_ref.qualified_name
+                        let (qname, ttable) = parse_state_object_name(object_type, object_name);
+                        object_type == &object_ref.object_type &&
+                        qname == object_ref.qualified_name &&
+                        ttable == object_ref.trigger_table
                     }
                     _ => false,
                 };

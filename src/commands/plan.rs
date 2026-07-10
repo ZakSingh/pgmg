@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use crate::db::{StateManager, connect_with_url, scan_sql_files, scan_migrations};
-use crate::sql::{SqlObject, ObjectType, QualifiedIdent, objects::calculate_ddl_hash, extract_altered_tables, state_object_name, parse_state_object_name, human_object_name};
+use crate::sql::{SqlObject, ObjectType, QualifiedIdent, objects::calculate_ddl_hash, extract_altered_tables, format_qualified_name, state_object_name, parse_state_object_name, human_object_name};
 use crate::analysis::{DependencyGraph, ObjectRef};
 use crate::BuiltinCatalog;
 #[cfg(feature = "cli")]
@@ -132,18 +132,19 @@ pub async fn execute_plan(
 
                     // Add these as UpdateObject operations (to trigger pre-drop/recreate)
                     for (obj_type, obj_name) in dependents {
-                        let obj_qualified = QualifiedIdent::from_qualified_name(&obj_name);
+                        let (obj_qualified, obj_trigger_table) = parse_state_object_name(&obj_type, &obj_name);
 
                         // Skip if already in changes
                         let already_included = object_changes.iter().any(|change| match change {
                             ChangeOperation::UpdateObject { object, .. } |
                             ChangeOperation::CreateObject { object, .. } => {
                                 object.object_type == obj_type &&
-                                object.qualified_name == obj_qualified
+                                object.qualified_name == obj_qualified &&
+                                object.trigger_table == obj_trigger_table
                             }
                             ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                                let qname = QualifiedIdent::from_qualified_name(object_name);
-                                object_type == &obj_type && qname == obj_qualified
+                                let (qname, ttable) = parse_state_object_name(object_type, object_name);
+                                object_type == &obj_type && qname == obj_qualified && ttable == obj_trigger_table
                             }
                             _ => false,
                         });
@@ -152,10 +153,11 @@ pub async fn execute_plan(
                             // Find the object in file_objects to get its DDL
                             if let Some(file_obj) = file_objects.iter().find(|obj|
                                 obj.object_type == obj_type &&
-                                obj.qualified_name == obj_qualified
+                                obj.qualified_name == obj_qualified &&
+                                obj.trigger_table == obj_trigger_table
                             ) {
                                 debug!("  Adding {:?} {} for recreation (migration alters dependent table)",
-                                    obj_type, format_qualified_name(&obj_qualified));
+                                    obj_type, human_object_name(&obj_type, &obj_qualified, obj_trigger_table.as_ref()));
                                 object_changes.push(ChangeOperation::UpdateObject {
                                     object: file_obj.clone(),
                                     old_hash: String::new(),
@@ -194,7 +196,8 @@ pub async fn execute_plan(
             let updated_objects_for_deps: Vec<(ObjectType, String)> = object_changes.iter()
                 .filter_map(|change| match change {
                     ChangeOperation::UpdateObject { object, .. } => {
-                        Some((object.object_type.clone(), format_qualified_name(&object.qualified_name)))
+                        Some((object.object_type.clone(),
+                              state_object_name(&object.object_type, &object.qualified_name, object.trigger_table.as_ref())))
                     }
                     _ => None,
                 })
@@ -208,9 +211,9 @@ pub async fn execute_plan(
 
             // Build a map of stored dependencies for updated objects
             let mut stored_deps_map: HashMap<(ObjectType, String), crate::sql::Dependencies> = HashMap::new();
-            for (obj_type, obj_name, deps) in updated_object_stored_deps {
-                let key = (obj_type, format_qualified_name(&obj_name));
-                stored_deps_map.insert(key, deps);
+            for (obj_type, obj_name, obj_trigger_table, deps) in updated_object_stored_deps {
+                let key_name = state_object_name(&obj_type, &obj_name, obj_trigger_table.as_ref());
+                stored_deps_map.insert((obj_type, key_name), deps);
             }
 
             // Build the "file-only" graph first - this is used for VALIDATION
@@ -224,7 +227,8 @@ pub async fn execute_plan(
             // Merge stored dependencies into file objects for updated objects
             // This ensures the ordering graph includes both old (database) and new (file) dependencies
             for obj in &mut all_objects_for_ordering {
-                let key = (obj.object_type.clone(), format_qualified_name(&obj.qualified_name));
+                let key = (obj.object_type.clone(),
+                           state_object_name(&obj.object_type, &obj.qualified_name, obj.trigger_table.as_ref()));
                 if let Some(stored_deps) = stored_deps_map.get(&key) {
                     // Merge stored dependencies with parsed dependencies
                     obj.dependencies.relations.extend(stored_deps.relations.clone());
@@ -233,7 +237,7 @@ pub async fn execute_plan(
                 }
             }
 
-            for (obj_type, obj_name, deps) in deleted_object_deps {
+            for (obj_type, obj_name, obj_trigger_table, deps) in deleted_object_deps {
                 // Create a minimal SqlObject for deleted objects
                 let deleted_obj = SqlObject::new(
                     obj_type,
@@ -241,7 +245,7 @@ pub async fn execute_plan(
                     String::new(), // Empty DDL for deleted objects
                     deps,
                     None, // No file path for deleted objects
-                );
+                ).with_trigger_table(obj_trigger_table);
                 all_objects_for_ordering.push(deleted_obj);
             }
 
@@ -276,7 +280,8 @@ pub async fn execute_plan(
                         // Also check if the dependent exists in the file objects (i.e., it's not being deleted)
                         let dependent_exists_in_files = file_objects.iter().any(|obj| {
                             obj.object_type == dependent.object_type &&
-                            obj.qualified_name == dependent.qualified_name
+                            obj.qualified_name == dependent.qualified_name &&
+                            obj.trigger_table == dependent.trigger_table
                         });
 
                         if dependent_exists_in_files {
@@ -326,21 +331,24 @@ pub async fn execute_plan(
                         ChangeOperation::UpdateObject { object, .. } |
                         ChangeOperation::CreateObject { object, .. } => {
                             object.object_type == affected_ref.object_type &&
-                            object.qualified_name == affected_ref.qualified_name
+                            object.qualified_name == affected_ref.qualified_name &&
+                            object.trigger_table == affected_ref.trigger_table
                         }
                         ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                            let qname = crate::sql::QualifiedIdent::from_qualified_name(object_name);
+                            let (qname, ttable) = parse_state_object_name(object_type, object_name);
                             object_type == &affected_ref.object_type &&
-                            qname == affected_ref.qualified_name
+                            qname == affected_ref.qualified_name &&
+                            ttable == affected_ref.trigger_table
                         }
                         _ => false,
                     });
-                    
+
                     if !already_included {
                         // Find the object in file_objects to get its DDL
-                        if let Some(file_obj) = file_objects.iter().find(|obj| 
+                        if let Some(file_obj) = file_objects.iter().find(|obj|
                             obj.object_type == affected_ref.object_type &&
-                            obj.qualified_name == affected_ref.qualified_name
+                            obj.qualified_name == affected_ref.qualified_name &&
+                            obj.trigger_table == affected_ref.trigger_table
                         ) {
                             // Add as an update operation (drop and recreate due to dependency)
                             object_changes.push(ChangeOperation::UpdateObject {
@@ -399,8 +407,8 @@ async fn detect_object_changes(
     let mut db_functions_by_name: HashMap<String, Vec<&crate::db::ObjectRecord>> = HashMap::new();
     
     for db_obj in db_objects {
-        let key = format!("{:?}:{}", db_obj.object_type, 
-            format_qualified_name(&db_obj.object_name));
+        let key = format!("{:?}:{}", db_obj.object_type,
+            state_object_name(&db_obj.object_type, &db_obj.object_name, db_obj.trigger_table.as_ref()));
         db_object_map.insert(key, db_obj);
         
         // Also track functions and procedures by name only (for overload detection)
@@ -415,26 +423,26 @@ async fn detect_object_changes(
     // Build set of all file objects first
     for file_obj in file_objects {
         let key = format!("{:?}:{}", file_obj.object_type,
-            format_qualified_name(&file_obj.qualified_name));
+            state_object_name(&file_obj.object_type, &file_obj.qualified_name, file_obj.trigger_table.as_ref()));
         file_object_set.insert(key);
     }
-    
+
     // Check for deleted objects first (in database but not in files)
     for (key, db_obj) in &db_object_map {
         if !file_object_set.contains(key) {
             changes.push(ChangeOperation::DeleteObject {
                 object_type: db_obj.object_type.clone(),
-                object_name: format_qualified_name(&db_obj.object_name),
+                object_name: state_object_name(&db_obj.object_type, &db_obj.object_name, db_obj.trigger_table.as_ref()),
                 reason: "Object no longer exists in code".to_string(),
             });
         }
     }
-    
+
     // Check for new or updated objects
     for file_obj in file_objects {
         let key = format!("{:?}:{}", file_obj.object_type,
-            format_qualified_name(&file_obj.qualified_name));
-        
+            state_object_name(&file_obj.object_type, &file_obj.qualified_name, file_obj.trigger_table.as_ref()));
+
         let new_hash = calculate_ddl_hash(&file_obj.ddl_statement);
         
         match db_object_map.get(&key) {
@@ -484,13 +492,6 @@ async fn detect_object_changes(
     Ok(changes)
 }
 
-fn format_qualified_name(qualified_name: &crate::sql::QualifiedIdent) -> String {
-    match &qualified_name.schema {
-        Some(schema) => format!("{}.{}", schema, qualified_name.name),
-        None => qualified_name.name.clone(),
-    }
-}
-
 /// Parse comment qualified name to extract parent object information
 #[allow(dead_code)]
 fn parse_comment_parent(comment_name: &str) -> Option<(String, String)> {
@@ -530,23 +531,27 @@ fn validate_no_duplicate_objects_in_files(file_objects: &[SqlObject]) -> Result<
     
     // Track object names and their locations for types that should be unique
     for obj in file_objects {
-        // Check object types that should have unique names within a schema
-        // Skip Comments, Triggers, CronJobs as they are contextual and may be legitimately duplicated
+        // Check object types that should have unique names within a schema.
+        // Triggers are keyed by name:table — same-named triggers on different
+        // tables are legitimate, but two on the same table are duplicates.
+        // Skip Comments and CronJobs as they are contextual and may be
+        // legitimately duplicated.
         let should_check = matches!(
             obj.object_type,
-            ObjectType::Function 
-            | ObjectType::Procedure 
-            | ObjectType::View 
+            ObjectType::Function
+            | ObjectType::Procedure
+            | ObjectType::View
             | ObjectType::MaterializedView
-            | ObjectType::Table 
-            | ObjectType::Type 
+            | ObjectType::Table
+            | ObjectType::Type
             | ObjectType::Domain
             | ObjectType::Index
             | ObjectType::Aggregate
+            | ObjectType::Trigger
         );
-        
+
         if should_check {
-            let obj_name = format_qualified_name(&obj.qualified_name);
+            let obj_name = state_object_name(&obj.object_type, &obj.qualified_name, obj.trigger_table.as_ref());
             let location = match &obj.source_file {
                 Some(path) => {
                     match path.strip_prefix(std::env::current_dir().unwrap_or_default()) {
@@ -573,7 +578,7 @@ fn validate_no_duplicate_objects_in_files(file_objects: &[SqlObject]) -> Result<
         if locations.len() > 1 {
             let object_type_name = match locations[0].1 {
                 ObjectType::Function => "function",
-                ObjectType::Procedure => "procedure", 
+                ObjectType::Procedure => "procedure",
                 ObjectType::View => "view",
                 ObjectType::MaterializedView => "materialized view",
                 ObjectType::Table => "table",
@@ -581,16 +586,25 @@ fn validate_no_duplicate_objects_in_files(file_objects: &[SqlObject]) -> Result<
                 ObjectType::Domain => "domain",
                 ObjectType::Index => "index",
                 ObjectType::Aggregate => "aggregate",
+                ObjectType::Trigger => "trigger",
                 _ => "object",
             };
-            
+
+            // Triggers are keyed as name:table — show that as "name' on table '..."
+            let display_name = if locations[0].1 == ObjectType::Trigger {
+                let (name, table) = parse_state_object_name(&ObjectType::Trigger, &obj_name);
+                human_object_name(&ObjectType::Trigger, &name, table.as_ref())
+            } else {
+                obj_name.clone()
+            };
+
             let location_list: Vec<String> = locations.iter().map(|(loc, _)| loc.clone()).collect();
-            
+
             return Err(format!(
                 "Multiple definitions of {} '{}' found in SQL files:\n  - {}\n\
                 pgmg does not allow duplicate object names. Please rename or remove one definition.",
                 object_type_name,
-                obj_name,
+                display_name,
                 location_list.join("\n  - ")
             ).into());
         }
