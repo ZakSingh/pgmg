@@ -18,7 +18,7 @@ pub mod output;
 // Re-export key public APIs for convenience
 pub use builtin_catalog::BuiltinCatalog;
 pub use sql::{analyze_statement, analyze_plpgsql, filter_builtins, Dependencies, QualifiedIdent, SqlObject, ObjectType};
-pub use analysis::{DependencyGraph, ObjectRef, DependencyType};
+pub use analysis::{DependencyGraph, ObjectRef, DependencyType, Severity, SeverityCounts};
 pub use db::{StateManager, DatabaseConfig, connect_to_database, connect_with_url, scan_sql_files, scan_migrations};
 pub use config::PgmgConfig;
 pub use error::{PgmgError, Result, ErrorContext};

@@ -518,7 +518,7 @@ pub fn extract_function_signature(statement: &str) -> Result<String, Box<dyn std
 }
 
 /// Helper to extract type name from TypeName node
-fn extract_type_name(type_name: &pg_query::protobuf::TypeName) -> Option<String> {
+pub(crate) fn extract_type_name(type_name: &pg_query::protobuf::TypeName) -> Option<String> {
     // Extract the type name from the names list
     let parts: Vec<String> = type_name.names.iter()
         .filter_map(|node| {

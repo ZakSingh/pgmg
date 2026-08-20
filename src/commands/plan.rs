@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use crate::db::{StateManager, connect_with_url, scan_sql_files, scan_migrations};
 use crate::sql::{SqlObject, ObjectType, QualifiedIdent, objects::calculate_ddl_hash, extract_altered_tables, format_qualified_name, state_object_name, parse_state_object_name, human_object_name};
-use crate::analysis::{DependencyGraph, ObjectRef};
+use crate::analysis::{DependencyGraph, ObjectRef, Severity, SeverityCounts, severity};
 use crate::BuiltinCatalog;
 #[cfg(feature = "cli")]
 use owo_colors::OwoColorize;
@@ -15,6 +15,9 @@ pub struct PlanResult {
     #[serde(serialize_with = "serialize_graph_summary")]
     pub dependency_graph: Option<DependencyGraph>,
     pub file_objects: Vec<SqlObject>,
+    /// Worst client-compatibility impact across all changes (Safe when empty).
+    pub severity: Severity,
+    pub severity_counts: SeverityCounts,
 }
 
 /// The petgraph-backed graph can't derive Serialize; emit just the summary
@@ -41,23 +44,47 @@ pub enum ChangeOperation {
     CreateObject {
         object: SqlObject,
         reason: String,
+        severity: Severity,
     },
     UpdateObject {
         object: SqlObject,
         old_hash: String,
         new_hash: String,
         reason: String,
+        severity: Severity,
     },
     DeleteObject {
         object_type: ObjectType,
         object_name: String,
         reason: String,
+        severity: Severity,
     },
     ApplyMigration {
         name: String,
         #[serde(skip)]
         content: String,
+        severity: Severity,
     },
+}
+
+impl ChangeOperation {
+    pub fn severity(&self) -> Severity {
+        match self {
+            ChangeOperation::CreateObject { severity, .. }
+            | ChangeOperation::UpdateObject { severity, .. }
+            | ChangeOperation::DeleteObject { severity, .. }
+            | ChangeOperation::ApplyMigration { severity, .. } => *severity,
+        }
+    }
+
+    fn severity_mut(&mut self) -> &mut Severity {
+        match self {
+            ChangeOperation::CreateObject { severity, .. }
+            | ChangeOperation::UpdateObject { severity, .. }
+            | ChangeOperation::DeleteObject { severity, .. }
+            | ChangeOperation::ApplyMigration { severity, .. } => severity,
+        }
+    }
 }
 
 pub async fn execute_plan(
@@ -83,6 +110,8 @@ pub async fn execute_plan(
         new_migrations: Vec::new(),
         dependency_graph: None,
         file_objects: Vec::new(),
+        severity: Severity::Safe,
+        severity_counts: SeverityCounts::default(),
     };
 
     // Step 1: Check for new migrations
@@ -99,6 +128,7 @@ pub async fn execute_plan(
                 plan_result.changes.push(ChangeOperation::ApplyMigration {
                     name: migration_name.clone(),
                     content,
+                    severity: Severity::Breaking,
                 });
             }
         }
@@ -184,6 +214,7 @@ pub async fn execute_plan(
                                     old_hash: String::new(),
                                     new_hash: calculate_ddl_hash(&file_obj.ddl_statement),
                                     reason: "Migration alters dependent table".to_string(),
+                                    severity: Severity::Breaking,
                                 });
                             }
                         }
@@ -386,6 +417,7 @@ pub async fn execute_plan(
                                 old_hash: String::new(), // We don't have the old hash, but it's not critical
                                 new_hash: calculate_ddl_hash(&file_obj.ddl_statement),
                                 reason: "Dependency requires recreation".to_string(),
+                                severity: Severity::Breaking,
                             });
                         }
                     }
@@ -405,7 +437,37 @@ pub async fn execute_plan(
         }
     }
 
+    // Final step: classify the client-compatibility severity of every change.
+    // Never fails; anything unclassifiable degrades to Breaking with a warning.
+    classify_changes(&client, &mut plan_result).await;
+
     Ok(plan_result)
+}
+
+/// Annotate each change with its client-compatibility severity and roll the
+/// worst case (plus counts) up onto the plan. Read-only against the database.
+async fn classify_changes(client: &tokio_postgres::Client, plan: &mut PlanResult) {
+    let mut counts = SeverityCounts::default();
+    let mut max = Severity::Safe;
+    for change in &mut plan.changes {
+        let classified = match &*change {
+            ChangeOperation::CreateObject { object, .. } => severity::classify_create(object),
+            ChangeOperation::UpdateObject { object, .. } => {
+                severity::classify_update(client, object).await
+            }
+            ChangeOperation::DeleteObject { object_type, object_name, .. } => {
+                severity::classify_delete(object_type, object_name)
+            }
+            ChangeOperation::ApplyMigration { name, content, .. } => {
+                severity::classify_migration(name, content)
+            }
+        };
+        *change.severity_mut() = classified;
+        counts.record(classified);
+        max = max.max(classified);
+    }
+    plan.severity = max;
+    plan.severity_counts = counts;
 }
 
 async fn check_new_migrations(
@@ -464,6 +526,7 @@ async fn detect_object_changes(
                 object_type: db_obj.object_type.clone(),
                 object_name: state_object_name(&db_obj.object_type, &db_obj.object_name, db_obj.trigger_table.as_ref()),
                 reason: "Object no longer exists in code".to_string(),
+                severity: Severity::Breaking,
             });
         }
     }
@@ -484,6 +547,7 @@ async fn detect_object_changes(
                         old_hash: db_obj.ddl_hash.clone(),
                         new_hash,
                         reason: "DDL content has changed".to_string(),
+                        severity: Severity::Breaking,
                     });
                 }
             }
@@ -514,6 +578,7 @@ async fn detect_object_changes(
                 changes.push(ChangeOperation::CreateObject {
                     object: file_obj.clone(),
                     reason: "New object not in database".to_string(),
+                    severity: Severity::Breaking,
                 });
             }
         }
@@ -700,49 +765,53 @@ pub fn print_plan_summary(plan: &PlanResult) {
             }
             
             match change {
-                ChangeOperation::CreateObject { object, reason } => {
+                ChangeOperation::CreateObject { object, reason, severity } => {
                     // Special handling for comments - display them inline with parent
                     if object.object_type == ObjectType::Comment {
                         // If this comment should be displayed standalone
-                        println!("  {} {} {} {} ({})", 
+                        println!("  {} {} {} {} ({}) {}",
                             "+".green().bold(),
                             "CREATE".green().bold(),
                             object.object_type.to_string().yellow(),
                             format_qualified_name(&object.qualified_name).cyan(),
-                            reason.dimmed()
+                            reason.dimmed(),
+                            severity_tag(*severity)
                         );
                     } else {
                         // Regular object - check if it has an associated comment
-                        println!("  {} {} {} {} ({})",
+                        println!("  {} {} {} {} ({}) {}",
                             "+".green().bold(),
                             "CREATE".green().bold(),
                             object.object_type.to_string().yellow(),
                             human_object_name(&object.object_type, &object.qualified_name, object.trigger_table.as_ref()).cyan(),
-                            reason.dimmed()
+                            reason.dimmed(),
+                            severity_tag(*severity)
                         );
 
                         // Look for associated comment in subsequent changes
                         print_associated_comments(plan, i, &mut printed_comments, object);
                     }
                 }
-                ChangeOperation::UpdateObject { object, old_hash, new_hash, reason } => {
+                ChangeOperation::UpdateObject { object, old_hash, new_hash, reason, severity } => {
                     // Special handling for comments - display them inline with parent
                     if object.object_type == ObjectType::Comment {
                         // If this comment should be displayed standalone
-                        println!("  {} {} {} {} ({})", 
+                        println!("  {} {} {} {} ({}) {}",
                             "~".yellow().bold(),
                             "UPDATE".yellow().bold(),
                             object.object_type.to_string().yellow(),
                             format_qualified_name(&object.qualified_name).cyan(),
-                            reason.dimmed()
+                            reason.dimmed(),
+                            severity_tag(*severity)
                         );
                     } else {
-                        println!("  {} {} {} {} ({})",
+                        println!("  {} {} {} {} ({}) {}",
                             "~".yellow().bold(),
                             "UPDATE".yellow().bold(),
                             object.object_type.to_string().yellow(),
                             human_object_name(&object.object_type, &object.qualified_name, object.trigger_table.as_ref()).cyan(),
-                            reason.dimmed()
+                            reason.dimmed(),
+                            severity_tag(*severity)
                         );
                         if !old_hash.is_empty() && old_hash.len() >= 8 {
                             println!("    {}: {}...", "Old hash".dimmed(), old_hash[..8].to_string().red());
@@ -750,26 +819,28 @@ pub fn print_plan_summary(plan: &PlanResult) {
                         if !new_hash.is_empty() && new_hash.len() >= 8 {
                             println!("    {}: {}...", "New hash".dimmed(), new_hash[..8].to_string().green());
                         }
-                        
+
                         // Look for associated comment in subsequent changes
                         print_associated_comments(plan, i, &mut printed_comments, object);
                     }
                 }
-                ChangeOperation::DeleteObject { object_type, object_name, reason } => {
+                ChangeOperation::DeleteObject { object_type, object_name, reason, severity } => {
                     let (qname, ttable) = parse_state_object_name(object_type, object_name);
-                    println!("  {} {} {} {} ({})",
+                    println!("  {} {} {} {} ({}) {}",
                         "-".red().bold(),
                         "DELETE".red().bold(),
                         object_type.to_string().yellow(),
                         human_object_name(object_type, &qname, ttable.as_ref()).cyan(),
-                        reason.dimmed()
+                        reason.dimmed(),
+                        severity_tag(*severity)
                     );
                 }
-                ChangeOperation::ApplyMigration { name, .. } => {
-                    println!("  {} {} {}", 
+                ChangeOperation::ApplyMigration { name, severity, .. } => {
+                    println!("  {} {} {} {}",
                         ">".magenta().bold(),
                         "MIGRATION".magenta().bold(),
-                        name.cyan()
+                        name.cyan(),
+                        severity_tag(*severity)
                     );
                 }
             }
@@ -777,13 +848,38 @@ pub fn print_plan_summary(plan: &PlanResult) {
     } else if plan.new_migrations.is_empty() {
         println!("\n{}", "No changes detected. Database is up to date.".green());
     }
-    
+
+    if !plan.changes.is_empty() {
+        let label = match plan.severity {
+            Severity::Safe => "SAFE".green().bold().to_string(),
+            Severity::Transient => "TRANSIENT".yellow().bold().to_string(),
+            Severity::Breaking => "BREAKING".red().bold().to_string(),
+        };
+        let counts = &plan.severity_counts;
+        println!("\n{}: {} ({} breaking, {} transient, {} safe)",
+            "Client compatibility".bold(),
+            label,
+            counts.breaking,
+            counts.transient,
+            counts.safe
+        );
+    }
+
     if let Some(graph) = &plan.dependency_graph {
         println!("\n{}: {} objects, {} dependencies", 
             "Dependency Graph".bold(),
             graph.node_count().to_string().yellow(),
             graph.edge_count().to_string().yellow()
         );
+    }
+}
+
+/// Colored `[safe]` / `[transient]` / `[breaking]` tag for a plan line
+fn severity_tag(severity: Severity) -> String {
+    match severity {
+        Severity::Safe => "[safe]".green().to_string(),
+        Severity::Transient => "[transient]".yellow().to_string(),
+        Severity::Breaking => "[breaking]".red().bold().to_string(),
     }
 }
 

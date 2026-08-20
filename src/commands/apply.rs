@@ -2,11 +2,12 @@ use std::path::PathBuf;
 use std::time::Duration;
 use std::collections::HashSet;
 use crate::db::{StateManager, connect_to_database, DatabaseConfig, AdvisoryLockManager, AdvisoryLockError};
+use crate::db::introspect::{get_existing_function_signatures, quote_qualified_identifier};
 use crate::sql::{SqlObject, ObjectType, state_object_name, parse_state_object_name, objects::{calculate_ddl_hash, extract_trigger_table}, splitter::split_sql_file, migration_analyzer::extract_enum_add_value_statements};
 use crate::commands::plan::{execute_plan, ChangeOperation, PlanResult};
 use crate::config::PgmgConfig;
 use crate::analysis::ObjectRef;
-use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification, ApplySucceededNotification, emit_apply_succeeded_notification};
+use crate::notify::{ObjectLoadedNotification, emit_object_loaded_notification, ApplyInitiatedNotification, emit_apply_initiated_notification, ApplyFailedNotification, emit_apply_failed_notification, ApplySucceededNotification, emit_apply_succeeded_notification};
 use crate::plpgsql_check::{check_modified_functions, check_soft_dependent_functions, display_check_errors};
 use crate::error::format_postgres_error_with_details;
 use tracing::{info, warn, debug, error};
@@ -258,9 +259,48 @@ async fn execute_apply_internal(
         return Ok(apply_result);
     }
 
+    // Announce the apply — and its overall client-compatibility severity —
+    // before any change runs, so listeners can prepare (e.g. pause traffic
+    // ahead of a breaking apply). Issued on the plain client (auto-commit):
+    // inside the apply transaction the NOTIFY would only be delivered at
+    // commit, after the changes had already landed.
+    emit_apply_initiated(client, &plan_result).await;
+
+    // Steps 2-3: execute the plan. Every apply_initiated gets closure: a
+    // failure anywhere past this point is announced on pgmg.apply_failed
+    // (a success announces on pgmg.apply_succeeded from within).
+    if let Err(e) = apply_planned_changes(
+        &migrations_dir,
+        &code_dir,
+        config,
+        client,
+        test_mode,
+        &plan_result,
+        &mut apply_result,
+    ).await {
+        emit_apply_failed(client, &plan_result, &apply_result, &e).await;
+        return Err(e);
+    }
+
+    Ok(apply_result)
+}
+
+/// Steps 2-3 of an apply run: decide the transaction mode, pre-commit enum
+/// values, and execute all planned changes. Split out so execute_apply_internal
+/// can report any failure on the pgmg.apply_failed channel.
+async fn apply_planned_changes(
+    migrations_dir: &Option<PathBuf>,
+    code_dir: &Option<PathBuf>,
+    config: &PgmgConfig,
+    client: &mut tokio_postgres::Client,
+    test_mode: bool,
+    plan_result: &PlanResult,
+    apply_result: &mut ApplyResult,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Step 2: Determine if we should use transaction mode
     // Use auto-commit mode for fresh builds and test mode
     // This allows ALTER TYPE ADD VALUE and other non-transactional DDL
+    let state_manager = StateManager::new(client);
     let is_fresh_build = state_manager.is_empty().await?;
     let use_transaction = !test_mode && !is_fresh_build;
 
@@ -280,7 +320,7 @@ async fn execute_apply_internal(
     let mut pre_committed_enum_stmts: HashSet<String> = HashSet::new();
 
     if use_transaction {
-        if let Some(ref migrations_dir) = migrations_dir {
+        if let Some(migrations_dir) = migrations_dir {
             for migration_name in &plan_result.new_migrations {
                 let migration_path = migrations_dir.join(format!("{}.sql", migration_name));
                 if let Ok(content) = std::fs::read_to_string(&migration_path) {
@@ -315,24 +355,72 @@ async fn execute_apply_internal(
     // Step 3: Execute changes in either transaction or auto-commit mode
     if use_transaction {
         let transaction = client.transaction().await?;
-        execute_all_changes(&transaction, &mut apply_result, &plan_result,
-                           &migrations_dir, &code_dir, config, test_mode,
+        execute_all_changes(&transaction, apply_result, plan_result,
+                           migrations_dir, code_dir, config, test_mode,
                            &pre_committed_enum_stmts).await?;
         // Emit the schema-changed NOTIFY inside the transaction so it is delivered
         // atomically on commit (and discarded if the commit below were to fail).
-        emit_apply_succeeded_if_changed(&transaction, &apply_result).await;
+        emit_apply_succeeded_if_changed(&transaction, apply_result).await;
         transaction.commit().await?;
-        print_apply_success_message(&apply_result, test_mode);
+        print_apply_success_message(apply_result, test_mode);
     } else {
-        execute_all_changes(client, &mut apply_result, &plan_result,
-                           &migrations_dir, &code_dir, config, test_mode,
+        execute_all_changes(client, apply_result, plan_result,
+                           migrations_dir, code_dir, config, test_mode,
                            &pre_committed_enum_stmts).await?;
         // Auto-commit mode: changes are already committed, so emit immediately.
-        emit_apply_succeeded_if_changed(client, &apply_result).await;
-        print_apply_success_message(&apply_result, test_mode);
+        emit_apply_succeeded_if_changed(client, apply_result).await;
+        print_apply_success_message(apply_result, test_mode);
     }
 
-    Ok(apply_result)
+    Ok(())
+}
+
+/// Emit the `pgmg.apply_initiated` NOTIFY announcing that an apply with pending
+/// changes is about to execute, with the plan's severity rollup. Best-effort:
+/// failures are logged but never abort the apply.
+async fn emit_apply_initiated<C: GenericClient>(client: &C, plan_result: &PlanResult) {
+    if plan_result.changes.is_empty() {
+        return;
+    }
+    let notification = ApplyInitiatedNotification {
+        severity: plan_result.severity,
+        severity_counts: plan_result.severity_counts,
+        changes: plan_result.changes.len(),
+    };
+    if let Err(e) = emit_apply_initiated_notification(client, &notification).await {
+        warn!(error = %e, "Failed to emit pgmg.apply_initiated NOTIFY event");
+    }
+}
+
+/// Emit the `pgmg.apply_failed` NOTIFY reporting that the apply announced on
+/// `pgmg.apply_initiated` failed before committing. Must run on the plain
+/// client after any rollback — a NOTIFY inside the failed transaction would be
+/// discarded. Best-effort: failures are logged but never mask the apply error.
+async fn emit_apply_failed<C: GenericClient>(
+    client: &C,
+    plan_result: &PlanResult,
+    apply_result: &ApplyResult,
+    error: &Box<dyn std::error::Error>,
+) {
+    // Prefer the detailed per-operation errors recorded during the run over
+    // the generic "Apply operation failed" the error itself carries.
+    let detail = if apply_result.errors.is_empty() {
+        error.to_string()
+    } else {
+        apply_result.errors.join("; ")
+    };
+    // Keep well under the 8000-byte NOTIFY payload cap.
+    let truncated: String = detail.chars().take(1000).collect();
+
+    let notification = ApplyFailedNotification {
+        severity: plan_result.severity,
+        severity_counts: plan_result.severity_counts,
+        changes: plan_result.changes.len(),
+        error: truncated,
+    };
+    if let Err(e) = emit_apply_failed_notification(client, &notification).await {
+        warn!(error = %e, "Failed to emit pgmg.apply_failed NOTIFY event");
+    }
 }
 
 /// Emit the `pgmg.apply_succeeded` NOTIFY when an apply run actually changed the
@@ -1529,74 +1617,6 @@ async fn get_trigger_table_from_dependencies<C: GenericClient>(
     Ok(table_name)
 }
 
-async fn get_existing_function_signatures<C: GenericClient>(
-    client: &C,
-    object_type: &ObjectType,
-    qualified_name: &crate::sql::QualifiedIdent,
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let (schema_name, function_name) = match &qualified_name.schema {
-        Some(s) => (s.as_str(), qualified_name.name.as_str()),
-        None => ("public", qualified_name.name.as_str()),
-    };
-    
-    // Handle operators separately as they use pg_operator, not pg_proc
-    if object_type == &ObjectType::Operator {
-        let query = r#"
-            SELECT 
-                CASE 
-                    WHEN n.nspname = 'public' THEN o.oprname
-                    ELSE n.nspname || '.' || o.oprname
-                END || '(' || 
-                COALESCE(tl.typname, 'NONE') || ', ' || 
-                COALESCE(tr.typname, 'NONE') || ')' AS signature
-            FROM pg_operator o
-            JOIN pg_namespace n ON n.oid = o.oprnamespace
-            LEFT JOIN pg_type tl ON tl.oid = o.oprleft
-            LEFT JOIN pg_type tr ON tr.oid = o.oprright
-            WHERE n.nspname = $1 
-              AND o.oprname = $2
-        "#;
-        
-        let rows = client.query(query, &[&schema_name, &function_name]).await?;
-        
-        let signatures: Vec<String> = rows.iter()
-            .map(|row| row.get::<_, String>(0))
-            .collect();
-        
-        return Ok(signatures);
-    }
-    
-    let prokind: &str = match object_type {
-        ObjectType::Function => "f",
-        ObjectType::Procedure => "p", 
-        ObjectType::Aggregate => "a",
-        _ => return Ok(vec![]),
-    };
-    
-    // Query to get all overloads of a function with their full signatures
-    let query = r#"
-        SELECT 
-            CASE 
-                WHEN n.nspname = 'public' THEN p.proname
-                ELSE n.nspname || '.' || p.proname
-            END || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS signature
-        FROM pg_proc p
-        JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = $1 
-          AND p.proname = $2
-          AND p.prokind = $3::char
-    "#;
-    
-    let rows = client.query(query, &[&schema_name, &function_name, &prokind]).await?;
-    
-    let signatures: Vec<String> = rows.iter()
-        .map(|row| row.get::<_, String>(0))
-        .collect();
-    
-    Ok(signatures)
-}
-
-
 #[cfg(feature = "cli")]
 pub fn print_apply_summary(result: &ApplyResult) {
     println!("\n{}", "=== PGMG Apply Summary ===".bold().blue());
@@ -1686,18 +1706,6 @@ pub fn print_apply_summary(result: &ApplyResult) {
             println!("  {} {} warnings found", "⚠".yellow(), result.plpgsql_warnings_found.to_string().yellow().bold());
         }
     }
-}
-
-// Helper function to quote identifiers properly
-fn quote_qualified_identifier(schema: Option<&str>, name: &str) -> String {
-    match schema {
-        Some(s) => format!("{}.{}", quote_identifier(s), quote_identifier(name)),
-        None => quote_identifier(name),
-    }
-}
-
-fn quote_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace("\"", "\"\""))
 }
 
 /// Check if we're running on AWS RDS by looking for the rdsadmin database

@@ -1,5 +1,72 @@
 use pgmg::commands::{PlanResult, ApplyResult, ChangeOperation};
 use pgmg::sql::ObjectType;
+use pgmg::Severity;
+
+/// Assert the severity of the change (create/update/delete) touching the
+/// given object, matching by type and bare or schema-qualified name.
+pub fn assert_change_severity(
+    plan: &PlanResult,
+    object_type: ObjectType,
+    object_name: &str,
+    expected: Severity,
+) {
+    let matches_name = |qualified: &pgmg::QualifiedIdent| {
+        qualified.name == object_name
+            || format!(
+                "{}.{}",
+                qualified.schema.as_deref().unwrap_or("public"),
+                qualified.name
+            ) == object_name
+    };
+    let found = plan.changes.iter().find_map(|change| match change {
+        ChangeOperation::CreateObject { object, severity, .. }
+        | ChangeOperation::UpdateObject { object, severity, .. }
+            if object.object_type == object_type && matches_name(&object.qualified_name) =>
+        {
+            Some(*severity)
+        }
+        ChangeOperation::DeleteObject { object_type: ot, object_name: on, severity, .. }
+            if ot == &object_type && on == object_name =>
+        {
+            Some(*severity)
+        }
+        _ => None,
+    });
+
+    match found {
+        Some(actual) => assert_eq!(
+            actual, expected,
+            "Expected {:?} '{}' to have severity {:?}, but it is {:?}",
+            object_type, object_name, expected, actual
+        ),
+        None => panic!(
+            "Expected plan to contain a change for {:?} '{}', but it doesn't: {:#?}",
+            object_type, object_name, plan.changes
+        ),
+    }
+}
+
+/// Assert the severity of a migration operation in the plan.
+pub fn assert_migration_severity(plan: &PlanResult, migration_name: &str, expected: Severity) {
+    let found = plan.changes.iter().find_map(|change| match change {
+        ChangeOperation::ApplyMigration { name, severity, .. } if name == migration_name => {
+            Some(*severity)
+        }
+        _ => None,
+    });
+
+    match found {
+        Some(actual) => assert_eq!(
+            actual, expected,
+            "Expected migration '{}' to have severity {:?}, but it is {:?}",
+            migration_name, expected, actual
+        ),
+        None => panic!(
+            "Expected plan to contain migration '{}', but it doesn't",
+            migration_name
+        ),
+    }
+}
 
 /// Assert that a plan contains a specific migration
 pub fn assert_plan_contains_migration(plan: &PlanResult, migration_name: &str) {

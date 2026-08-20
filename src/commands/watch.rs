@@ -316,15 +316,15 @@ async fn process_db_changes(config: &WatchConfig, _paths: Vec<PathBuf>) -> Vec<O
                 for change in &plan_result.changes {
                     match change {
                         crate::commands::plan::ChangeOperation::CreateObject { object, .. } => {
-                            println!("  + {:?} {}", object.object_type, object.qualified_name.name);
+                            println!("  + {:?} {} [{:?}]", object.object_type, object.qualified_name.name, change.severity());
                             changed_objects.push(ObjectRef::from(object));
                         }
                         crate::commands::plan::ChangeOperation::UpdateObject { object, .. } => {
-                            println!("  ~ {:?} {}", object.object_type, object.qualified_name.name);
+                            println!("  ~ {:?} {} [{:?}]", object.object_type, object.qualified_name.name, change.severity());
                             changed_objects.push(ObjectRef::from(object));
                         }
                         crate::commands::plan::ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                            println!("  - {:?} {}", object_type, object_name);
+                            println!("  - {:?} {} [{:?}]", object_type, object_name, change.severity());
                             // Deleted objects don't need test runs
                         }
                         // ApplyMigration won't appear since we pass None for migrations_dir

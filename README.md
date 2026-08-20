@@ -66,6 +66,13 @@ Execution order:
 
 The plan command is read-only and can be run safely at any time.
 
+Each planned change is tagged with a client-compatibility severity —
+`[safe]`, `[transient]`, or `[breaking]` — and the plan reports the worst
+case as a `Client compatibility` rollup (also in `--format json` as
+`severity` / `severity_counts`). This answers whether applying the plan
+breaks clients compiled against the current schema. See
+[docs/severity.md](docs/severity.md) for the full classification.
+
 ### The `apply` Command
 
 Executes the changes identified by plan:

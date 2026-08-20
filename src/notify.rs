@@ -1,4 +1,5 @@
 use serde::{Serialize, Deserialize};
+use crate::analysis::{Severity, SeverityCounts};
 use crate::sql::{SqlObject, ObjectType};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +77,117 @@ pub async fn emit_object_loaded_notification<C: tokio_postgres::GenericClient>(
     client.execute(
         "SELECT pg_notify($1, $2)",
         &[&"pgmg.object_loaded", &payload],
+    ).await?;
+
+    Ok(())
+}
+
+/// Channel that pgmg notifies when an apply run with pending changes is about
+/// to start executing them.
+///
+/// Clients should `LISTEN "pgmg.apply_initiated"` to learn — before the schema
+/// changes — what the apply is about to do to them: the payload carries the
+/// plan's overall client-compatibility severity (see docs/severity.md), so a
+/// listener can e.g. pause traffic or drain work ahead of a `breaking` apply.
+/// Fires in every environment, not just development mode.
+pub const APPLY_INITIATED_CHANNEL: &str = "pgmg.apply_initiated";
+
+/// Payload of the `pgmg.apply_initiated` NOTIFY: the plan's client-compatibility
+/// rollup and the number of operations about to be applied.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApplyInitiatedNotification {
+    /// Worst client-compatibility impact across the planned changes:
+    /// "safe", "transient", or "breaking".
+    pub severity: Severity,
+    pub severity_counts: SeverityCounts,
+    /// Total number of planned operations (migrations included).
+    pub changes: usize,
+}
+
+impl ApplyInitiatedNotification {
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// Emit a NOTIFY on the `pgmg.apply_initiated` channel announcing the apply
+/// that is about to run and its overall severity.
+///
+/// Must be issued OUTSIDE the apply transaction (auto-commit): NOTIFY inside a
+/// transaction is only delivered at commit, which would defeat announcing the
+/// apply before its changes land.
+pub async fn emit_apply_initiated_notification<C: tokio_postgres::GenericClient>(
+    client: &C,
+    notification: &ApplyInitiatedNotification,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = notification.to_json()?;
+
+    // PostgreSQL NOTIFY caps the payload at 8000 bytes; this summary is tiny,
+    // but guard anyway to surface a clear error rather than a Postgres failure.
+    if payload.len() > 7900 {
+        return Err("Notification payload too large".into());
+    }
+
+    client.execute(
+        "SELECT pg_notify($1, $2)",
+        &[&APPLY_INITIATED_CHANNEL, &payload],
+    ).await?;
+
+    Ok(())
+}
+
+/// Channel that pgmg notifies when an apply run that announced
+/// `pgmg.apply_initiated` fails before its changes are committed.
+///
+/// Clients should `LISTEN "pgmg.apply_failed"` to pair with the initiated
+/// event: every `apply_initiated` is followed by exactly one of
+/// `apply_succeeded` or `apply_failed`, so a listener that paused work for a
+/// breaking apply knows when to resume. In transactional mode a failed apply
+/// rolled back completely; in auto-commit mode (fresh builds, test mode) the
+/// schema may have partially changed. Fires in every environment.
+pub const APPLY_FAILED_CHANNEL: &str = "pgmg.apply_failed";
+
+/// Payload of the `pgmg.apply_failed` NOTIFY: what the failed apply was
+/// attempting (mirroring `ApplyInitiatedNotification` so the two correlate)
+/// plus the error that stopped it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApplyFailedNotification {
+    /// Worst client-compatibility impact across the planned changes:
+    /// "safe", "transient", or "breaking".
+    pub severity: Severity,
+    pub severity_counts: SeverityCounts,
+    /// Total number of planned operations (migrations included).
+    pub changes: usize,
+    /// The error that aborted the apply, truncated to fit the NOTIFY payload.
+    pub error: String,
+}
+
+impl ApplyFailedNotification {
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+/// Emit a NOTIFY on the `pgmg.apply_failed` channel reporting that the apply
+/// announced on `pgmg.apply_initiated` did not land.
+///
+/// Must be issued OUTSIDE the failed transaction (auto-commit): a NOTIFY
+/// issued inside it would be discarded by the rollback.
+pub async fn emit_apply_failed_notification<C: tokio_postgres::GenericClient>(
+    client: &C,
+    notification: &ApplyFailedNotification,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = notification.to_json()?;
+
+    // PostgreSQL NOTIFY caps the payload at 8000 bytes. The error string is
+    // truncated at construction, but guard anyway to surface a clear error.
+    if payload.len() > 7900 {
+        return Err("Notification payload too large".into());
+    }
+
+    client.execute(
+        "SELECT pg_notify($1, $2)",
+        &[&APPLY_FAILED_CHANNEL, &payload],
     ).await?;
 
     Ok(())
@@ -262,5 +374,50 @@ mod tests {
     #[test]
     fn test_apply_succeeded_channel_name() {
         assert_eq!(APPLY_SUCCEEDED_CHANNEL, "pgmg.apply_succeeded");
+    }
+
+    #[test]
+    fn test_apply_initiated_channel_name() {
+        assert_eq!(APPLY_INITIATED_CHANNEL, "pgmg.apply_initiated");
+    }
+
+    #[test]
+    fn test_apply_failed_channel_name() {
+        assert_eq!(APPLY_FAILED_CHANNEL, "pgmg.apply_failed");
+    }
+
+    #[test]
+    fn test_apply_failed_to_json() {
+        let notification = ApplyFailedNotification {
+            severity: Severity::Breaking,
+            severity_counts: SeverityCounts { safe: 0, transient: 0, breaking: 1 },
+            changes: 1,
+            error: "Migration failed".to_string(),
+        };
+
+        let json = notification.to_json().unwrap();
+        assert!(json.contains(r#""severity":"breaking""#));
+        assert!(json.contains(r#""changes":1"#));
+        assert!(json.contains(r#""error":"Migration failed""#));
+
+        let roundtrip: ApplyFailedNotification = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, notification);
+    }
+
+    #[test]
+    fn test_apply_initiated_to_json() {
+        let notification = ApplyInitiatedNotification {
+            severity: Severity::Breaking,
+            severity_counts: SeverityCounts { safe: 2, transient: 1, breaking: 1 },
+            changes: 4,
+        };
+
+        let json = notification.to_json().unwrap();
+        assert!(json.contains(r#""severity":"breaking""#));
+        assert!(json.contains(r#""severity_counts":{"safe":2,"transient":1,"breaking":1}"#));
+        assert!(json.contains(r#""changes":4"#));
+
+        let roundtrip: ApplyInitiatedNotification = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip, notification);
     }
 }

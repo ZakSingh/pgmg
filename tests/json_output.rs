@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 use pgmg::commands::{ApplyResult, ChangeOperation, PlanResult};
-use pgmg::{Dependencies, DependencyGraph, ObjectType, QualifiedIdent, SqlObject};
+use pgmg::{Dependencies, DependencyGraph, ObjectType, QualifiedIdent, Severity, SeverityCounts, SqlObject};
 use serde_json::Value;
 
 /// Build a PlanResult with dependencies inserted in the given order, so two
@@ -32,20 +32,25 @@ fn sample_plan_result(relation_order: &[&str]) -> PlanResult {
             ChangeOperation::CreateObject {
                 object,
                 reason: "New object".to_string(),
+                severity: Severity::Safe,
             },
             ChangeOperation::DeleteObject {
                 object_type: ObjectType::View,
                 object_name: "public.old_view".to_string(),
                 reason: "Removed from source".to_string(),
+                severity: Severity::Breaking,
             },
             ChangeOperation::ApplyMigration {
                 name: "0002_add.sql".to_string(),
                 content: "CREATE TABLE t (id int);".to_string(),
+                severity: Severity::Safe,
             },
         ],
         new_migrations: vec!["0002_add.sql".to_string()],
         dependency_graph: Some(DependencyGraph::new()),
         file_objects: vec![],
+        severity: Severity::Breaking,
+        severity_counts: SeverityCounts { safe: 2, transient: 0, breaking: 1 },
     }
 }
 
@@ -62,6 +67,16 @@ fn plan_result_json_shape() {
     assert_eq!(v["changes"][1]["object_name"], "public.old_view");
     assert_eq!(v["changes"][2]["type"], "apply_migration");
     assert_eq!(v["changes"][2]["name"], "0002_add.sql");
+
+    // Every change carries a snake_case severity, and the plan carries the
+    // rollup plus per-level counts
+    assert_eq!(v["changes"][0]["severity"], "safe");
+    assert_eq!(v["changes"][1]["severity"], "breaking");
+    assert_eq!(v["changes"][2]["severity"], "safe");
+    assert_eq!(v["severity"], "breaking");
+    assert_eq!(v["severity_counts"]["safe"], 2);
+    assert_eq!(v["severity_counts"]["transient"], 0);
+    assert_eq!(v["severity_counts"]["breaking"], 1);
 
     // SQL bodies are omitted from JSON output
     assert!(v["changes"][0]["object"].get("ddl_statement").is_none());

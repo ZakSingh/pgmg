@@ -4,6 +4,7 @@ pub mod scanner;
 pub mod tls;
 pub mod locks;
 pub mod test_utils;
+pub mod introspect;
 
 pub use state::{StateManager, MigrationRecord, ObjectRecord};
 pub use connection::{DatabaseConfig, connect_to_database, connect_with_url, ManagedConnection};
