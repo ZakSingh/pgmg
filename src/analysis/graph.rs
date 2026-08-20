@@ -90,10 +90,14 @@ impl DependencyGraph {
             
             // Add edges for function dependencies
             for dep in &filtered_deps.functions {
-                // Function dependencies can match both functions and procedures
-                if let Some(dep_obj) = objects.iter().find(|o| 
-                    &o.qualified_name == dep && 
-                    matches!(o.object_type, ObjectType::Function | ObjectType::Procedure)
+                // Function dependencies can match functions and procedures, and
+                // also operators: operator comments record their parent operator
+                // in `functions` (Dependencies has no operators field). Operator
+                // names are pure symbols, so they cannot collide with function
+                // identifiers.
+                if let Some(dep_obj) = objects.iter().find(|o|
+                    &o.qualified_name == dep &&
+                    matches!(o.object_type, ObjectType::Function | ObjectType::Procedure | ObjectType::Operator)
                 ) {
                     let dep_ref = ObjectRef::from(dep_obj);
 
@@ -109,6 +113,27 @@ impl DependencyGraph {
                 }
             }
             
+            // Comments on triggers name their parent as `trigger:NAME:TABLE` but
+            // record only the trigger's TABLE in `relations` (Dependencies has no
+            // trigger bucket). Tie the comment to the trigger itself so it is
+            // created after — and dropped before — its parent.
+            if obj.object_type == ObjectType::Comment {
+                if let Some(rest) = obj.qualified_name.name.strip_prefix("trigger:") {
+                    if let Some((trigger_name, table)) = rest.split_once(':') {
+                        if let Some(dep_obj) = objects.iter().find(|o|
+                            o.object_type == ObjectType::Trigger &&
+                            o.qualified_name.name == trigger_name &&
+                            o.trigger_table.as_ref()
+                                .map(|t| crate::sql::format_qualified_name(t) == table)
+                                .unwrap_or(false)
+                        ) {
+                            let dep_ref = ObjectRef::from(dep_obj);
+                            graph.add_edge(dep_ref, obj_ref.clone(), DependencyType::Hard)?;
+                        }
+                    }
+                }
+            }
+
             // Add edges for type dependencies
             for dep in &filtered_deps.types {
                 // Type dependencies can be satisfied by types, domains, views, materialized views, or tables
