@@ -148,9 +148,10 @@ async fn test_function_parameter_type_change_cleanup() -> Result<(), Box<dyn std
     ).await?;
     assert_eq!(count, 1, "Should have exactly one calculate_tax function");
     
-    // Verify the function works with numeric input
+    // Verify the function works with numeric input (cast: tokio-postgres
+    // cannot read NUMERIC into f64 directly)
     let result = env.query_scalar::<f64>(
-        "SELECT calculate_tax(123.45)"
+        "SELECT calculate_tax(123.45)::float8"
     ).await?;
     assert!((result - 9.876).abs() < 0.001);
     

@@ -40,7 +40,7 @@ async fn test_plan_with_existing_migrations() -> Result<(), Box<dyn std::error::
     // Apply first migration manually
     env.execute_sql(fixtures::migrations::INITIAL_SCHEMA).await?;
     env.execute_sql(
-        "INSERT INTO pgmg_migrations (name) VALUES ('001_initial_schema')"
+        "INSERT INTO pgmg.pgmg_migrations (name) VALUES ('001_initial_schema')"
     ).await?;
     
     // Create migration files
@@ -113,7 +113,7 @@ async fn test_plan_detects_modified_objects() -> Result<(), Box<dyn std::error::
     
     // Track the view in pgmg_state with its hash
     env.execute_sql(indoc! {r#"
-        INSERT INTO pgmg_state (object_type, object_name, ddl_hash)
+        INSERT INTO pgmg.pgmg_state (object_type, object_name, ddl_hash)
         VALUES ('view', 'user_stats', 'old_hash_value');
     "#}).await?;
     
@@ -149,7 +149,7 @@ async fn test_plan_detects_deleted_objects() -> Result<(), Box<dyn std::error::E
     
     // Track objects in pgmg_state
     env.execute_sql(indoc! {r#"
-        INSERT INTO pgmg_state (object_type, object_name, ddl_hash)
+        INSERT INTO pgmg.pgmg_state (object_type, object_name, ddl_hash)
         VALUES 
             ('view', 'user_stats', 'some_hash'),
             ('view', 'deleted_view', 'another_hash');
@@ -229,7 +229,7 @@ async fn test_plan_with_no_changes() -> Result<(), Box<dyn std::error::Error>> {
         .expect("user_stats view should be found");
     
     env.execute_sql(&format!(
-        "INSERT INTO pgmg_state (object_type, object_name, ddl_hash) VALUES ('view', 'user_stats', '{}')",
+        "INSERT INTO pgmg.pgmg_state (object_type, object_name, ddl_hash) VALUES ('view', 'user_stats', '{}')",
         user_stats_obj.ddl_hash
     )).await?;
     
@@ -293,14 +293,14 @@ async fn test_plan_with_mixed_changes() -> Result<(), Box<dyn std::error::Error>
     "#}).await?;
     
     env.execute_sql(indoc! {r#"
-        INSERT INTO pgmg_state (object_type, object_name, ddl_hash)
+        INSERT INTO pgmg.pgmg_state (object_type, object_name, ddl_hash)
         VALUES 
             ('view', 'old_view', 'old_view_hash'),
             ('view', 'deleted_view', 'deleted_hash');
     "#}).await?;
     
     env.execute_sql(
-        "INSERT INTO pgmg_migrations (name) VALUES ('001_initial')"
+        "INSERT INTO pgmg.pgmg_migrations (name) VALUES ('001_initial')"
     ).await?;
     
     // Create files for mixed changes

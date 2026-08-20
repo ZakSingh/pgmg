@@ -196,8 +196,10 @@ async fn test_operator_deletion() -> Result<(), Box<dyn std::error::Error>> {
         LANGUAGE sql;
     "#}).await?;
     
+    // Note: `++` is not a legal operator name (a name ending in + or - must
+    // contain one of ~ ! @ # % ^ & | ` ?), so use `+#+`.
     env.write_sql_file("op.sql", indoc! {r#"
-        CREATE OPERATOR ++ (
+        CREATE OPERATOR +#+ (
             LEFTARG = int,
             RIGHTARG = int,
             FUNCTION = my_func
@@ -221,7 +223,7 @@ async fn test_operator_deletion() -> Result<(), Box<dyn std::error::Error>> {
         env.connection_string.clone(),
         None,
     ).await?;
-    assert_plan_contains_delete(&plan, ObjectType::Operator, "++");
+    assert_plan_contains_delete(&plan, ObjectType::Operator, "+#+");
     
     // Apply the deletion
     execute_apply(
@@ -235,7 +237,7 @@ async fn test_operator_deletion() -> Result<(), Box<dyn std::error::Error>> {
     let exists: bool = env.query_scalar(
         "SELECT EXISTS (
             SELECT 1 FROM pg_operator
-            WHERE oprname = '++'
+            WHERE oprname = '+#+'
         )"
     ).await?;
     assert!(!exists);
@@ -275,7 +277,8 @@ async fn test_operator_comment() -> Result<(), Box<dyn std::error::Error>> {
     let comment: Option<String> = env.query_scalar(
         "SELECT obj_description(o.oid, 'pg_operator')
          FROM pg_operator o
-         WHERE o.oprname = '<#>'"
+         WHERE o.oprname = '<#>'
+         AND o.oprleft = 'point'::regtype AND o.oprright = 'point'::regtype"
     ).await?;
     assert_eq!(comment, Some("Squared distance between two points".to_string()));
     
@@ -301,7 +304,8 @@ async fn test_operator_comment() -> Result<(), Box<dyn std::error::Error>> {
     let comment: Option<String> = env.query_scalar(
         "SELECT obj_description(o.oid, 'pg_operator')
          FROM pg_operator o
-         WHERE o.oprname = '<#>'"
+         WHERE o.oprname = '<#>'
+         AND o.oprleft = 'point'::regtype AND o.oprright = 'point'::regtype"
     ).await?;
     assert_eq!(comment, Some("Euclidean distance squared".to_string()));
     
@@ -345,12 +349,13 @@ async fn test_prefix_operator() -> Result<(), Box<dyn std::error::Error>> {
         &PgmgConfig::default(),
     ).await?;
     
-    // Test the operator - verify it exists
+    // Test the operator - verify it exists. A prefix operator's oprleft is
+    // InvalidOid (0), not NULL — pg_operator's oid columns are never NULL.
     let exists: bool = env.query_scalar(
         "SELECT EXISTS (
             SELECT 1 FROM pg_operator o
-            WHERE o.oprname = '!' 
-            AND o.oprleft IS NULL 
+            WHERE o.oprname = '!'
+            AND o.oprleft = 0
             AND o.oprright = 'bigint'::regtype
         )"
     ).await?;

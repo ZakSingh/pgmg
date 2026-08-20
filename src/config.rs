@@ -272,15 +272,23 @@ mod tests {
     
     #[test]
     fn test_config_load_nonexistent_file() {
+        let _cwd = crate::error::lock_cwd_for_test();
         let temp_dir = tempdir().unwrap();
+        let original_dir = env::current_dir().unwrap();
         env::set_current_dir(temp_dir.path()).unwrap();
-        
+
         let result = PgmgConfig::load_from_file().unwrap();
+
+        // Restore before temp_dir is deleted on drop — leaving the process in
+        // a deleted cwd breaks every later test that touches the cwd.
+        let _ = env::set_current_dir(original_dir);
+
         assert!(result.is_none());
     }
     
     #[test]
     fn test_config_load_from_file() {
+        let _cwd = crate::error::lock_cwd_for_test();
         let temp_dir = tempdir().unwrap();
         let config_path = temp_dir.path().join("pgmg.toml");
         
@@ -309,6 +317,7 @@ code_dir = "test_sql"
     
     #[test]
     fn test_write_sample_config() {
+        let _cwd = crate::error::lock_cwd_for_test();
         let temp_dir = tempdir().unwrap();
         let original_dir = env::current_dir().unwrap();
         env::set_current_dir(temp_dir.path()).unwrap();

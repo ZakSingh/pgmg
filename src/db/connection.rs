@@ -354,6 +354,9 @@ mod tests {
         }
     }
     
+    // TlsMode::from_str("require") errors on builds without the tls feature,
+    // so the whole test is gated, not just its mode assertions.
+    #[cfg(feature = "tls")]
     #[test]
     fn test_merge_tls_config() {
         let mut config = DatabaseConfig {

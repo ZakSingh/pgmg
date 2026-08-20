@@ -1422,10 +1422,11 @@ mod tests {
     fn test_nested_casts() {
         let sql = "select (price::decimal)::api.money_type from products";
         let result = analyze_statement(sql).unwrap();
-        
-        let decimal_type = QualifiedIdent::from_name("decimal".to_string());
+
+        // Built-in type aliases are canonicalized by the parser: decimal -> pg_catalog.numeric
+        let decimal_type = QualifiedIdent::new(Some("pg_catalog".to_string()), "numeric".to_string());
         let money_type = QualifiedIdent::new(Some("api".to_string()), "money_type".to_string());
-        
+
         assert!(result.types.contains(&decimal_type));
         assert!(result.types.contains(&money_type));
     }
@@ -1444,13 +1445,13 @@ mod tests {
         let sql = "select id::integer, name::text, created::timestamp from users";
         let result = analyze_statement(sql).unwrap();
         
-        // These are built-in types and should not be included
-        let integer_type = QualifiedIdent::from_name("integer".to_string());
+        // analyze_statement does not filter built-ins — that happens later via
+        // filter_builtins during graph construction. It does canonicalize
+        // aliases (integer -> pg_catalog.int4); bare `text` stays unqualified.
+        let integer_type = QualifiedIdent::new(Some("pg_catalog".to_string()), "int4".to_string());
         let text_type = QualifiedIdent::from_name("text".to_string());
-        let timestamp_type = QualifiedIdent::from_name("timestamp".to_string());
-        
-        // Note: The current implementation doesn't filter built-ins yet
-        // This test documents the current behavior
+        let timestamp_type = QualifiedIdent::new(Some("pg_catalog".to_string()), "timestamp".to_string());
+
         assert!(result.types.contains(&integer_type));
         assert!(result.types.contains(&text_type));
         assert!(result.types.contains(&timestamp_type));
@@ -1719,7 +1720,7 @@ mod tests {
     #[test]
     fn test_complex_expression_with_multiple_casts() {
         let sql = r#"
-        select 
+        select (
             coalesce(
                 sum(convert_currency(id.price, p_currency_code) * cl.quantity),
                 (0, p_currency_code)::currency
@@ -1731,9 +1732,9 @@ mod tests {
         where cl.account_id = p_account_id
         "#;
         let result = analyze_statement(sql).unwrap();
-        
+
         let currency_type = QualifiedIdent::from_name("currency".to_string());
-        let int_type = QualifiedIdent::from_name("int".to_string());
+        let int_type = QualifiedIdent::new(Some("pg_catalog".to_string()), "int4".to_string());
         let cart_summary_type = QualifiedIdent::new(Some("api".to_string()), "cart_summary".to_string());
         
         assert!(result.types.contains(&currency_type));

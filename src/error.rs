@@ -565,13 +565,27 @@ impl Drop for DirectoryGuard {
     }
 }
 
+/// Serializes tests that read or mutate the process-global current directory.
+/// cwd is shared by every thread, so such tests race under the default
+/// parallel test runner; each one must hold this lock for its full body.
+#[cfg(test)]
+pub(crate) static CWD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire [`CWD_TEST_LOCK`], recovering from poisoning — a previous
+/// cwd-test's panic must not fail unrelated tests.
+#[cfg(test)]
+pub(crate) fn lock_cwd_for_test() -> std::sync::MutexGuard<'static, ()> {
+    CWD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod directory_guard_tests {
     use super::*;
     use tempfile::tempdir;
-    
+
     #[test]
     fn test_directory_guard_restores_on_drop() {
+        let _cwd = lock_cwd_for_test();
         let original = env::current_dir().unwrap().canonicalize().unwrap();
         let temp_dir = tempdir().unwrap();
         let temp_path = temp_dir.path().canonicalize().unwrap();
@@ -589,6 +603,7 @@ mod directory_guard_tests {
     
     #[test]
     fn test_directory_guard_manual_restore() {
+        let _cwd = lock_cwd_for_test();
         let original = env::current_dir().unwrap().canonicalize().unwrap();
         let temp_dir = tempdir().unwrap();
         let temp_path = temp_dir.path().canonicalize().unwrap();
@@ -605,6 +620,7 @@ mod directory_guard_tests {
     
     #[test]
     fn test_directory_guard_original_dir() {
+        let _cwd = lock_cwd_for_test();
         let original = env::current_dir().unwrap();
         let temp_dir = tempdir().unwrap();
         let temp_path = temp_dir.path().to_path_buf();
