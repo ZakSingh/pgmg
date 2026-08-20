@@ -216,9 +216,28 @@ pub async fn execute_plan(
                 stored_deps_map.insert((obj_type, key_name), deps);
             }
 
-            // Build the "file-only" graph first - this is used for VALIDATION
-            // (checking if the new state after apply will be consistent)
-            let file_graph = DependencyGraph::build_from_objects(&file_objects, &builtin_catalog)?;
+            // Reconstruct minimal SqlObjects for deleted objects (empty DDL,
+            // stored dependencies). Needed as graph nodes in both graphs below.
+            let deleted_sql_objects: Vec<SqlObject> = deleted_object_deps.into_iter()
+                .map(|(obj_type, obj_name, obj_trigger_table, deps)| {
+                    SqlObject::new(
+                        obj_type,
+                        obj_name,
+                        String::new(), // Empty DDL for deleted objects
+                        deps,
+                        None, // No file path for deleted objects
+                    ).with_trigger_table(obj_trigger_table)
+                })
+                .collect();
+
+            // Build the VALIDATION graph: file objects with their NEW parsed
+            // dependencies, plus the deleted objects as nodes. The deleted
+            // objects must be present — dependents_of() answers "no dependents"
+            // for an object that isn't a node, which would make the
+            // deletion-safety check below pass vacuously.
+            let mut validation_objects = file_objects.clone();
+            validation_objects.extend(deleted_sql_objects.iter().cloned());
+            let file_graph = DependencyGraph::build_from_objects(&validation_objects, &builtin_catalog)?;
 
             // Now build the "merged" graph for PRE-DROP ORDERING
             // This includes stored dependencies so we know what the database currently has
@@ -237,17 +256,7 @@ pub async fn execute_plan(
                 }
             }
 
-            for (obj_type, obj_name, obj_trigger_table, deps) in deleted_object_deps {
-                // Create a minimal SqlObject for deleted objects
-                let deleted_obj = SqlObject::new(
-                    obj_type,
-                    obj_name,
-                    String::new(), // Empty DDL for deleted objects
-                    deps,
-                    None, // No file path for deleted objects
-                ).with_trigger_table(obj_trigger_table);
-                all_objects_for_ordering.push(deleted_obj);
-            }
+            all_objects_for_ordering.extend(deleted_sql_objects);
 
             // Build ordering graph from merged dependencies
             let graph = DependencyGraph::build_from_objects(&all_objects_for_ordering, &builtin_catalog)?;
