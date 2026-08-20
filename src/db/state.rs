@@ -244,19 +244,9 @@ impl<'a> StateManager<'a> {
         let mut objects = Vec::new();
         for row in rows {
             let object_type_str: String = row.get(0);
-            let object_type = match object_type_str.as_str() {
-                "table" => ObjectType::Table,
-                "view" => ObjectType::View,
-                "materialized_view" => ObjectType::MaterializedView,
-                "function" => ObjectType::Function,
-                "procedure" => ObjectType::Procedure,
-                "type" => ObjectType::Type,
-                "domain" => ObjectType::Domain,
-                "index" => ObjectType::Index,
-                "trigger" => ObjectType::Trigger,
-                "comment" => ObjectType::Comment,
-                "cron_job" => ObjectType::CronJob,
-                _ => continue, // Skip unknown types
+            let object_type = match self.string_to_object_type(&object_type_str) {
+                Some(object_type) => object_type,
+                None => continue, // Skip unknown types
             };
 
             let object_name_str: String = row.get(1);
