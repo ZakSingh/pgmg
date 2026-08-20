@@ -856,6 +856,16 @@ async fn apply_drop_for_update<C: GenericClient>(
     
     // Just drop the object - creation will happen in a separate phase
     let drop_statement = match object.object_type {
+        ObjectType::Operator => {
+            // DROP OPERATOR requires the argument types; look up the live
+            // signature(s) from pg_operator like the delete path does.
+            let existing_signatures = get_existing_function_signatures(client, &object.object_type, &object.qualified_name).await?;
+            for signature in existing_signatures {
+                let drop_statement = format!("DROP OPERATOR IF EXISTS {}", signature);
+                client.execute(&drop_statement, &[]).await?;
+            }
+            return Ok(());
+        }
         ObjectType::Trigger => {
             // The table is part of the trigger's identity; re-parse the DDL only
             // if it's somehow missing (e.g. objects built outside the parser)

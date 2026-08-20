@@ -1089,11 +1089,20 @@ fn extract_operator_dependencies(define_stmt: &pg_query::protobuf::DefineStmt, d
         if let Some(pg_query::NodeEnum::DefElem(elem)) = &def_elem.node {
             match elem.defname.as_str() {
                 "procedure" | "function" => {
-                    // Extract the function/procedure dependency
+                    // Extract the function/procedure dependency. pg_query
+                    // produces ObjectWithArgs for `FUNCTION = f(text, text)`
+                    // but a bare TypeName for `FUNCTION = f`.
                     if let Some(arg) = &elem.arg {
-                        if let Some(pg_query::NodeEnum::ObjectWithArgs(func_with_args)) = &arg.node {
-                            let func_name = extract_name_from_node_list(&func_with_args.objname)?;
-                            dependencies.functions.insert(func_name);
+                        match &arg.node {
+                            Some(pg_query::NodeEnum::ObjectWithArgs(func_with_args)) => {
+                                let func_name = extract_name_from_node_list(&func_with_args.objname)?;
+                                dependencies.functions.insert(func_name);
+                            }
+                            Some(pg_query::NodeEnum::TypeName(type_name)) => {
+                                let func_name = extract_name_from_node_list(&type_name.names)?;
+                                dependencies.functions.insert(func_name);
+                            }
+                            _ => {}
                         }
                     }
                 }
