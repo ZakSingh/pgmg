@@ -12,7 +12,8 @@ enum CronOperation {
     Unschedule { job_name: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ObjectType {
     Table,
     View,
@@ -49,10 +50,11 @@ impl fmt::Display for ObjectType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SqlObject {
     pub object_type: ObjectType,
     pub qualified_name: QualifiedIdent,
+    #[serde(skip)]
     pub ddl_statement: String,
     pub dependencies: Dependencies,
     pub source_file: Option<PathBuf>,

@@ -1,6 +1,12 @@
 #[cfg(feature = "cli")]
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
 
 #[derive(Parser, Clone)]
 #[command(name = "pgmg")]
@@ -10,7 +16,11 @@ pub struct Cli {
     /// Increase verbosity level (can be used multiple times)
     #[arg(short, long, action = clap::ArgAction::Count)]
     pub verbose: Option<u8>,
-    
+
+    /// Output format for command results
+    #[arg(long, global = true, value_enum, default_value = "text")]
+    pub format: OutputFormat,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -237,6 +247,33 @@ mod tests {
             }
             _ => panic!("Expected Plan command"),
         }
+    }
+
+    #[test]
+    fn test_format_flag_after_subcommand() {
+        let args = vec!["pgmg", "plan", "--format", "json"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_format_flag_before_subcommand() {
+        let args = vec!["pgmg", "--format", "json", "apply"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.format, OutputFormat::Json);
+    }
+
+    #[test]
+    fn test_format_defaults_to_text() {
+        let args = vec!["pgmg", "plan"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert_eq!(cli.format, OutputFormat::Text);
+    }
+
+    #[test]
+    fn test_format_rejects_unknown_value() {
+        let args = vec!["pgmg", "plan", "--format", "yaml"];
+        assert!(Cli::try_parse_from(args).is_err());
     }
 
     #[test]

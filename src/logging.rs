@@ -8,7 +8,9 @@ use tracing_subscriber::{
 };
 
 /// Initialize the logging and error reporting infrastructure
-pub fn init(verbosity: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///
+/// `log_to_stderr` keeps stdout clean for machine-readable output (--format json).
+pub fn init(verbosity: u8, log_to_stderr: bool) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Install color-eyre panic and error handlers if available
     #[cfg(feature = "cli")]
     color_eyre::install()?;
@@ -26,10 +28,21 @@ pub fn init(verbosity: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync
         .unwrap_or_else(|_| EnvFilter::new(format!("pgmg={},tokio_postgres=warn,hyper=warn", log_level)));
     
     // Check if we're running in a terminal for color output
-    let is_terminal = std::io::stdout().is_terminal();
-    
+    let (writer, is_terminal) = if log_to_stderr {
+        (
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr),
+            std::io::stderr().is_terminal(),
+        )
+    } else {
+        (
+            tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stdout),
+            std::io::stdout().is_terminal(),
+        )
+    };
+
     // Set up the formatting layer
     let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(writer)
         .with_target(false)
         .with_thread_ids(false)
         .with_thread_names(false)

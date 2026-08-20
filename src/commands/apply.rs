@@ -15,7 +15,7 @@ use tokio_postgres::GenericClient;
 #[cfg(feature = "cli")]
 use owo_colors::OwoColorize;
 
-#[derive(Debug)]
+#[derive(Debug, Default, serde::Serialize)]
 pub struct ApplyResult {
     pub migrations_applied: Vec<String>,
     pub objects_created: Vec<String>,
@@ -55,12 +55,15 @@ pub async fn execute_apply_with_test_mode(
 /// ```no_run
 /// use pgmg::{PgmgConfig, apply_migrations};
 /// use tracing_subscriber;
-/// 
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// // Initialize tracing (you control the output format)
 /// tracing_subscriber::fmt::init();
-/// 
-/// let config = PgmgConfig::load_from_file()?;
+///
+/// let config = PgmgConfig::load_from_file()?.unwrap_or_default();
 /// let result = apply_migrations(&config).await?;
+/// # Ok(())
+/// # }
 /// ```
 pub async fn apply_migrations(
     config: &PgmgConfig,

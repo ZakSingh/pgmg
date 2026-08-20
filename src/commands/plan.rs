@@ -8,15 +8,35 @@ use crate::BuiltinCatalog;
 use owo_colors::OwoColorize;
 use tracing::{debug, info};
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct PlanResult {
     pub changes: Vec<ChangeOperation>,
     pub new_migrations: Vec<String>,
+    #[serde(serialize_with = "serialize_graph_summary")]
     pub dependency_graph: Option<DependencyGraph>,
     pub file_objects: Vec<SqlObject>,
 }
 
-#[derive(Debug, Clone)]
+/// The petgraph-backed graph can't derive Serialize; emit just the summary
+/// counts, which is all consumers of the plan output need.
+fn serialize_graph_summary<S: serde::Serializer>(
+    graph: &Option<DependencyGraph>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+    match graph {
+        None => s.serialize_none(),
+        Some(graph) => {
+            let mut st = s.serialize_struct("DependencyGraphSummary", 2)?;
+            st.serialize_field("node_count", &graph.node_count())?;
+            st.serialize_field("edge_count", &graph.edge_count())?;
+            st.end()
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChangeOperation {
     CreateObject {
         object: SqlObject,
@@ -35,6 +55,7 @@ pub enum ChangeOperation {
     },
     ApplyMigration {
         name: String,
+        #[serde(skip)]
         content: String,
     },
 }

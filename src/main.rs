@@ -1,7 +1,7 @@
 use tokio_postgres::NoTls;
 use pgmg::{analyze_statement, filter_builtins, BuiltinCatalog, DependencyGraph};
-use pgmg::cli::{Cli, Commands};
-use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, execute_watch, WatchConfig, execute_reset, print_reset_summary, execute_test, print_test_summary, execute_seed, print_seed_summary, execute_new, print_new_summary, execute_check, print_check_summary, execute_run};
+use pgmg::cli::{Cli, Commands, OutputFormat};
+use pgmg::commands::{execute_plan, print_plan_summary, execute_apply, print_apply_summary, ApplyResult, execute_watch, WatchConfig, execute_reset, print_reset_summary, execute_test, print_test_summary, execute_seed, print_seed_summary, execute_new, print_new_summary, execute_check, print_check_summary, execute_run};
 use pgmg::config::PgmgConfig;
 use pgmg::error::{PgmgError, Result};
 use pgmg::logging;
@@ -23,7 +23,8 @@ async fn main() -> color_eyre::Result<()> {
     // Initialize logging and error handling
     // Verbosity: 0 = warn, 1 = info, 2 = debug, 3+ = trace
     let verbosity = cli.verbose.unwrap_or(0);
-    if let Err(e) = logging::init(verbosity) {
+    // In JSON mode logs go to stderr so stdout stays a single JSON document
+    if let Err(e) = logging::init(verbosity, cli.format == OutputFormat::Json) {
         eprintln!("Failed to initialize logging: {}", e);
         std::process::exit(1);
     }
@@ -62,6 +63,18 @@ async fn run(cli: Cli) -> Result<()> {
         }
     };
 
+    let format = cli.format;
+    if format == OutputFormat::Json
+        && !matches!(
+            cli.command,
+            Commands::Plan { .. } | Commands::Status { .. } | Commands::Apply { .. } | Commands::Migrate { .. }
+        )
+    {
+        return Err(PgmgError::Configuration(
+            "--format json is currently only supported for plan, status, apply, and migrate".to_string()
+        ));
+    }
+
     match cli.command {
         Commands::Init => {
             logging::output::step("Generating sample configuration file...");
@@ -73,205 +86,31 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Plan { migrations_dir, code_dir, connection_string, output_graph } => {
-            logging::output::header("Planning Changes");
-            
-            // Merge CLI args with config file
-            let merged_config = PgmgConfig::merge_with_cli(
-                config_file,
-                migrations_dir,
-                code_dir,
-                connection_string,
-                output_graph,
-            );
-            
-            // Require connection string
-            let conn_str = merged_config.connection_string.clone()
-                .or_else(|| std::env::var("DATABASE_URL").ok())
-                .ok_or_else(|| PgmgError::Configuration(
-                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
-                ))?;
-            
-            // Validate connection string format
-            if !conn_str.starts_with("postgres://") && !conn_str.starts_with("postgresql://") {
-                return Err(PgmgError::InvalidConnectionString(conn_str));
-            }
-            
-            // Log configuration
-            debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
-            if let Some(ref dir) = merged_config.migrations_dir {
-                debug!("Migrations directory: {}", dir.display());
-            }
-            if let Some(ref dir) = merged_config.code_dir {
-                debug!("Code directory: {}", dir.display());
-            }
-            
-            // Execute plan with progress tracking
-            let start = std::time::Instant::now();
-            let plan_result = execute_plan(
-                merged_config.migrations_dir,
-                merged_config.code_dir,
-                conn_str,
-                merged_config.output_graph,
-            ).await?;
-            
-            let elapsed = start.elapsed();
-            info!("Planning completed in {}", logging::format_duration(elapsed));
-            
-            print_plan_summary(&plan_result);
-            Ok(())
+            run_plan_command(
+                "Planning Changes", "Planning", format, config_file,
+                migrations_dir, code_dir, connection_string, output_graph,
+            ).await
         }
-        
+
         Commands::Status { migrations_dir, code_dir, connection_string, output_graph } => {
-            logging::output::header("Checking Status");
-            
-            // Merge CLI args with config file
-            let merged_config = PgmgConfig::merge_with_cli(
-                config_file,
-                migrations_dir,
-                code_dir,
-                connection_string,
-                output_graph,
-            );
-            
-            // Require connection string
-            let conn_str = merged_config.connection_string.clone()
-                .or_else(|| std::env::var("DATABASE_URL").ok())
-                .ok_or_else(|| PgmgError::Configuration(
-                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
-                ))?;
-            
-            // Validate connection string format
-            if !conn_str.starts_with("postgres://") && !conn_str.starts_with("postgresql://") {
-                return Err(PgmgError::InvalidConnectionString(conn_str));
-            }
-            
-            // Log configuration
-            debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
-            if let Some(ref dir) = merged_config.migrations_dir {
-                debug!("Migrations directory: {}", dir.display());
-            }
-            if let Some(ref dir) = merged_config.code_dir {
-                debug!("Code directory: {}", dir.display());
-            }
-            
-            // Execute plan with progress tracking
-            let start = std::time::Instant::now();
-            let plan_result = execute_plan(
-                merged_config.migrations_dir,
-                merged_config.code_dir,
-                conn_str,
-                merged_config.output_graph,
-            ).await?;
-            
-            let elapsed = start.elapsed();
-            info!("Status check completed in {}", logging::format_duration(elapsed));
-            
-            print_plan_summary(&plan_result);
-            Ok(())
+            run_plan_command(
+                "Checking Status", "Status check", format, config_file,
+                migrations_dir, code_dir, connection_string, output_graph,
+            ).await
         }
         
         Commands::Apply { migrations_dir, code_dir, connection_string, dev } => {
-            logging::output::header("Applying Changes");
-            
-            // Merge CLI args with config file (no output_graph for apply)
-            let merged_config = PgmgConfig::merge_with_cli(
-                config_file,
-                migrations_dir,
-                code_dir,
-                connection_string,
-                None, // apply command doesn't use output_graph
-            ).with_dev_mode(dev);
-            
-            // Log configuration
-            if let Some(ref dir) = merged_config.migrations_dir {
-                debug!("Migrations directory: {}", dir.display());
-            }
-            if let Some(ref dir) = merged_config.code_dir {
-                debug!("Code directory: {}", dir.display());
-            }
-            if merged_config.development_mode.unwrap_or(false) {
-                info!("Development mode enabled - NOTIFY events will be emitted");
-            }
-            
-            // Require connection string
-            let conn_str = merged_config.connection_string.clone()
-                .or_else(|| std::env::var("DATABASE_URL").ok())
-                .ok_or_else(|| PgmgError::Configuration(
-                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
-                ))?;
-            
-            // Warn if no directories specified
-            if merged_config.migrations_dir.is_none() && merged_config.code_dir.is_none() {
-                warn!("No migrations or code directory specified - nothing to apply");
-                return Ok(());
-            }
-            
-            // Execute apply with progress tracking
-            let start = std::time::Instant::now();
-            let apply_result = execute_apply(
-                merged_config.migrations_dir.clone(),
-                merged_config.code_dir.clone(),
-                conn_str,
-                &merged_config,
-            ).await?;
-            
-            let elapsed = start.elapsed();
-            info!("Apply completed in {}", logging::format_duration(elapsed));
-            
-            print_apply_summary(&apply_result);
-            Ok(())
+            run_apply_command(
+                "Applying Changes", "Apply", "apply", format, config_file,
+                migrations_dir, code_dir, connection_string, dev,
+            ).await
         }
-        
+
         Commands::Migrate { migrations_dir, code_dir, connection_string, dev } => {
-            logging::output::header("Migrating Database");
-            
-            // Merge CLI args with config file (no output_graph for migrate)
-            let merged_config = PgmgConfig::merge_with_cli(
-                config_file,
-                migrations_dir,
-                code_dir,
-                connection_string,
-                None, // migrate command doesn't use output_graph
-            ).with_dev_mode(dev);
-            
-            // Log configuration
-            if let Some(ref dir) = merged_config.migrations_dir {
-                debug!("Migrations directory: {}", dir.display());
-            }
-            if let Some(ref dir) = merged_config.code_dir {
-                debug!("Code directory: {}", dir.display());
-            }
-            if merged_config.development_mode.unwrap_or(false) {
-                info!("Development mode enabled - NOTIFY events will be emitted");
-            }
-            
-            // Require connection string
-            let conn_str = merged_config.connection_string.clone()
-                .or_else(|| std::env::var("DATABASE_URL").ok())
-                .ok_or_else(|| PgmgError::Configuration(
-                    "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
-                ))?;
-            
-            // Warn if no directories specified
-            if merged_config.migrations_dir.is_none() && merged_config.code_dir.is_none() {
-                warn!("No migrations or code directory specified - nothing to migrate");
-                return Ok(());
-            }
-            
-            // Execute apply with progress tracking
-            let start = std::time::Instant::now();
-            let apply_result = execute_apply(
-                merged_config.migrations_dir.clone(),
-                merged_config.code_dir.clone(),
-                conn_str,
-                &merged_config,
-            ).await?;
-            
-            let elapsed = start.elapsed();
-            info!("Migration completed in {}", logging::format_duration(elapsed));
-            
-            print_apply_summary(&apply_result);
-            Ok(())
+            run_apply_command(
+                "Migrating Database", "Migration", "migrate", format, config_file,
+                migrations_dir, code_dir, connection_string, dev,
+            ).await
         }
         
         Commands::Watch { migrations_dir, code_dir, connection_string, debounce_ms, no_auto_apply } => {
@@ -546,10 +385,155 @@ async fn run(cli: Cli) -> Result<()> {
             // Execute the SQL file
             execute_run(file, conn_str, &run_config).await
                 .map_err(|e| PgmgError::Other(format!("Run failed: {}", e)))?;
-            
+
             Ok(())
         }
     }
+}
+
+/// Shared implementation of the `plan` and `status` commands.
+#[allow(clippy::too_many_arguments)]
+async fn run_plan_command(
+    header: &str,
+    done_label: &str,
+    format: OutputFormat,
+    config_file: Option<PgmgConfig>,
+    migrations_dir: Option<PathBuf>,
+    code_dir: Option<PathBuf>,
+    connection_string: Option<String>,
+    output_graph: Option<PathBuf>,
+) -> Result<()> {
+    if format == OutputFormat::Text {
+        logging::output::header(header);
+    }
+
+    // Merge CLI args with config file
+    let merged_config = PgmgConfig::merge_with_cli(
+        config_file,
+        migrations_dir,
+        code_dir,
+        connection_string,
+        output_graph,
+    );
+
+    // Require connection string
+    let conn_str = merged_config.connection_string.clone()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .ok_or_else(|| PgmgError::Configuration(
+            "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
+        ))?;
+
+    // Validate connection string format
+    if !conn_str.starts_with("postgres://") && !conn_str.starts_with("postgresql://") {
+        return Err(PgmgError::InvalidConnectionString(conn_str));
+    }
+
+    // Log configuration
+    debug!("Connection: {}", conn_str.replace(|c: char| c == ':' || c == '@', "*"));
+    if let Some(ref dir) = merged_config.migrations_dir {
+        debug!("Migrations directory: {}", dir.display());
+    }
+    if let Some(ref dir) = merged_config.code_dir {
+        debug!("Code directory: {}", dir.display());
+    }
+
+    // Execute plan with progress tracking
+    let start = std::time::Instant::now();
+    let plan_result = execute_plan(
+        merged_config.migrations_dir,
+        merged_config.code_dir,
+        conn_str,
+        merged_config.output_graph,
+    ).await?;
+
+    let elapsed = start.elapsed();
+    info!("{} completed in {}", done_label, logging::format_duration(elapsed));
+
+    match format {
+        OutputFormat::Text => print_plan_summary(&plan_result),
+        OutputFormat::Json => emit_json(&plan_result)?,
+    }
+    Ok(())
+}
+
+/// Shared implementation of the `apply` and `migrate` commands.
+#[allow(clippy::too_many_arguments)]
+async fn run_apply_command(
+    header: &str,
+    done_label: &str,
+    nothing_verb: &str,
+    format: OutputFormat,
+    config_file: Option<PgmgConfig>,
+    migrations_dir: Option<PathBuf>,
+    code_dir: Option<PathBuf>,
+    connection_string: Option<String>,
+    dev: bool,
+) -> Result<()> {
+    if format == OutputFormat::Text {
+        logging::output::header(header);
+    }
+
+    // Merge CLI args with config file (apply/migrate don't use output_graph)
+    let merged_config = PgmgConfig::merge_with_cli(
+        config_file,
+        migrations_dir,
+        code_dir,
+        connection_string,
+        None,
+    ).with_dev_mode(dev);
+
+    // Log configuration
+    if let Some(ref dir) = merged_config.migrations_dir {
+        debug!("Migrations directory: {}", dir.display());
+    }
+    if let Some(ref dir) = merged_config.code_dir {
+        debug!("Code directory: {}", dir.display());
+    }
+    if merged_config.development_mode.unwrap_or(false) {
+        info!("Development mode enabled - NOTIFY events will be emitted");
+    }
+
+    // Require connection string
+    let conn_str = merged_config.connection_string.clone()
+        .or_else(|| std::env::var("DATABASE_URL").ok())
+        .ok_or_else(|| PgmgError::Configuration(
+            "No connection string provided. Use --connection-string, DATABASE_URL env var, or pgmg.toml".to_string()
+        ))?;
+
+    // Warn if no directories specified
+    if merged_config.migrations_dir.is_none() && merged_config.code_dir.is_none() {
+        warn!("No migrations or code directory specified - nothing to {}", nothing_verb);
+        // Still emit one JSON document so stdout is never empty in JSON mode
+        if format == OutputFormat::Json {
+            emit_json(&ApplyResult::default())?;
+        }
+        return Ok(());
+    }
+
+    // Execute apply with progress tracking
+    let start = std::time::Instant::now();
+    let apply_result = execute_apply(
+        merged_config.migrations_dir.clone(),
+        merged_config.code_dir.clone(),
+        conn_str,
+        &merged_config,
+    ).await?;
+
+    let elapsed = start.elapsed();
+    info!("{} completed in {}", done_label, logging::format_duration(elapsed));
+
+    match format {
+        OutputFormat::Text => print_apply_summary(&apply_result),
+        OutputFormat::Json => emit_json(&apply_result)?,
+    }
+    Ok(())
+}
+
+fn emit_json<T: serde::Serialize>(value: &T) -> Result<()> {
+    let json = serde_json::to_string_pretty(value)
+        .map_err(|e| PgmgError::Configuration(format!("Failed to serialize output as JSON: {}", e)))?;
+    println!("{}", json);
+    Ok(())
 }
 
 // Keep the demo for testing, but adapt to new error handling

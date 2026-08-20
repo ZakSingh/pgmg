@@ -4,17 +4,30 @@ use serde_json::Value;
 
 use crate::builtin_catalog::BuiltinCatalog;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize)]
 pub struct QualifiedIdent {
     pub schema: Option<String>,
     pub name: String,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Dependencies {
+    #[serde(serialize_with = "serialize_sorted_idents")]
     pub relations: HashSet<QualifiedIdent>,
+    #[serde(serialize_with = "serialize_sorted_idents")]
     pub functions: HashSet<QualifiedIdent>,
+    #[serde(serialize_with = "serialize_sorted_idents")]
     pub types: HashSet<QualifiedIdent>,
+}
+
+/// HashSet iteration order is nondeterministic; sort so JSON output is stable.
+fn serialize_sorted_idents<S: serde::Serializer>(
+    set: &HashSet<QualifiedIdent>,
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    let mut idents: Vec<&QualifiedIdent> = set.iter().collect();
+    idents.sort();
+    serde::Serialize::serialize(&idents, s)
 }
 
 impl QualifiedIdent {

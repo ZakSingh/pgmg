@@ -361,7 +361,7 @@ where
     }
     
     if errors.is_empty() && num_functions_to_check > 0 {
-        println!("  {} All dependent functions remain compatible", "✓".green().bold());
+        eprintln!("  {} All dependent functions remain compatible", "✓".green().bold());
     }
     
     Ok(errors)
@@ -463,7 +463,7 @@ pub fn display_check_errors(errors: &[PlpgsqlCheckError]) {
         return;
     }
     
-    println!("\n{}", "=== PL/pgSQL Check Results ===".bold().yellow());
+    eprintln!("\n{}", "=== PL/pgSQL Check Results ===".bold().yellow());
     
     // Sort errors by level - warnings first, then errors. plpgsql_check emits
     // variants like "warning extra", so match on prefix.
@@ -501,7 +501,7 @@ pub fn display_check_errors(errors: &[PlpgsqlCheckError]) {
             _ => error.function_name.clone(),
         };
         
-        println!("\n{} {} in {}", 
+        eprintln!("\n{} {} in {}",
             level_colored,
             format!("[{}]", error.check_result.sqlstate.as_deref().unwrap_or("00000")).dimmed(),
             location.cyan()
@@ -509,22 +509,22 @@ pub fn display_check_errors(errors: &[PlpgsqlCheckError]) {
         
         // Display the main message
         if let Some(message) = &error.check_result.message {
-            println!("  {}", message);
+            eprintln!("  {}", message);
         }
         
         // Display detail if available
         if let Some(detail) = &error.check_result.detail {
-            println!("  {}: {}", "Detail".dimmed(), detail);
+            eprintln!("  {}: {}", "Detail".dimmed(), detail);
         }
         
         // Display hint if available
         if let Some(hint) = &error.check_result.hint {
-            println!("  {}: {}", "Hint".green().dimmed(), hint);
+            eprintln!("  {}: {}", "Hint".green().dimmed(), hint);
         }
         
         // Display context if available
         if let Some(context) = &error.check_result.context {
-            println!("  {}: {}", "Context".dimmed(), context);
+            eprintln!("  {}: {}", "Context".dimmed(), context);
         }
     }
     
@@ -537,17 +537,17 @@ pub fn display_check_errors(errors: &[PlpgsqlCheckError]) {
         .count();
     
     // Display summary
-    print!("\n{} ", sorted_errors.len().to_string().yellow().bold());
+    eprint!("\n{} ", sorted_errors.len().to_string().yellow().bold());
     if warnings > 0 && errors_count > 0 {
-        print!("issues ({} warnings, {} errors) ", warnings, errors_count);
+        eprint!("issues ({} warnings, {} errors) ", warnings, errors_count);
     } else if warnings > 0 {
-        print!("warning{} ", if warnings == 1 { "" } else { "s" });
+        eprint!("warning{} ", if warnings == 1 { "" } else { "s" });
     } else if errors_count > 0 {
-        print!("error{} ", if errors_count == 1 { "" } else { "s" });
+        eprint!("error{} ", if errors_count == 1 { "" } else { "s" });
     } else {
-        print!("issue{} ", if sorted_errors.len() == 1 { "" } else { "s" });
+        eprint!("issue{} ", if sorted_errors.len() == 1 { "" } else { "s" });
     }
-    println!("found by plpgsql_check");
+    eprintln!("found by plpgsql_check");
 }
 
 #[cfg(test)]
