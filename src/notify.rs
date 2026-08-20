@@ -203,8 +203,16 @@ pub const APPLY_SUCCEEDED_CHANNEL: &str = "pgmg.apply_succeeded";
 
 /// Summary of what an apply run changed. Sent as the payload of the
 /// `pgmg.apply_succeeded` NOTIFY so clients can log/inspect the change.
+///
+/// Carries the plan's severity rollup (mirroring `ApplyInitiatedNotification`)
+/// so a listener that missed the initiated event — NOTIFY is not queued for
+/// disconnected sessions — can still tell that a breaking apply just committed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApplySucceededNotification {
+    /// Worst client-compatibility impact across the applied changes:
+    /// "safe", "transient", or "breaking".
+    pub severity: Severity,
+    pub severity_counts: SeverityCounts,
     pub migrations_applied: usize,
     pub objects_created: usize,
     pub objects_updated: usize,
@@ -336,6 +344,8 @@ mod tests {
     #[test]
     fn test_apply_succeeded_is_empty() {
         let empty = ApplySucceededNotification {
+            severity: Severity::Safe,
+            severity_counts: SeverityCounts::default(),
             migrations_applied: 0,
             objects_created: 0,
             objects_updated: 0,
@@ -344,6 +354,8 @@ mod tests {
         assert!(empty.is_empty());
 
         let changed = ApplySucceededNotification {
+            severity: Severity::Safe,
+            severity_counts: SeverityCounts { safe: 1, transient: 0, breaking: 0 },
             migrations_applied: 0,
             objects_created: 1,
             objects_updated: 0,
@@ -355,6 +367,8 @@ mod tests {
     #[test]
     fn test_apply_succeeded_to_json() {
         let notification = ApplySucceededNotification {
+            severity: Severity::Breaking,
+            severity_counts: SeverityCounts { safe: 3, transient: 2, breaking: 1 },
             migrations_applied: 2,
             objects_created: 3,
             objects_updated: 1,
@@ -362,6 +376,8 @@ mod tests {
         };
 
         let json = notification.to_json().unwrap();
+        assert!(json.contains(r#""severity":"breaking""#));
+        assert!(json.contains(r#""severity_counts":{"safe":3,"transient":2,"breaking":1}"#));
         assert!(json.contains(r#""migrations_applied":2"#));
         assert!(json.contains(r#""objects_created":3"#));
         assert!(json.contains(r#""objects_updated":1"#));

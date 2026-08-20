@@ -360,7 +360,7 @@ async fn apply_planned_changes(
                            &pre_committed_enum_stmts).await?;
         // Emit the schema-changed NOTIFY inside the transaction so it is delivered
         // atomically on commit (and discarded if the commit below were to fail).
-        emit_apply_succeeded_if_changed(&transaction, apply_result).await;
+        emit_apply_succeeded_if_changed(&transaction, apply_result, plan_result).await;
         transaction.commit().await?;
         print_apply_success_message(apply_result, test_mode);
     } else {
@@ -368,7 +368,7 @@ async fn apply_planned_changes(
                            migrations_dir, code_dir, config, test_mode,
                            &pre_committed_enum_stmts).await?;
         // Auto-commit mode: changes are already committed, so emit immediately.
-        emit_apply_succeeded_if_changed(client, apply_result).await;
+        emit_apply_succeeded_if_changed(client, apply_result, plan_result).await;
         print_apply_success_message(apply_result, test_mode);
     }
 
@@ -430,8 +430,11 @@ async fn emit_apply_failed<C: GenericClient>(
 async fn emit_apply_succeeded_if_changed<C: GenericClient>(
     client: &C,
     apply_result: &ApplyResult,
+    plan_result: &PlanResult,
 ) {
     let notification = ApplySucceededNotification {
+        severity: plan_result.severity,
+        severity_counts: plan_result.severity_counts,
         migrations_applied: apply_result.migrations_applied.len(),
         objects_created: apply_result.objects_created.len(),
         objects_updated: apply_result.objects_updated.len(),

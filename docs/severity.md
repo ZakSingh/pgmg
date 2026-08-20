@@ -158,7 +158,13 @@ traffic or drain in-flight work when a `breaking` apply is starting):
 
 **`pgmg.apply_succeeded`** — sent inside the apply transaction, so it arrives
 only once the changes have committed. This is the signal to reset statement
-caches.
+caches. The payload carries the plan's severity rollup alongside the change
+counts, so a listener that missed `apply_initiated` (NOTIFY is not queued for
+disconnected sessions) can still tell that a `breaking` apply just committed:
+
+```json
+{ "severity": "breaking", "severity_counts": { "safe": 0, "transient": 1, "breaking": 1 }, "migrations_applied": 1, "objects_created": 0, "objects_updated": 2, "objects_deleted": 0 }
+```
 
 **`pgmg.apply_failed`** — sent when an announced apply errors before
 committing. The payload mirrors `apply_initiated` (so the two correlate) plus
