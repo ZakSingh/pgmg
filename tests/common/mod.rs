@@ -352,21 +352,31 @@ pub async fn cleanup_all() {
     cleanup_shared_container().await;
 }
 
+/// atexit callback: runs on the main thread after all tests finish, when the
+/// per-test tokio runtimes are gone, so the blocking lock is safe. Dropping
+/// the Container issues a synchronous `docker rm -f`.
+extern "C" fn cleanup_container_at_exit() {
+    if let Some(container) = CONTAINER.blocking_lock().take() {
+        drop(container);
+        println!("Cleaned up shared PostgreSQL container");
+    }
+}
+
 /// Register cleanup handlers to ensure containers are stopped
 pub fn register_cleanup_handlers() {
     use std::sync::Once;
     static INIT: Once = Once::new();
     
     INIT.call_once(|| {
-        // Register cleanup for normal program termination
-        let _ = std::panic::set_hook(Box::new(|_| {
-            // Try to cleanup on panic (best effort)
-            std::thread::spawn(|| {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                rt.block_on(cleanup_shared_container());
-            }).join().ok();
-        }));
-        
+        // Stop the container when the test process exits. The static Container
+        // never drops on its own, which leaks one postgres container per test
+        // binary run. Do NOT do this from a panic hook: a failing assertion is
+        // a panic, and tearing the container down there kills every other test
+        // still running against it (and swallows the panic message).
+        unsafe {
+            libc::atexit(cleanup_container_at_exit);
+        }
+
         // Register cleanup for SIGINT/SIGTERM
         #[cfg(unix)]
         {

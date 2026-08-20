@@ -1402,6 +1402,7 @@ dependencies = [
  "ctrlc",
  "futures-util",
  "indoc",
+ "libc",
  "notify",
  "once_cell",
  "owo-colors",

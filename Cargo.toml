@@ -55,3 +55,4 @@ once_cell = "1.19"
 indoc = "2.0"
 uuid = { version = "1.6", features = ["v4"] }
 ctrlc = "3.4"
+libc = "0.2"
