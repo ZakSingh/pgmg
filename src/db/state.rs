@@ -264,10 +264,14 @@ impl<'a> StateManager<'a> {
         Ok(objects)
     }
 
-    /// Check if database has no applied migrations (fresh build)
+    /// Check if pgmg has never applied anything to this database (fresh build):
+    /// no recorded migrations AND no tracked objects. Checking migrations alone
+    /// would misclassify migration-less (declarative-only) projects as fresh on
+    /// every apply, silently disabling transactional mode.
     pub async fn is_empty(&self) -> Result<bool, Box<dyn std::error::Error>> {
         let count: i64 = self.client.query_one(
-            "SELECT COUNT(*) FROM pgmg.pgmg_migrations",
+            "SELECT (SELECT COUNT(*) FROM pgmg.pgmg_migrations)
+                  + (SELECT COUNT(*) FROM pgmg.pgmg_state)",
             &[],
         ).await?.get(0);
         Ok(count == 0)
