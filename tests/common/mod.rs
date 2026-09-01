@@ -1,8 +1,9 @@
 use once_cell::sync::Lazy;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::process::Command;
+use std::sync::{Arc, Once};
 use tempfile::TempDir;
-use testcontainers::{clients::Cli, Container, RunnableImage};
+use testcontainers::{core::ImageExt, runners::AsyncRunner, ContainerAsync, ContainerRequest};
 use testcontainers_modules::postgres::Postgres;
 use tokio::sync::Mutex;
 use tokio_postgres::{Client, NoTls, Row};
@@ -58,12 +59,76 @@ struct ContainerInfo {
     host_port: u16,
 }
 
+/// Docker label on every container this harness starts. List them with
+/// `docker ps -a --filter label=pgmg-test-harness`.
+pub const HARNESS_LABEL: &str = "pgmg-test-harness";
+/// Label carrying the pid of the test process that owns a container, so the startup scrub
+/// can tell abandoned containers from those of a concurrently running test binary.
+const HARNESS_PID_LABEL: &str = "pgmg-test-harness.pid";
+const POSTGRES_TAG: &str = "16-alpine";
+
 /// Shared PostgreSQL container for all tests
-static DOCKER_CLIENT: Lazy<Cli> = Lazy::new(Cli::default);
-static CONTAINER: Lazy<Arc<Mutex<Option<Container<'static, Postgres>>>>> = 
+static CONTAINER: Lazy<Arc<Mutex<Option<ContainerAsync<Postgres>>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
 static CONTAINER_INFO: Lazy<Arc<Mutex<Option<ContainerInfo>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
+
+/// The Postgres image every pgmg test container starts from: pinned to a supported major,
+/// labelled, and named `pgmg-test-*` so the containers are identifiable in `docker ps`.
+/// The first call in a process also removes containers abandoned by earlier test runs.
+pub fn postgres_image() -> ContainerRequest<Postgres> {
+    static SCRUB: Once = Once::new();
+    SCRUB.call_once(scrub_abandoned_containers);
+
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    Postgres::default()
+        .with_tag(POSTGRES_TAG)
+        .with_label(HARNESS_LABEL, "1")
+        .with_label(HARNESS_PID_LABEL, std::process::id().to_string())
+        .with_container_name(format!("pgmg-test-{}", &suffix[..12]))
+}
+
+/// Remove containers left behind by earlier pgmg test processes that died without running
+/// the atexit hook (SIGKILL, abort). A container whose owning process is still alive belongs
+/// to a concurrently running test binary and is left alone. Best-effort: failures are ignored.
+fn scrub_abandoned_containers() {
+    let format = format!("{{{{.ID}}}} {{{{.Label \"{HARNESS_PID_LABEL}\"}}}}");
+    let Ok(output) = Command::new("docker")
+        .args(["ps", "-a", "--filter", &format!("label={HARNESS_LABEL}"), "--format", &format])
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let abandoned: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| {
+            let (id, pid) = line.split_once(' ')?;
+            let owner_alive = pid.trim().parse::<u32>().map(process_alive).unwrap_or(false);
+            (!owner_alive).then_some(id)
+        })
+        .collect();
+    if abandoned.is_empty() {
+        return;
+    }
+    let _ = Command::new("docker").args(["rm", "-f", "-v"]).args(&abandoned).output();
+}
+
+/// Signal 0 checks for existence without signalling. EPERM means the process exists but
+/// belongs to another user, which still counts as alive.
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+    alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
+}
 
 /// Test environment with isolated database and temporary directories
 pub struct TestEnvironment {
@@ -306,18 +371,9 @@ async fn ensure_container_started() -> Result<ContainerInfo, Box<dyn std::error:
     let mut info_guard = CONTAINER_INFO.lock().await;
     
     if container_guard.is_none() {
-        let postgres_image = RunnableImage::from(Postgres::default())
-            .with_env_var(("POSTGRES_PASSWORD", "postgres"))
-            .with_env_var(("POSTGRES_USER", "postgres"))
-            .with_env_var(("POSTGRES_DB", "postgres"));
-            // Note: testcontainers automatically cleans up containers when dropped
-        
-        let container = DOCKER_CLIENT.run(postgres_image);
-        let host_port = container.get_host_port_ipv4(5432);
-        
-        // Wait for PostgreSQL to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        
+        let container = postgres_image().start().await?;
+        let host_port = container.get_host_port_ipv4(5432).await?;
+
         *info_guard = Some(ContainerInfo { host_port });
         *container_guard = Some(container);
     }
@@ -334,15 +390,16 @@ impl Clone for ContainerInfo {
 }
 
 /// Stop the shared PostgreSQL container (called on test completion)
+/// Remove the shared PostgreSQL container together with its anonymous data volume.
 pub async fn cleanup_shared_container() {
-    let mut container_guard = CONTAINER.lock().await;
-    let mut info_guard = CONTAINER_INFO.lock().await;
-    
-    if let Some(container) = container_guard.take() {
-        // The container will be stopped and removed when dropped
-        drop(container);
-        *info_guard = None;
-        println!("Cleaned up shared PostgreSQL container");
+    let container = CONTAINER.lock().await.take();
+    *CONTAINER_INFO.lock().await = None;
+
+    if let Some(container) = container {
+        match container.rm().await {
+            Ok(()) => println!("Cleaned up shared PostgreSQL container"),
+            Err(e) => eprintln!("Failed to remove shared PostgreSQL container: {e}"),
+        }
     }
 }
 
@@ -352,27 +409,27 @@ pub async fn cleanup_all() {
     cleanup_shared_container().await;
 }
 
-/// atexit callback: runs on the main thread after all tests finish, when the
-/// per-test tokio runtimes are gone, so the blocking lock is safe. Dropping
-/// the Container issues a synchronous `docker rm -f`.
+/// atexit callback: runs on the main thread after all tests finish, when the per-test
+/// tokio runtimes are gone. Removing the container is async (and dropping a
+/// `ContainerAsync` outside a runtime panics), so it gets a runtime of its own.
 extern "C" fn cleanup_container_at_exit() {
-    if let Some(container) = CONTAINER.blocking_lock().take() {
-        drop(container);
-        println!("Cleaned up shared PostgreSQL container");
+    match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt.block_on(cleanup_shared_container()),
+        Err(e) => eprintln!("Failed to build a runtime for container cleanup: {e}"),
     }
 }
 
 /// Register cleanup handlers to ensure containers are stopped
 pub fn register_cleanup_handlers() {
-    use std::sync::Once;
     static INIT: Once = Once::new();
     
     INIT.call_once(|| {
-        // Stop the container when the test process exits. The static Container
-        // never drops on its own, which leaks one postgres container per test
-        // binary run. Do NOT do this from a panic hook: a failing assertion is
-        // a panic, and tearing the container down there kills every other test
-        // still running against it (and swallows the panic message).
+        // Remove the shared container when the test process exits. The static
+        // container never drops on its own, which leaks one postgres container
+        // (and its volume) per test binary run. Do NOT do this from a panic hook:
+        // a failing assertion is a panic, and tearing the container down there
+        // kills every other test still running against it (and swallows the
+        // panic message).
         unsafe {
             libc::atexit(cleanup_container_at_exit);
         }

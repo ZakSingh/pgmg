@@ -49,8 +49,8 @@ webpki-roots = { version = "1.0.2", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 
 [dev-dependencies]
-testcontainers = { version = "0.15", features = ["watchdog"] }
-testcontainers-modules = { version = "0.1", features = ["postgres"] }
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres"] }
 once_cell = "1.19"
 indoc = "2.0"
 uuid = { version = "1.6", features = ["v4"] }

@@ -5,8 +5,7 @@ use pgmg::config::PgmgConfig;
 use pgmg::commands::apply::execute_apply;
 use pgmg::db::{AdvisoryLockManager, AdvisoryLockError, connect_with_url};
 use tempfile::TempDir;
-use testcontainers::clients::Cli;
-use testcontainers_modules::postgres::Postgres;
+use testcontainers::runners::AsyncRunner;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
@@ -25,11 +24,10 @@ async fn test_concurrent_apply_operations_are_serialized() {
 /// Test that lock acquisition times out when another process holds the lock
 #[tokio::test]
 async fn test_lock_acquisition_timeout() {
-    let docker = Cli::default();
-    let postgres = docker.run(Postgres::default());
+    let postgres = common::postgres_image().start().await.unwrap();
     let connection_string = format!(
         "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
-        postgres.get_host_port_ipv4(5432)
+        postgres.get_host_port_ipv4(5432).await.unwrap()
     );
 
     // Create first connection and acquire lock
@@ -78,11 +76,10 @@ async fn test_lock_acquisition_timeout() {
 /// Test that locks are properly cleaned up when connections are dropped
 #[tokio::test]
 async fn test_lock_cleanup_on_connection_drop() {
-    let docker = Cli::default();
-    let postgres = docker.run(Postgres::default());
+    let postgres = common::postgres_image().start().await.unwrap();
     let connection_string = format!(
         "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
-        postgres.get_host_port_ipv4(5432)
+        postgres.get_host_port_ipv4(5432).await.unwrap()
     );
 
     // Acquire lock in a separate scope so connection gets dropped
@@ -160,11 +157,10 @@ async fn test_lock_key_consistency() {
 /// Test that failed apply operations properly release locks
 #[tokio::test]
 async fn test_lock_release_on_apply_failure() {
-    let docker = Cli::default();
-    let postgres = docker.run(Postgres::default());
+    let postgres = common::postgres_image().start().await.unwrap();
     let connection_string = format!(
         "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
-        postgres.get_host_port_ipv4(5432)
+        postgres.get_host_port_ipv4(5432).await.unwrap()
     );
 
     // Create test directories with invalid migration
@@ -211,11 +207,10 @@ async fn test_lock_release_on_apply_failure() {
 /// Test concurrent lock manager operations
 #[tokio::test]
 async fn test_concurrent_lock_manager_operations() {
-    let docker = Cli::default();
-    let postgres = docker.run(Postgres::default());
+    let postgres = common::postgres_image().start().await.unwrap();
     let connection_string = format!(
         "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
-        postgres.get_host_port_ipv4(5432)
+        postgres.get_host_port_ipv4(5432).await.unwrap()
     );
 
     let mut handles = Vec::new();
@@ -317,11 +312,10 @@ async fn test_concurrent_lock_manager_operations() {
 /// Test that lock operations work correctly across database transactions
 #[tokio::test]
 async fn test_lock_behavior_with_transactions() {
-    let docker = Cli::default();
-    let postgres = docker.run(Postgres::default());
+    let postgres = common::postgres_image().start().await.unwrap();
     let connection_string = format!(
         "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
-        postgres.get_host_port_ipv4(5432)
+        postgres.get_host_port_ipv4(5432).await.unwrap()
     );
 
     let (mut client, connection) = connect_with_url(&connection_string).await.unwrap();
@@ -355,11 +349,10 @@ async fn test_lock_behavior_with_transactions() {
 /// Performance test to ensure lock operations are fast enough
 #[tokio::test]
 async fn test_lock_performance() {
-    let docker = Cli::default();
-    let postgres = docker.run(Postgres::default());
+    let postgres = common::postgres_image().start().await.unwrap();
     let connection_string = format!(
         "postgresql://postgres:postgres@127.0.0.1:{}/postgres",
-        postgres.get_host_port_ipv4(5432)
+        postgres.get_host_port_ipv4(5432).await.unwrap()
     );
 
     let (client, connection) = connect_with_url(&connection_string).await.unwrap();
