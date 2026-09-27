@@ -183,6 +183,14 @@ pub async fn execute_plan(
 
                     // Add these as UpdateObject operations (to trigger pre-drop/recreate)
                     for (obj_type, obj_name) in dependents {
+                        // A cron job's command is stored as text and resolved when
+                        // the job runs, so an altered table never requires the job
+                        // to be rescheduled. Rescheduling would only churn cron.job.
+                        if obj_type == ObjectType::CronJob {
+                            debug!("  Skipping cron job {} (command resolves at run time)", obj_name);
+                            continue;
+                        }
+
                         let (obj_qualified, obj_trigger_table) = parse_state_object_name(&obj_type, &obj_name);
 
                         // Skip if already in changes

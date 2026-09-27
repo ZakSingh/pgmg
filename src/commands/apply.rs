@@ -947,7 +947,18 @@ async fn apply_drop_for_update<C: GenericClient>(
         client.execute(&comment_null_statement, &[]).await?;
         return Ok(());
     }
-    
+
+    // Cron jobs are not dropped before recreation. cron.schedule(name, ...) has
+    // upserted on the job name since pg_cron 1.3, so re-running the file's
+    // statement updates the existing row in place. That keeps the jobid (and
+    // its cron.job_run_details history), avoids pg_cron cancelling a run that
+    // is in flight when the launcher reloads, and halves the writes to
+    // cron.job inside the apply transaction.
+    if object.object_type == ObjectType::CronJob {
+        debug!("Skipping pre-drop of cron job {} (cron.schedule upserts by name)", object.qualified_name.name);
+        return Ok(());
+    }
+
     // Just drop the object - creation will happen in a separate phase
     let drop_statement = match object.object_type {
         ObjectType::Operator => {
@@ -1096,6 +1107,26 @@ async fn apply_delete_object<C: GenericClient>(
 
         let drop_statement = format!("DROP TRIGGER IF EXISTS {} ON {}", trigger_name, quoted_table);
         client.execute(&drop_statement, &[]).await?;
+    } else if object_type == &ObjectType::CronJob {
+        // cron.unschedule(name) has no IF EXISTS: it errors when no row matches
+        // the name for the current user (already unscheduled by hand, or scheduled
+        // under another role). Either way there is nothing pgmg can drop, so treat
+        // it like a comment: tolerate the failure and forget the object.
+        let drop_statement = generate_drop_statement(object_type, &qualified_name);
+        client.execute("SAVEPOINT cron_unschedule", &[]).await?;
+        match client.execute(&drop_statement, &[]).await {
+            Ok(_) => {
+                client.execute("RELEASE SAVEPOINT cron_unschedule", &[]).await?;
+            }
+            Err(e) => {
+                client.execute("ROLLBACK TO SAVEPOINT cron_unschedule", &[]).await?;
+                warn!(
+                    job = %qualified_name.name,
+                    error = %e,
+                    "cron.unschedule failed; removing the job from pgmg state anyway"
+                );
+            }
+        }
     } else {
         // Drop the object
         let drop_statement = generate_drop_statement(object_type, &qualified_name);

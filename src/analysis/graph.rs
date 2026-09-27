@@ -15,7 +15,7 @@ pub struct ObjectRef {
     pub trigger_table: Option<QualifiedIdent>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DependencyType {
     /// Structural dependency - dependent must be recreated when dependency changes
     /// Examples: views depending on tables, triggers depending on functions
@@ -70,6 +70,18 @@ impl DependencyGraph {
                 obj.qualified_name.name
             );
 
+            // The edge type a structural reference gets when *this* object is
+            // the dependent. pg_cron stores a job's command as text and resolves
+            // the objects it names when the job runs, so nothing about the job
+            // needs recreating when a dependency changes. The edges stay in the
+            // graph — deletion validation and create/drop ordering rely on them —
+            // but as Soft, so the recreation cascade stops at the job.
+            let structural = if obj.object_type == ObjectType::CronJob {
+                DependencyType::Soft
+            } else {
+                DependencyType::Hard
+            };
+
             // Add edges for relation dependencies
             for dep in &filtered_deps.relations {
                 // Relations could be tables, views, or materialized views
@@ -84,7 +96,7 @@ impl DependencyGraph {
                         obj_ref.object_type,
                         obj_name
                     );
-                    graph.add_edge(dep_ref, obj_ref.clone(), DependencyType::Hard)?;
+                    graph.add_edge(dep_ref, obj_ref.clone(), structural)?;
                 }
             }
             
@@ -106,7 +118,8 @@ impl DependencyGraph {
                         // Functions/procedures calling other functions/procedures use runtime lookup
                         ObjectType::Function | ObjectType::Procedure => DependencyType::Soft,
                         // Views, triggers, and other objects have structural dependencies
-                        _ => DependencyType::Hard,
+                        // (cron jobs excepted; see `structural` above)
+                        _ => structural,
                     };
                     
                     graph.add_edge(dep_ref, obj_ref.clone(), dep_type)?;
@@ -143,7 +156,7 @@ impl DependencyGraph {
                     matches!(o.object_type, ObjectType::Type | ObjectType::Domain | ObjectType::View | ObjectType::MaterializedView | ObjectType::Table)
                 ) {
                     let dep_ref = ObjectRef::from(dep_obj);
-                    graph.add_edge(dep_ref, obj_ref.clone(), DependencyType::Hard)?;
+                    graph.add_edge(dep_ref, obj_ref.clone(), structural)?;
                 }
             }
         }
@@ -452,6 +465,56 @@ mod tests {
             dependencies,
             None,
         )
+    }
+
+    fn deps(relations: &[&str], functions: &[&str]) -> Dependencies {
+        Dependencies {
+            relations: relations.iter().map(|n| QualifiedIdent::from_name(n.to_string())).collect(),
+            functions: functions.iter().map(|n| QualifiedIdent::from_name(n.to_string())).collect(),
+            types: HashSet::new(),
+        }
+    }
+
+    /// pg_cron resolves a job's command text when the job runs, so a changed
+    /// dependency must not cascade into the job. The edge itself has to stay:
+    /// deletion validation and create/drop ordering are built on it.
+    #[test]
+    fn test_cron_job_edges_are_soft_but_kept() {
+        let objects = vec![
+            create_test_object(ObjectType::View, "counts", None, deps(&[], &[])),
+            create_test_object(ObjectType::Function, "refresh_counts", None, deps(&["counts"], &[])),
+            create_test_object(ObjectType::View, "counts_report", None, deps(&[], &["refresh_counts"])),
+            create_test_object(ObjectType::CronJob, "refresh_counts_job", None, deps(&["counts"], &["refresh_counts"])),
+        ];
+        let graph = DependencyGraph::build_from_objects(&objects, &BuiltinCatalog::new()).unwrap();
+
+        let counts = ObjectRef::new(ObjectType::View, QualifiedIdent::from_name("counts".to_string()));
+        let function = ObjectRef::new(ObjectType::Function, QualifiedIdent::from_name("refresh_counts".to_string()));
+        let report = ObjectRef::new(ObjectType::View, QualifiedIdent::from_name("counts_report".to_string()));
+        let job = ObjectRef::new(ObjectType::CronJob, QualifiedIdent::from_name("refresh_counts_job".to_string()));
+
+        // Changing the function recreates the view that embeds it, not the job.
+        let affected = graph.affected_by_changes(&[function.clone()]);
+        assert!(affected.contains(&report));
+        assert!(!affected.contains(&job), "cron job must not be recreated for a function change");
+
+        // Changing the relation the job's command names does not reach the job either,
+        // even though it does reach the function (and through it the report view).
+        let affected = graph.affected_by_changes(&[counts.clone()]);
+        assert!(affected.contains(&function));
+        assert!(affected.contains(&report));
+        assert!(!affected.contains(&job), "cron job must not be recreated for a relation change");
+
+        // The edges still exist for deletion validation ...
+        assert!(graph.dependents_of(&function).contains(&job));
+        assert!(graph.dependents_of(&counts).contains(&job));
+
+        // ... and for ordering: the job is scheduled after, and unscheduled before,
+        // the objects its command names.
+        let creation = graph.creation_order().unwrap();
+        let pos = |r: &ObjectRef| creation.iter().position(|o| o == r).unwrap();
+        assert!(pos(&function) < pos(&job));
+        assert!(pos(&counts) < pos(&job));
     }
 
     #[test]
