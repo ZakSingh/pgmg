@@ -11,7 +11,7 @@ pub enum OutputFormat {
 #[derive(Parser, Clone)]
 #[command(name = "pgmg")]
 #[command(about = "PostgreSQL Migration Manager")]
-#[command(version = "0.1.0")]
+#[command(version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("PGMG_GIT_SHA"), ")"))]
 pub struct Cli {
     /// Increase verbosity level (can be used multiple times)
     #[arg(short, long, action = clap::ArgAction::Count)]

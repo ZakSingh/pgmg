@@ -6,6 +6,29 @@ A tool for managing PostgreSQL schema migrations with automatic dependency resol
 
 pgmg handles both traditional sequential migrations for tables and declarative management of views, functions, and types. It automatically manages dependencies and ensures your database objects are recreated in the correct order when table changes affect them. This means that you can manage your views, functions, and types just like normal code, and that you do not need to order them alphanumerically in your filesystem.
 
+## Installation
+
+Prebuilt Linux binaries are attached to the [`latest` prerelease](https://github.com/ZakSingh/pgmg/releases/tag/latest). Every push to `main` publishes two assets per architecture:
+
+| Asset | Behaviour |
+|-------|-----------|
+| `pgmg-linux-x86_64`, `pgmg-linux-aarch64` | Always the current tip of `main`. Overwritten on every push. |
+| `pgmg-linux-x86_64-<sha>`, `pgmg-linux-aarch64-<sha>` | Built from exactly that commit. Immutable once uploaded. |
+
+If you depend on pgmg as a library at a pinned git rev, download the matching sha-suffixed asset so the CLI you run is the same commit you link:
+
+```bash
+# Extract the pinned rev from Cargo.lock and fetch the matching binary
+SHA=$(grep -A2 'name = "pgmg"' Cargo.lock | grep -o '#[0-9a-f]\{40\}' | tr -d '#')
+gh release download latest --repo ZakSingh/pgmg --pattern "pgmg-linux-x86_64-$SHA" --output pgmg
+chmod +x pgmg
+
+# Confirm the binary is the commit you expect
+./pgmg --version   # pgmg 0.1.0 (<sha>)
+```
+
+`pgmg --version` reports the commit the binary was built from. Local builds read it from git and append `-dirty` when the working tree has uncommitted changes; set `PGMG_GIT_SHA` at build time to override.
+
 ## Usage
 
 ### Basic Commands

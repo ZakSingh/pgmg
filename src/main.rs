@@ -30,7 +30,7 @@ async fn main() -> color_eyre::Result<()> {
     }
     
     // Log startup
-    info!("Starting pgmg v{}", env!("CARGO_PKG_VERSION"));
+    info!("Starting pgmg v{} ({})", env!("CARGO_PKG_VERSION"), env!("PGMG_GIT_SHA"));
     debug!("Command: {:?}", cli.command);
     
     // Run the actual command
