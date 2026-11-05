@@ -169,12 +169,8 @@ pub async fn execute_plan(
                         debug!("  - {}", format_qualified_name(table));
                     }
 
-                    // Convert to "schema.table" format for database query
-                    let table_names: Vec<String> = affected_tables.iter()
-                        .map(|t| format_qualified_name(t))
-                        .collect();
-
                     // Find all managed objects depending on these tables
+                    let table_names: Vec<QualifiedIdent> = affected_tables.iter().cloned().collect();
                     let dependents = state_manager
                         .find_dependents_of_relations(&table_names)
                         .await?;

@@ -555,20 +555,33 @@ impl<'a> StateManager<'a> {
     ///
     /// This is used to identify objects that need to be pre-dropped before
     /// migrations that alter these tables.
+    ///
+    /// Relation dependencies are stored exactly as the managed SQL spelled them, so
+    /// a view reading `public.accounts` and a migration altering `accounts` name the
+    /// same table two ways. Both sides are compared with an unqualified name taken
+    /// to mean the `public` schema, the same default the dependency graph uses.
     pub async fn find_dependents_of_relations(
         &self,
-        relations: &[String],
+        relations: &[QualifiedIdent],
     ) -> Result<Vec<(ObjectType, String)>, Box<dyn std::error::Error>> {
         if relations.is_empty() {
             return Ok(Vec::new());
         }
+
+        let relations: Vec<String> = relations
+            .iter()
+            .map(|r| format!("{}.{}", r.schema.as_deref().unwrap_or("public"), r.name))
+            .collect();
 
         let rows = self.client.query(
             r#"
             SELECT DISTINCT dependent_type, dependent_name
             FROM pgmg.pgmg_dependencies
             WHERE dependency_type = 'relation'
-            AND dependency_name = ANY($1)
+            AND CASE WHEN position('.' IN dependency_name) = 0
+                     THEN 'public.' || dependency_name
+                     ELSE dependency_name
+                END = ANY($1)
             "#,
             &[&relations],
         ).await?;

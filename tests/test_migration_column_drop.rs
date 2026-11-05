@@ -348,3 +348,174 @@ async fn test_column_drop_with_materialized_view() -> Result<(), Box<dyn std::er
 
     Ok(())
 }
+
+/// A view that names its table schema-qualified (`public.accounts`) must still be
+/// pre-dropped when the migration alters the table without a schema (`accounts`).
+/// Before the fix the dependency lookup compared the two spellings literally, so
+/// nothing was pre-dropped and `ALTER COLUMN ... TYPE` failed with
+/// "cannot alter type of a column used by a view or rule".
+#[tokio::test]
+async fn test_alter_column_type_unqualified_migration_qualified_view() -> Result<(), Box<dyn std::error::Error>> {
+    let env = TestEnvironment::new().await?;
+
+    env.write_migration("001_create_accounts", indoc! {r#"
+        CREATE TABLE accounts (
+            id INT PRIMARY KEY,
+            owner_id BIGINT NOT NULL
+        );
+    "#}).await?;
+
+    env.write_sql_file("account_owners.sql", indoc! {r#"
+        CREATE VIEW account_owners AS
+        SELECT a.id, a.owner_id
+        FROM public.accounts a;
+    "#}).await?;
+
+    let result = execute_apply(
+        Some(env.migrations_dir.clone()),
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert_apply_successful(&result);
+    assert_eq!(result.objects_created.len(), 1);
+
+    // Migration names the table without a schema; the view file is unchanged.
+    env.write_migration("002_owner_id_int", indoc! {r#"
+        ALTER TABLE accounts
+          ALTER COLUMN owner_id TYPE INT;
+    "#}).await?;
+
+    let result2 = execute_apply(
+        Some(env.migrations_dir.clone()),
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert_apply_successful(&result2);
+    assert_eq!(result2.migrations_applied.len(), 1, "Should apply 1 migration");
+    assert_eq!(result2.objects_updated.len(), 1, "account_owners should be pre-dropped and recreated");
+
+    let table_type: String = env.query_scalar(
+        "SELECT data_type FROM information_schema.columns
+         WHERE table_name = 'accounts' AND column_name = 'owner_id'"
+    ).await?;
+    assert_eq!(table_type, "integer");
+
+    let view_type: String = env.query_scalar(
+        "SELECT data_type FROM information_schema.columns
+         WHERE table_name = 'account_owners' AND column_name = 'owner_id'"
+    ).await?;
+    assert_eq!(view_type, "integer", "recreated view should pick up the new column type");
+
+    Ok(())
+}
+
+/// The mirror case: the view names the table bare (`accounts`) and the migration
+/// qualifies it (`public.accounts`). Both spellings refer to the same table.
+#[tokio::test]
+async fn test_alter_column_type_qualified_migration_unqualified_view() -> Result<(), Box<dyn std::error::Error>> {
+    let env = TestEnvironment::new().await?;
+
+    env.write_migration("001_create_accounts", indoc! {r#"
+        CREATE TABLE accounts (
+            id INT PRIMARY KEY,
+            owner_id BIGINT NOT NULL
+        );
+    "#}).await?;
+
+    env.write_sql_file("account_owners.sql", indoc! {r#"
+        CREATE VIEW account_owners AS
+        SELECT a.id, a.owner_id
+        FROM accounts a;
+    "#}).await?;
+
+    let result = execute_apply(
+        Some(env.migrations_dir.clone()),
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert_apply_successful(&result);
+
+    env.write_migration("002_owner_id_int", indoc! {r#"
+        ALTER TABLE public.accounts
+          ALTER COLUMN owner_id TYPE INT;
+    "#}).await?;
+
+    let result2 = execute_apply(
+        Some(env.migrations_dir.clone()),
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert_apply_successful(&result2);
+    assert_eq!(result2.migrations_applied.len(), 1);
+    assert_eq!(result2.objects_updated.len(), 1, "account_owners should be pre-dropped and recreated");
+
+    let view_type: String = env.query_scalar(
+        "SELECT data_type FROM information_schema.columns
+         WHERE table_name = 'account_owners' AND column_name = 'owner_id'"
+    ).await?;
+    assert_eq!(view_type, "integer");
+
+    Ok(())
+}
+
+/// A table in a non-public schema must not be confused with a same-named table in
+/// public: altering bare `accounts` (resolves to public) must leave a view on
+/// `audit.accounts` alone, and altering `audit.accounts` must pre-drop only that view.
+#[tokio::test]
+async fn test_alter_table_schema_mismatch_does_not_predrop_other_schema() -> Result<(), Box<dyn std::error::Error>> {
+    let env = TestEnvironment::new().await?;
+
+    env.write_migration("001_create", indoc! {r#"
+        CREATE SCHEMA audit;
+        CREATE TABLE accounts (id INT PRIMARY KEY, owner_id BIGINT NOT NULL);
+        CREATE TABLE audit.accounts (id INT PRIMARY KEY, owner_id BIGINT NOT NULL);
+    "#}).await?;
+
+    env.write_sql_file("public_owners.sql", indoc! {r#"
+        CREATE VIEW public_owners AS SELECT id, owner_id FROM public.accounts;
+    "#}).await?;
+    env.write_sql_file("audit_owners.sql", indoc! {r#"
+        CREATE VIEW audit_owners AS SELECT id, owner_id FROM audit.accounts;
+    "#}).await?;
+
+    let result = execute_apply(
+        Some(env.migrations_dir.clone()),
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert_apply_successful(&result);
+    assert_eq!(result.objects_created.len(), 2);
+
+    env.write_migration("002_public_owner_id_int", indoc! {r#"
+        ALTER TABLE accounts ALTER COLUMN owner_id TYPE INT;
+    "#}).await?;
+
+    let result2 = execute_apply(
+        Some(env.migrations_dir.clone()),
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert_apply_successful(&result2);
+    assert_eq!(result2.objects_updated, vec!["public_owners"], "only the view on public.accounts should be recreated");
+
+    env.write_migration("003_audit_owner_id_int", indoc! {r#"
+        ALTER TABLE audit.accounts ALTER COLUMN owner_id TYPE INT;
+    "#}).await?;
+
+    let result3 = execute_apply(
+        Some(env.migrations_dir.clone()),
+        Some(env.sql_dir.clone()),
+        env.connection_string.clone(),
+        &PgmgConfig::default(),
+    ).await?;
+    assert_apply_successful(&result3);
+    assert_eq!(result3.objects_updated, vec!["audit_owners"], "only the view on audit.accounts should be recreated");
+
+    Ok(())
+}
