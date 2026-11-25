@@ -515,9 +515,10 @@ async fn test_comment_readded_on_object_recreation() -> Result<(), Box<dyn std::
     let comment_text: Option<String> = row.get(0);
     assert_eq!(comment_text, Some("Returns the current tax rate (10%)".to_string()));
     
-    // Modify function body (forces drop/recreate)
+    // Change the function's return type (forces drop/recreate; a body-only
+    // edit would be replaced in place and never lose its comment)
     env.write_sql_file("function.sql", indoc! {r#"
-        CREATE FUNCTION get_tax_rate() RETURNS numeric AS $$ 
+        CREATE FUNCTION get_tax_rate() RETURNS double precision AS $$ 
         BEGIN 
             -- Updated to 15% tax rate
             RETURN 0.15;

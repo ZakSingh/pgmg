@@ -49,6 +49,7 @@ fn sample_plan_result(relation_order: &[&str]) -> PlanResult {
         new_migrations: vec!["0002_add.sql".to_string()],
         dependency_graph: Some(DependencyGraph::new()),
         file_objects: vec![],
+        recheck_objects: vec![],
         severity: Severity::Breaking,
         severity_counts: SeverityCounts { safe: 2, transient: 0, breaking: 1 },
     }

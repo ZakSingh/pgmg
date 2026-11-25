@@ -97,6 +97,10 @@ pub struct RoutineCatalogInfo {
     /// Names aligned with `allargtypes` when present, else with the IN
     /// parameters; NULL unless at least one parameter is named.
     pub argnames: Option<Vec<String>>,
+    /// How many trailing input parameters have a default.
+    pub nargdefaults: i16,
+    /// How many input parameters the routine has.
+    pub nargs: i16,
 }
 
 /// Look up the single pg_proc row for a managed routine. Returns None when the
@@ -115,7 +119,9 @@ pub async fn get_routine_catalog_info<C: GenericClient>(
                p.proretset,
                p.proallargtypes::oid[] AS allargtypes,
                p.proargmodes::text[]   AS argmodes,
-               p.proargnames           AS argnames
+               p.proargnames           AS argnames,
+               p.pronargdefaults       AS nargdefaults,
+               p.pronargs              AS nargs
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind = $3::char
@@ -134,6 +140,8 @@ pub async fn get_routine_catalog_info<C: GenericClient>(
         allargtypes: row.get("allargtypes"),
         argmodes: row.get("argmodes"),
         argnames: row.get("argnames"),
+        nargdefaults: row.get("nargdefaults"),
+        nargs: row.get("nargs"),
     }))
 }
 
@@ -197,6 +205,42 @@ pub async fn get_relation_shape<C: GenericClient>(
         WHERE n.nspname = $1 AND c.relname = $2
           AND a.attnum > 0 AND NOT a.attisdropped
         ORDER BY a.attnum
+        "#,
+        &[&schema, &name],
+    ).await?;
+    Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+}
+
+/// Output columns of a view or materialized view as a client describing a
+/// query over it is told them: PostgreSQL reports a domain column as its base
+/// type in the row description (through nested domains), never as the domain.
+/// Comparable with the columns of a prepared statement. Empty when the
+/// relation is missing.
+pub async fn get_relation_described_shape<C: GenericClient>(
+    client: &C,
+    schema: &str,
+    name: &str,
+) -> Result<Vec<(String, u32)>, tokio_postgres::Error> {
+    let rows = client.query(
+        r#"
+        WITH RECURSIVE col AS (
+            SELECT a.attnum, a.attname, t.oid AS typid, t.typtype, t.typbasetype
+            FROM pg_attribute a
+            JOIN pg_class c     ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            JOIN pg_type t      ON t.oid = a.atttypid
+            WHERE n.nspname = $1 AND c.relname = $2
+              AND a.attnum > 0 AND NOT a.attisdropped
+            UNION ALL
+            SELECT col.attnum, col.attname, t.oid, t.typtype, t.typbasetype
+            FROM col
+            JOIN pg_type t ON t.oid = col.typbasetype
+            WHERE col.typtype = 'd'
+        )
+        SELECT attname, typid::oid
+        FROM col
+        WHERE typtype <> 'd'
+        ORDER BY attnum
         "#,
         &[&schema, &name],
     ).await?;

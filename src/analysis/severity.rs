@@ -1,10 +1,11 @@
 //! Client-compatibility severity classification for planned changes.
 //!
 //! Answers: does applying this change break clients compiled against the
-//! current schema? pgmg recreates every changed object with DROP + CREATE, so
-//! an update always churns the object's OID; what matters to clients is
-//! whether the object's interface — call signature and output row shape —
-//! survives the recreation. The old interface comes from the live catalog,
+//! current schema? pgmg recreates a changed object with DROP + CREATE, which
+//! churns the object's OID; what matters to clients is whether the object's
+//! interface — call signature and output row shape — survives the recreation.
+//! (The exception is a routine replaced in place, which keeps its OID and is
+//! always safe.) The old interface comes from the live catalog,
 //! the new one from the file DDL (normalized through the same connection so
 //! type aliases compare correctly).
 //!
@@ -13,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use tokio_postgres::GenericClient;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::db::introspect;
 use crate::db::introspect::quote_qualified_identifier;
@@ -75,9 +76,57 @@ pub fn classify_delete(object_type: &ObjectType, _object_name: &str) -> Severity
     }
 }
 
-/// Classify an update, which pgmg always applies as DROP + CREATE — so the
-/// best case for a client-referencable object is Transient (OID churn with an
-/// identical interface).
+/// Classify an edited function or procedure, and say whether it can be applied
+/// with `CREATE OR REPLACE` instead of DROP + CREATE.
+///
+/// PostgreSQL accepts a replacement only when the routine keeps its identity
+/// argument types, input parameter names, result shape and parameter defaults.
+/// The first three are exactly what makes an update `Transient` rather than
+/// `Breaking`; this adds the defaults. The returned severity is the one a
+/// DROP + CREATE would have; a routine that is in the end replaced in place
+/// keeps its OID and is `Safe`.
+pub async fn classify_routine_edit<C: GenericClient>(client: &C, object: &SqlObject) -> (Severity, bool) {
+    let Some(new) = extract_routine_interface(&object.ddl_statement) else {
+        return (breaking_warn(object, "could not parse routine interface from DDL"), false);
+    };
+    let prokind = if object.object_type == ObjectType::Procedure { "p" } else { "f" };
+    let severity = match classify_routine_against_catalog(client, object, prokind, &new).await {
+        RoutineChange::Identical => Severity::Transient,
+        // An extended interface is a different routine to PostgreSQL: it has
+        // to be dropped and created, never replaced.
+        RoutineChange::Extended => return (Severity::Transient, false),
+        RoutineChange::Breaking => return (Severity::Breaking, false),
+    };
+    let Some(new_defaults) = count_parameter_defaults(&object.ddl_statement) else {
+        return (severity, false);
+    };
+    let old_defaults = match introspect::get_routine_catalog_info(
+        client, object_schema(object), &object.qualified_name.name, prokind,
+    ).await {
+        Ok(Some(info)) => info.nargdefaults as usize,
+        _ => return (severity, false),
+    };
+    // "cannot remove parameter defaults from existing function"
+    (severity, new_defaults >= old_defaults)
+}
+
+/// Number of parameters with a DEFAULT in a CREATE FUNCTION / PROCEDURE.
+fn count_parameter_defaults(ddl: &str) -> Option<usize> {
+    let parsed = pg_query::parse(ddl).ok()?;
+    let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?;
+    let Some(pg_query::NodeEnum::CreateFunctionStmt(func)) = &stmt.node else {
+        return None;
+    };
+    Some(func.parameters.iter().filter(|param| matches!(
+        &param.node,
+        Some(pg_query::NodeEnum::FunctionParameter(fp)) if fp.defexpr.is_some()
+    )).count())
+}
+
+/// Classify an update applied as DROP + CREATE, where the best case for a
+/// client-referencable object is Transient (OID churn with an identical
+/// interface). Routines replaced in place are not classified here; they keep
+/// their OID and are Safe.
 pub async fn classify_update<C: GenericClient>(client: &C, object: &SqlObject) -> Severity {
     match object.object_type {
         // Metadata-only: comments are re-set in place, never dropped.
@@ -129,6 +178,20 @@ struct RoutineInterface {
     ret_type: Option<String>,
     /// RETURNS SETOF or RETURNS TABLE.
     setof: bool,
+    /// How many identity parameters have a DEFAULT.
+    defaults: usize,
+}
+
+/// How an edited routine's interface compares with the live one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutineChange {
+    /// Same identity arguments, parameter names and result.
+    Identical,
+    /// Everything a caller of the old routine relied on is still there:
+    /// parameters with defaults were added after the existing ones, or
+    /// columns were added to a row result.
+    Extended,
+    Breaking,
 }
 
 fn extract_routine_interface(ddl: &str) -> Option<RoutineInterface> {
@@ -147,10 +210,12 @@ fn extract_routine_interface(ddl: &str) -> Option<RoutineInterface> {
         let type_text = fp.arg_type.as_ref().filter(|t| !t.pct_type).and_then(|t| extract_type_name(t))?;
         match fp.mode() {
             Mode::FuncParamIn | Mode::FuncParamVariadic | Mode::FuncParamDefault => {
+                iface.defaults += usize::from(fp.defexpr.is_some());
                 iface.identity_types.push(type_text);
                 iface.identity_names.push(fp.name.clone());
             }
             Mode::FuncParamInout => {
+                iface.defaults += usize::from(fp.defexpr.is_some());
                 iface.identity_types.push(type_text.clone());
                 iface.identity_names.push(fp.name.clone());
                 iface.out_cols.push((fp.name.clone(), type_text));
@@ -210,7 +275,10 @@ async fn classify_routine_update<C: GenericClient>(client: &C, object: &SqlObjec
         return breaking_warn(object, "could not parse routine interface from DDL");
     };
     let prokind = if object.object_type == ObjectType::Procedure { "p" } else { "f" };
-    classify_routine_against_catalog(client, object, prokind, &new).await
+    match classify_routine_against_catalog(client, object, prokind, &new).await {
+        RoutineChange::Identical | RoutineChange::Extended => Severity::Transient,
+        RoutineChange::Breaking => Severity::Breaking,
+    }
 }
 
 async fn classify_routine_against_catalog<C: GenericClient>(
@@ -218,12 +286,12 @@ async fn classify_routine_against_catalog<C: GenericClient>(
     object: &SqlObject,
     prokind: &str,
     new: &RoutineInterface,
-) -> Severity {
+) -> RoutineChange {
     let schema = object_schema(object);
     let info = match introspect::get_routine_catalog_info(client, schema, &object.qualified_name.name, prokind).await {
         Ok(Some(info)) => info,
-        Ok(None) => return breaking_warn(object, "existing routine not found (or overloaded) in catalog"),
-        Err(e) => return breaking_warn(object, &format!("catalog lookup failed: {e}")),
+        Ok(None) => return breaking(breaking_warn(object, "existing routine not found (or overloaded) in catalog")),
+        Err(e) => return breaking(breaking_warn(object, &format!("catalog lookup failed: {e}"))),
     };
 
     // Identity arguments: resolve the new signature through to_regprocedure;
@@ -233,10 +301,30 @@ async fn classify_routine_against_catalog<C: GenericClient>(
         quote_qualified_identifier(Some(schema), &object.qualified_name.name),
         new.identity_types.join(",")
     );
+    let mut extended = false;
     match introspect::resolve_regprocedure(client, &signature).await {
         Ok(Some(oid)) if oid == info.oid => {}
-        Ok(_) => return Severity::Breaking, // signature no longer matches the live routine
-        Err(e) => return breaking_warn(object, &format!("signature resolution failed: {e}")),
+        Ok(_) => {
+            // The signature changed. Existing calls still resolve when the
+            // old parameters come first, unchanged, and every parameter added
+            // after them has a default.
+            let old_count = info.nargs.max(0) as usize;
+            let added = new.identity_types.len().saturating_sub(old_count);
+            if added == 0 || new.defaults < added {
+                return RoutineChange::Breaking;
+            }
+            let old_signature = format!(
+                "{}({})",
+                quote_qualified_identifier(Some(schema), &object.qualified_name.name),
+                new.identity_types[..old_count].join(",")
+            );
+            match introspect::resolve_regprocedure(client, &old_signature).await {
+                Ok(Some(oid)) if oid == info.oid => extended = true,
+                Ok(_) => return RoutineChange::Breaking,
+                Err(e) => return breaking(breaking_warn(object, &format!("signature resolution failed: {e}"))),
+            }
+        }
+        Err(e) => return breaking(breaking_warn(object, &format!("signature resolution failed: {e}"))),
     }
 
     // Parameter renames break clients using named notation. Only names that
@@ -245,22 +333,22 @@ async fn classify_routine_against_catalog<C: GenericClient>(
     let (old_in_names, old_out_cols) = old_param_lists(&info);
     for (old_name, new_name) in old_in_names.iter().zip(new.identity_names.iter()) {
         if !old_name.is_empty() && old_name != new_name {
-            return Severity::Breaking;
+            return RoutineChange::Breaking;
         }
     }
 
     // Result shape.
     if new.setof != info.retset {
-        return Severity::Breaking;
+        return RoutineChange::Breaking;
     }
     if !old_out_cols.is_empty() || !new.out_cols.is_empty() {
         let new_types: Vec<String> = new.out_cols.iter().map(|(_, t)| t.clone()).collect();
         let new_oids = match introspect::resolve_types(client, &new_types).await {
             Ok(oids) => oids,
-            Err(e) => return breaking_warn(object, &format!("type resolution failed: {e}")),
+            Err(e) => return breaking(breaking_warn(object, &format!("type resolution failed: {e}"))),
         };
         if new_oids.iter().any(|o| o.is_none()) {
-            return breaking_warn(object, "could not resolve an output parameter type");
+            return breaking(breaking_warn(object, "could not resolve an output parameter type"));
         }
         let new_out: Vec<(String, u32)> = new
             .out_cols
@@ -269,7 +357,15 @@ async fn classify_routine_against_catalog<C: GenericClient>(
             .map(|((name, _), oid)| (name.clone(), oid.unwrap()))
             .collect();
         if old_out_cols != new_out {
-            return Severity::Breaking;
+            // Columns added to a row result leave every old column where a
+            // caller selecting or reading it by name finds it. A single OUT
+            // parameter is a scalar result, and a second one turns it into a
+            // row, so that case stays breaking.
+            let is_row_result = info.retset || old_out_cols.len() >= 2;
+            if !(is_row_result && is_ordered_subsequence(&old_out_cols, &new_out)) {
+                return RoutineChange::Breaking;
+            }
+            extended = true;
         }
     } else {
         match &new.ret_type {
@@ -277,20 +373,29 @@ async fn classify_routine_against_catalog<C: GenericClient>(
                 match introspect::resolve_types(client, std::slice::from_ref(ret)).await {
                     Ok(oids) => match oids.first().copied().flatten() {
                         Some(oid) if oid == info.rettype => {}
-                        Some(_) => return Severity::Breaking,
-                        None => return breaking_warn(object, "could not resolve the return type"),
+                        Some(_) => return RoutineChange::Breaking,
+                        None => return breaking(breaking_warn(object, "could not resolve the return type")),
                     },
-                    Err(e) => return breaking_warn(object, &format!("type resolution failed: {e}")),
+                    Err(e) => return breaking(breaking_warn(object, &format!("type resolution failed: {e}"))),
                 }
             }
             // Procedures have no RETURNS clause; both sides are void.
             None if prokind == "p" => {}
-            None => return breaking_warn(object, "routine has no parseable return type"),
+            None => return breaking(breaking_warn(object, "routine has no parseable return type")),
         }
     }
 
-    Severity::Transient
+    if extended {
+        RoutineChange::Extended
+    } else {
+        RoutineChange::Identical
+    }
 }
+
+fn breaking(_: Severity) -> RoutineChange {
+    RoutineChange::Breaking
+}
+
 
 // ---------------------------------------------------------------------------
 // Aggregates
@@ -397,7 +502,7 @@ async fn classify_aggregate_update<C: GenericClient>(client: &C, object: &SqlObj
 
 /// The defining SELECT of a view/matview DDL plus any explicit column aliases
 /// (`CREATE VIEW v (a, b) AS ...`).
-fn extract_view_query(ddl: &str) -> Option<(String, Vec<String>)> {
+pub(crate) fn extract_view_query(ddl: &str) -> Option<(String, Vec<String>)> {
     let parsed = pg_query::parse(ddl).ok()?;
     let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?;
     let (query_node, alias_nodes) = match &stmt.node {
@@ -423,7 +528,9 @@ fn extract_view_query(ddl: &str) -> Option<(String, Vec<String>)> {
 
 async fn classify_relation_shape_update<C: GenericClient>(client: &C, object: &SqlObject) -> Severity {
     let schema = object_schema(object);
-    let old_cols = match introspect::get_relation_shape(client, schema, &object.qualified_name.name).await {
+    // Both sides are what a client's Describe reports, where a domain column
+    // appears as its base type.
+    let old_cols = match introspect::get_relation_described_shape(client, schema, &object.qualified_name.name).await {
         Ok(cols) => cols,
         Err(e) => return breaking_warn(object, &format!("catalog lookup failed: {e}")),
     };
@@ -459,20 +566,50 @@ async fn classify_relation_shape_update<C: GenericClient>(client: &C, object: &S
         }
     }
 
-    if old_cols == new_cols {
+    // Added columns leave every old column in place for a client that names
+    // or reads its columns by name.
+    if is_ordered_subsequence(&old_cols, &new_cols) {
+        Severity::Transient
+    } else {
+        debug!(
+            object = %crate::sql::format_qualified_name(&object.qualified_name),
+            ?old_cols,
+            ?new_cols,
+            "an existing output column was removed, renamed, retyped or reordered; breaking"
+        );
+        Severity::Breaking
+    }
+}
+
+/// Severity of a recreated view or materialized view whose columns after the
+/// apply are known (see [`super::shadow`]), for when the defining query cannot
+/// be prepared against the database as it is now.
+pub async fn classify_relation_against_shape<C: GenericClient>(
+    client: &C,
+    object: &SqlObject,
+    new_cols: &[(String, u32)],
+) -> Option<Severity> {
+    let old_cols = introspect::get_relation_described_shape(client, object_schema(object), &object.qualified_name.name)
+        .await
+        .ok()?;
+    if old_cols.is_empty() {
+        return None;
+    }
+    Some(if is_ordered_subsequence(&old_cols, new_cols) {
         Severity::Transient
     } else {
         Severity::Breaking
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
 // Types (enums and composites), domains, operators
 // ---------------------------------------------------------------------------
 
-/// True if `old` appears within `new` in order (labels may be inserted
-/// anywhere, but every existing label survives with relative order intact).
-fn is_ordered_subsequence(old: &[String], new: &[String]) -> bool {
+/// True if `old` appears within `new` in order (items may be inserted
+/// anywhere, but every existing one survives with relative order intact).
+/// Used for enum labels and for the columns of row shapes.
+fn is_ordered_subsequence<T: PartialEq>(old: &[T], new: &[T]) -> bool {
     let mut new_iter = new.iter();
     old.iter().all(|label| new_iter.any(|candidate| candidate == label))
 }
@@ -544,7 +681,9 @@ async fn classify_type_update<C: GenericClient>(client: &C, object: &SqlObject) 
                 .zip(oids)
                 .map(|((name, _), oid)| (name, oid.unwrap()))
                 .collect();
-            if old_attrs == new_shape {
+            // Added attributes leave every old one in place for a client
+            // that matches attributes by name.
+            if is_ordered_subsequence(&old_attrs, &new_shape) {
                 Severity::Transient
             } else {
                 Severity::Breaking
@@ -748,11 +887,9 @@ fn classify_migration_node(migration: &str, sql: &str, node: &pg_query::NodeEnum
         GrantStmt(grant) if grant.is_grant => Severity::Safe,
         // ALTER TYPE ... ADD VALUE only extends the value set.
         AlterEnumStmt(alter) if !alter.new_val.is_empty() && alter.old_val.is_empty() => Severity::Safe,
-        // Anything reshaping or removing existing schema. ALTER TABLE is
-        // Breaking in every form — even ADD COLUMN changes the row shape.
-        AlterTableStmt(_) | DropStmt(_) | RenameStmt(_) | GrantStmt(_) | AlterEnumStmt(_) => {
-            Severity::Breaking
-        }
+        AlterTableStmt(alter) => classify_alter_table(alter),
+        // Anything reshaping or removing existing schema.
+        DropStmt(_) | RenameStmt(_) | GrantStmt(_) | AlterEnumStmt(_) => Severity::Breaking,
         _ => {
             warn!(
                 migration,
@@ -762,6 +899,50 @@ fn classify_migration_node(migration: &str, sql: &str, node: &pg_query::NodeEnum
             Severity::Breaking
         }
     }
+}
+
+/// Severity of one `ALTER TABLE` (or `ALTER TYPE ... ATTRIBUTE`, which shares
+/// its parse node): the worst of its subcommands.
+///
+/// - Adding a column or attribute is `Transient`: everything a client read
+///   before is still there, but statements prepared with a `*` and cached type
+///   definitions are stale until the client's caches flush.
+/// - Subcommands that leave the row shape alone (constraints, defaults,
+///   `SET NOT NULL`, triggers, row security, ownership, storage) are `Safe`.
+/// - `DROP NOT NULL` is `Breaking`: a client that decodes the column as
+///   non-null fails on the first NULL.
+/// - Everything else (dropping, renaming or retyping a column, and any
+///   subcommand pgmg does not classify) is `Breaking`, as is `ALTER INDEX /
+///   VIEW / SEQUENCE`.
+fn classify_alter_table(alter: &pg_query::protobuf::AlterTableStmt) -> Severity {
+    use crate::sql::migration_analyzer::{classify_subcommand, AlterImpact};
+    use pg_query::protobuf::{AlterTableType as At, ObjectType as Obj};
+
+    let object_type = Obj::try_from(alter.objtype).ok();
+    let is_table = matches!(object_type, Some(Obj::ObjectTable | Obj::ObjectForeignTable));
+    let is_type = matches!(object_type, Some(Obj::ObjectType));
+    if !is_table && !is_type {
+        return Severity::Breaking;
+    }
+
+    alter
+        .cmds
+        .iter()
+        .map(|cmd| {
+            let Some(pg_query::NodeEnum::AlterTableCmd(cmd)) = &cmd.node else {
+                return Severity::Breaking;
+            };
+            match At::try_from(cmd.subtype) {
+                Ok(At::AtAddColumn) => Severity::Transient,
+                Ok(_) if is_type => Severity::Breaking,
+                Ok(At::AtDropNotNull) => Severity::Breaking,
+                Ok(At::AtDropConstraint) => Severity::Safe,
+                Ok(subtype) if classify_subcommand(subtype) == AlterImpact::Unaffected => Severity::Safe,
+                _ => Severity::Breaking,
+            }
+        })
+        .max()
+        .unwrap_or(Severity::Breaking)
 }
 
 fn statement_preview(sql: &str) -> String {
@@ -856,11 +1037,48 @@ mod tests {
     }
 
     #[test]
-    fn migration_alter_table_is_breaking() {
-        assert_eq!(
-            classify_migration("m", "ALTER TABLE users ADD COLUMN age int;"),
-            Severity::Breaking
-        );
+    fn migration_add_column_is_transient() {
+        for sql in [
+            "ALTER TABLE users ADD COLUMN age int;",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS age int NOT NULL DEFAULT 0;",
+            "ALTER TABLE users ADD COLUMN a int, ADD COLUMN b text;",
+            "ALTER TYPE address ADD ATTRIBUTE country text;",
+        ] {
+            assert_eq!(classify_migration("m", sql), Severity::Transient, "{sql}");
+        }
+    }
+
+    #[test]
+    fn migration_alter_table_leaving_the_row_shape_alone_is_safe() {
+        for sql in [
+            "ALTER TABLE users ADD CONSTRAINT users_age_check CHECK (age > 0);",
+            "ALTER TABLE users DROP CONSTRAINT users_age_check;",
+            "ALTER TABLE users ALTER COLUMN age SET DEFAULT 0;",
+            "ALTER TABLE users ALTER COLUMN age SET NOT NULL;",
+            "ALTER TABLE users ENABLE ROW LEVEL SECURITY;",
+            "ALTER TABLE users DISABLE TRIGGER USER;",
+            "ALTER TABLE users OWNER TO app;",
+        ] {
+            assert_eq!(classify_migration("m", sql), Severity::Safe, "{sql}");
+        }
+    }
+
+    #[test]
+    fn migration_alter_table_changing_existing_columns_is_breaking() {
+        for sql in [
+            "ALTER TABLE users DROP COLUMN age;",
+            "ALTER TABLE users ALTER COLUMN age TYPE bigint;",
+            "ALTER TABLE users ALTER COLUMN age DROP NOT NULL;",
+            "ALTER TABLE users RENAME COLUMN age TO years;",
+            "ALTER TABLE users ADD COLUMN a int, DROP COLUMN age;",
+            "ALTER TABLE users SET SCHEMA archive;",
+            "ALTER TYPE address DROP ATTRIBUTE country;",
+            "ALTER TYPE address ALTER ATTRIBUTE country TYPE int;",
+            "ALTER VIEW user_list SET (security_barrier = true);",
+            "ALTER INDEX users_idx SET (fillfactor = 70);",
+        ] {
+            assert_eq!(classify_migration("m", sql), Severity::Breaking, "{sql}");
+        }
     }
 
     #[test]
@@ -918,6 +1136,11 @@ mod tests {
         let sql = r#"
             CREATE TABLE audit (id int);
             ALTER TABLE users ADD COLUMN age int;
+        "#;
+        assert_eq!(classify_migration("m", sql), Severity::Transient);
+        let sql = r#"
+            ALTER TABLE users ADD COLUMN age int;
+            ALTER TABLE users DROP COLUMN name;
         "#;
         assert_eq!(classify_migration("m", sql), Severity::Breaking);
     }

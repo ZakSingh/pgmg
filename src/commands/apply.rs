@@ -470,9 +470,10 @@ async fn execute_all_changes<C: GenericClient>(
         // Collect all objects that need dropping (both updates and deletes)
         // These must be combined and sorted together by dependency order because
         // dependencies can cross between the two groups
+        // Updates applied in place (CREATE OR REPLACE) are not dropped at all.
         let all_to_drop: Vec<&ChangeOperation> = plan_result.changes.iter()
             .filter(|change| matches!(change,
-                ChangeOperation::UpdateObject { .. } | ChangeOperation::DeleteObject { .. }
+                ChangeOperation::UpdateObject { in_place: false, .. } | ChangeOperation::DeleteObject { .. }
             ))
             .collect();
 
@@ -638,25 +639,26 @@ async fn execute_all_changes<C: GenericClient>(
             }
             
             // Combine creates and updates (which need recreation)
-            let mut all_creates: Vec<(&SqlObject, bool)> = Vec::new();
+            // (object, is an update, is replaced in place)
+            let mut all_creates: Vec<(&SqlObject, bool, bool)> = Vec::new();
             
             // Add regular creates
             for change in &creates {
                 if let ChangeOperation::CreateObject { object, .. } = change {
-                    all_creates.push((object, false));
+                    all_creates.push((object, false, false));
                 }
             }
             
             // Add updates (which need recreation)
             for change in &updates {
-                if let ChangeOperation::UpdateObject { object, .. } = change {
-                    all_creates.push((object, true));
+                if let ChangeOperation::UpdateObject { object, in_place, .. } = change {
+                    all_creates.push((object, true, *in_place));
                 }
             }
             
             // Sort by creation order if available
             if let Some(ref create_order) = creation_order {
-                all_creates.sort_by_key(|(obj, _)| {
+                all_creates.sort_by_key(|(obj, _, _)| {
                     create_order.iter().position(|ref_|
                         ref_.object_type == obj.object_type &&
                         ref_.qualified_name == obj.qualified_name &&
@@ -665,10 +667,10 @@ async fn execute_all_changes<C: GenericClient>(
                 });
             }
             
-            for (object, is_update) in all_creates {
+            for (object, is_update, in_place) in all_creates {
                 if transaction_aborted { break; }
                 
-                match apply_create_object(client, object, config, test_mode).await {
+                match apply_create_object(client, object, config, test_mode, in_place).await {
                     Ok(_) => {
                         // Track modified objects for plpgsql_check
                         modified_objects.push(object);
@@ -679,7 +681,8 @@ async fn execute_all_changes<C: GenericClient>(
                                 info!(
                                     object_type = %format!("{:?}", object.object_type).to_lowercase(),
                                     object_name = %format_object_name(object),
-                                    "Recreated object (updated)"
+                                    in_place,
+                                    "{}", if in_place { "Replaced object in place" } else { "Recreated object (updated)" }
                                 );
                             }
                         } else {
@@ -729,6 +732,21 @@ async fn execute_all_changes<C: GenericClient>(
     
     // Step 4.5: Run plpgsql_check on modified functions if in development mode
     // IMPORTANT: Run plpgsql_check WITHIN the transaction before committing
+    //
+    // Functions that read a table a migration added columns to are checked
+    // too, even though they were left in place: their bodies are parsed at
+    // run time, so this is where a reference the new column made ambiguous
+    // surfaces.
+    for object in &plan_result.recheck_objects {
+        let already_tracked = modified_objects.iter().any(|modified|
+            modified.object_type == object.object_type &&
+            modified.qualified_name == object.qualified_name
+        );
+        if !already_tracked {
+            modified_objects.push(object);
+        }
+    }
+
     if config.development_mode.unwrap_or(false) && 
        config.check_plpgsql.unwrap_or(false) &&
        !modified_objects.is_empty() {
@@ -887,6 +905,7 @@ async fn apply_create_object<C: GenericClient>(
     object: &SqlObject,
     config: &PgmgConfig,
     test_mode: bool,
+    in_place: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Skip pg_cron related objects in test mode
     if test_mode && should_skip_in_test_mode(&object.ddl_statement) {
@@ -908,8 +927,17 @@ async fn apply_create_object<C: GenericClient>(
         }
     }
 
-    // Execute the DDL statement
-    client.execute(&object.ddl_statement, &[]).await?;
+    // Execute the DDL statement. An in-place update was not dropped
+    // beforehand, so it has to replace the existing definition.
+    if in_place {
+        let ddl = crate::sql::with_or_replace(&object.ddl_statement).ok_or_else(|| format!(
+            "{} cannot be replaced in place: not a function or procedure definition",
+            format_object_name(object)
+        ))?;
+        client.execute(&ddl, &[]).await?;
+    } else {
+        client.execute(&object.ddl_statement, &[]).await?;
+    }
 
     // Update state tracking with object hash
     let ddl_hash = calculate_ddl_hash(&object.ddl_statement);

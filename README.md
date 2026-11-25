@@ -225,21 +225,111 @@ CREATE TABLE pgmg_state (
     - Detects which objects are affected by table migrations
 
 3. **Migration Wrapping**
-    - When a table migration affects views/functions, pgmg:
+    - When a pending migration alters a table in a way its dependents cannot
+      survive, pgmg:
         - Drops the dependent objects before the migration
         - Runs the migration
         - Recreates objects using current definitions from sql/
+    - What counts depends on the `ALTER TABLE` subcommand; see
+      [Which table changes recreate dependents](#which-table-changes-recreate-dependents).
+    - Editing a managed object follows the same principle; see
+      [What gets dropped and recreated](#what-gets-dropped-and-recreated).
 
 4. **Atomic Execution**
     - All changes run in a single transaction when possible
     - On success: updates both state tables
     - On failure: rolls back everything
 
+### What gets dropped and recreated
+
+pgmg recreates an object only when something forces it to. There are two
+forcing reasons, and they apply the same way whether the change comes from an
+edited file or from a migration:
+
+- **Binding.** PostgreSQL ties some objects to others in its catalog and will
+  not let the one be dropped or altered while the other exists. A view is bound
+  to the tables, views and functions it uses; a trigger to its table and its
+  function; an index to its table; a function to the types in its signature.
+  When an object is dropped, everything bound to it is dropped first and
+  recreated afterwards.
+- **Stored results.** A materialized view or an index holds values computed
+  when it was built. When anything it is derived from changes, it is rebuilt,
+  even if nothing forces a drop.
+
+Everything else is left in place. In particular:
+
+- **A function or procedure body is not a binding.** A body written as a string
+  (`AS $$ ... $$`) is parsed when it runs, so the tables and views it queries
+  are looked up by name each time. Such a routine stays in place when a
+  relation it queries is recreated or altered. What does bind it is its
+  signature: a parameter or result of a table's or view's row type, a
+  `tbl.col%TYPE` parameter, a type used in a default. A variable declared with
+  a composite type, or a cast to one, binds as well. SQL-standard bodies
+  (`BEGIN ATOMIC`, `RETURN expr`) are parsed at creation and bind like a view.
+- **An edited function or procedure is replaced in place** with `CREATE OR
+  REPLACE` when its interface is unchanged: same argument types, parameter
+  names, result type and `OUT` columns, and no parameter default removed. It
+  keeps its OID, its privileges and everything built on it. If the interface
+  changed, it is dropped and recreated along with what is bound to it. The
+  plan marks in-place updates as "replaced in place" (`"in_place": true` in
+  JSON output).
+
+When `check_plpgsql` is on, routines left in place are re-checked whenever
+something they call or query was changed, which is where a change that broke
+their body shows up.
+
+### Which table changes recreate dependents
+
+pgmg reads each pending migration's `ALTER TABLE` statements and recreates
+what is bound to the table only when the change calls for it. The most
+disruptive change to a table across all pending migrations decides how that
+table's dependents are treated.
+
+| `ALTER TABLE ...` | Dependents |
+|---|---|
+| `ALTER COLUMN ... TYPE`, `DROP COLUMN` | Everything bound to the table is dropped before the migration and recreated after. PostgreSQL refuses these while a dependent view uses the column. |
+| `DROP CONSTRAINT` | Left in place, unless something in the database depends on the constraint itself (a view that groups by a primary key and selects other columns does). Then, and when pgmg cannot find the constraint to check, as above. |
+| `ADD COLUMN` | Left in place, except those whose definition the new column changes (below). |
+| `ADD CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`, identity and generated-column changes, `OWNER TO`, storage parameters, `SET TABLESPACE`, `ENABLE`/`DISABLE TRIGGER`, row-level security switches | Left in place. |
+| Anything else (`INHERIT`, `ATTACH PARTITION`, rules, ...) | Everything bound to the table is dropped and recreated, as a conservative default. |
+
+Migrations that change a **type** are handled the same way. When a pending
+migration renames, drops, moves or restructures a type or domain (`ALTER TYPE
+... RENAME TO`, `DROP TYPE`, `SET SCHEMA`, `ADD`/`DROP`/`ALTER ATTRIBUTE`),
+everything bound to that type is dropped first and recreated after. This is
+what makes the usual way of removing an enum label work: rename the type
+aside, create its replacement, move the columns over, drop the old one.
+`ALTER TYPE ... ADD VALUE` and `RENAME VALUE` leave dependents alone.
+
+PostgreSQL resolves a view's column references once, when the view is created.
+After an `ADD COLUMN`, pgmg therefore still recreates the dependents whose
+source would now resolve differently, so the database keeps matching what a
+fresh build of your files produces:
+
+- definitions using `*` or `t.*`, which would otherwise not expose the new column;
+- definitions using `NATURAL JOIN`, whose join columns may now differ;
+- definitions with an unqualified reference spelled like a new column, which
+  the new column may capture or make ambiguous. If it is ambiguous the apply
+  fails, exactly as a fresh build would.
+
+Three consequences worth knowing:
+
+- **Triggers stay on the table during the migration** unless the migration
+  changes a column's type, drops a column, or drops a constraint something
+  depends on. A backfill (`UPDATE`) in any other migration fires them, as it
+  would in a migration with no `ALTER TABLE` at all. Use `ALTER TABLE ...
+  DISABLE TRIGGER USER` around a backfill that must not fire them.
+- **Functions exist while migrations run** unless they are bound to something
+  being rebuilt. A migration that calls a managed function gets the version
+  from before the apply.
+- **Only top-level statements are analyzed.** An `ALTER TABLE` inside a `DO`
+  block or a function called by the migration is not seen.
+
 ### Key Design Decisions
 
 1. **Declarative SQL Objects**: Views, functions, and types are defined declaratively in the sql/ directory. The current file is always the source of truth.
 
-2. **Hash-Based Change Detection**: Objects are recreated when their content hash changes, ensuring the database matches the code.
+2. **Hash-Based Change Detection**: Objects are updated when their content hash changes, ensuring the database matches the code.
 
 3. **Automatic Dependency Resolution**: Rather than manually managing DROP/CREATE order, pgmg determines the correct sequence automatically.
 
@@ -255,7 +345,7 @@ If an apply fails:
 
 ### Advantages
 
-- **No manual coordination**: Table changes automatically trigger view recreation
+- **No manual coordination**: Table changes that affect a view recreate it automatically
 - **Version control friendly**: Only source SQL in git, not generated migrations
 - **Self-healing**: Drift between code and database is automatically corrected
 - **Safe iterations**: Plan shows exactly what will happen before execution

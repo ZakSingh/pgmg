@@ -251,10 +251,10 @@ async fn test_migration_altering_table_does_not_reschedule_cron_job() -> Result<
     ).await?;
     assert_eq!(deps, 1, "cron job should record its relation dependency");
 
-    env.write_migration("002_events_kind", "ALTER TABLE events ADD COLUMN kind text;").await?;
+    env.write_migration("002_events_id_bigint", "ALTER TABLE events ALTER COLUMN id TYPE bigint;").await?;
 
     let plan = plan(&env).await?;
-    assert_plan_contains_migration(&plan, "002_events_kind");
+    assert_plan_contains_migration(&plan, "002_events_id_bigint");
     // The view really depends on the table's shape and is recreated ...
     assert_plan_contains_update(&plan, ObjectType::View, "events_count");
     // ... the job's command text does not, so it is left alone.

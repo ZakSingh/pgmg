@@ -1167,9 +1167,84 @@ fn normalize_ddl_for_hashing(ddl: &str) -> String {
         .to_lowercase()
 }
 
+/// Rewrite a `CREATE FUNCTION` / `CREATE PROCEDURE` statement as `CREATE OR
+/// REPLACE ...`, leaving every other byte (the body included) untouched.
+/// Returns the statement unchanged if it already says `OR REPLACE`, and `None`
+/// if it is not a routine definition.
+pub fn with_or_replace(ddl: &str) -> Option<String> {
+    use pg_query::protobuf::Token;
+
+    let scanned = pg_query::scan(ddl).ok()?;
+    let mut tokens = scanned.tokens.iter()
+        .filter(|t| !matches!(t.token(), Token::SqlComment | Token::CComment));
+
+    let create = tokens.next()?;
+    if create.token() != Token::Create {
+        return None;
+    }
+    match tokens.next()?.token() {
+        Token::Function | Token::Procedure => {
+            let at = usize::try_from(create.end).ok()?;
+            let (head, tail) = (ddl.get(..at)?, ddl.get(at..)?);
+            Some(format!("{head} or replace{tail}"))
+        }
+        Token::Or => {
+            let replace = tokens.next()?;
+            let kind = tokens.next()?;
+            (replace.token() == Token::Replace
+                && matches!(kind.token(), Token::Function | Token::Procedure))
+                .then(|| ddl.to_string())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn with_or_replace_rewrites_only_the_create_keyword() {
+        let ddl = "create function api.f(p int)\n  returns int language sql as $$ select p -- create function\n $$;";
+        assert_eq!(
+            with_or_replace(ddl).unwrap(),
+            "create or replace function api.f(p int)\n  returns int language sql as $$ select p -- create function\n $$;",
+        );
+        assert_eq!(
+            with_or_replace("  -- note\n  CREATE PROCEDURE p() LANGUAGE plpgsql AS $$ begin null; end $$").unwrap(),
+            "  -- note\n  CREATE or replace PROCEDURE p() LANGUAGE plpgsql AS $$ begin null; end $$",
+        );
+        assert_eq!(
+            with_or_replace("create /* why */ function f() returns int language sql as 'select 1'").unwrap(),
+            "create or replace /* why */ function f() returns int language sql as 'select 1'",
+        );
+    }
+
+    #[test]
+    fn with_or_replace_leaves_statements_that_already_replace() {
+        for ddl in [
+            "create or replace function f() returns int language sql as 'select 1'",
+            "CREATE OR REPLACE PROCEDURE p() LANGUAGE plpgsql AS $$ begin null; end $$",
+        ] {
+            assert_eq!(with_or_replace(ddl).as_deref(), Some(ddl));
+        }
+    }
+
+    #[test]
+    fn with_or_replace_refuses_anything_that_is_not_a_routine() {
+        for ddl in [
+            "create view v as select 1",
+            "create or replace view v as select 1",
+            "create aggregate a(int) (sfunc = f, stype = int)",
+            "create trigger t before update on x for each row execute function f()",
+            "select 1",
+            "",
+            "create function f( 'unterminated",
+        ] {
+            assert!(with_or_replace(ddl).is_none(), "{ddl}");
+        }
+    }
+
 
     #[test]
     fn test_trigger_identity_includes_table() {

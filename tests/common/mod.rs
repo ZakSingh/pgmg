@@ -458,6 +458,7 @@ pub fn register_cleanup_handlers() {
 pub mod assertions;
 pub mod fixtures;
 pub mod plan_output;
+pub mod evolution;
 
 // Add UUID dependency for unique database names
 use uuid;

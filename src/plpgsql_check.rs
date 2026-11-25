@@ -265,8 +265,9 @@ where
     Ok(errors)
 }
 
-/// Check functions that have soft dependencies on modified functions
-/// These are functions that call the modified functions and need validation
+/// Check routines that reach a modified object at run time: those that call a
+/// modified function, and those that query a modified relation from their body.
+/// They are not recreated, so this is where a change that broke them shows up.
 pub async fn check_soft_dependent_functions<C>(
     client: &C,
     dependency_graph: &crate::analysis::DependencyGraph,
@@ -289,14 +290,13 @@ where
     let mut functions_to_check = std::collections::HashSet::new();
     
     for modified_obj in modified_objects {
-        if matches!(modified_obj.object_type, ObjectType::Function | ObjectType::Procedure) {
-            let obj_ref = ObjectRef::from(*modified_obj);
-            
-            // Get all soft dependents (functions that call this function)
-            for dependent in dependency_graph.soft_dependents_of(&obj_ref) {
-                if matches!(dependent.object_type, ObjectType::Function | ObjectType::Procedure) {
-                    functions_to_check.insert(dependent);
-                }
+        let obj_ref = ObjectRef::from(*modified_obj);
+
+        // Routines that call a modified function, or query a modified view
+        // from their body: left in place, but possibly broken by the change.
+        for dependent in dependency_graph.soft_dependents_of(&obj_ref) {
+            if matches!(dependent.object_type, ObjectType::Function | ObjectType::Procedure) {
+                functions_to_check.insert(dependent);
             }
         }
     }

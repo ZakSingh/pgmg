@@ -598,6 +598,80 @@ impl<'a> StateManager<'a> {
 
         Ok(result)
     }
+
+    /// Find all managed objects that depend on any of the given types or
+    /// domains. As with relations, an unqualified name on either side of the
+    /// comparison means `public`.
+    pub async fn find_dependents_of_types(
+        &self,
+        types: &[QualifiedIdent],
+    ) -> Result<Vec<(ObjectType, String)>, Box<dyn std::error::Error>> {
+        if types.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let types: Vec<String> = types
+            .iter()
+            .map(|t| format!("{}.{}", t.schema.as_deref().unwrap_or("public"), t.name))
+            .collect();
+
+        let rows = self.client.query(
+            r#"
+            SELECT DISTINCT dependent_type, dependent_name
+            FROM pgmg.pgmg_dependencies
+            WHERE dependency_type = 'type'
+            AND CASE WHEN position('.' IN dependency_name) = 0
+                     THEN 'public.' || dependency_name
+                     ELSE dependency_name
+                END = ANY($1)
+            ORDER BY 1, 2
+            "#,
+            &[&types],
+        ).await?;
+
+        Ok(rows.iter()
+            .filter_map(|row| {
+                let dep_type: String = row.get(0);
+                self.string_to_object_type(&dep_type).map(|t| (t, row.get::<_, String>(1)))
+            })
+            .collect())
+    }
+
+    /// Whether dropping `constraint` from `table` could disturb objects that
+    /// exist in the database now: true when something in the catalog depends
+    /// on the constraint itself (a view that groups by a primary key and
+    /// selects other columns does), and also when the table or constraint
+    /// cannot be found, since then nothing is known about it (it may have been
+    /// renamed by an earlier pending migration).
+    ///
+    /// An unqualified table name means `public`, as everywhere in pgmg.
+    pub async fn dropped_constraint_in_use(
+        &self,
+        table: &QualifiedIdent,
+        constraint: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let schema = table.schema.as_deref().unwrap_or("public");
+        let row = self.client.query_one(
+            r#"
+            SELECT
+                count(c.oid) AS found,
+                count(d.objid) AS dependents
+            FROM pg_constraint c
+            JOIN pg_class r ON r.oid = c.conrelid
+            JOIN pg_namespace n ON n.oid = r.relnamespace
+            LEFT JOIN pg_depend d
+                ON d.refclassid = 'pg_constraint'::regclass
+               AND d.refobjid = c.oid
+               AND d.deptype = 'n'
+            WHERE n.nspname = $1 AND r.relname = $2 AND c.conname = $3
+            "#,
+            &[&schema, &table.name, &constraint],
+        ).await?;
+
+        let found: i64 = row.get("found");
+        let dependents: i64 = row.get("dependents");
+        Ok(found == 0 || dependents > 0)
+    }
 }
 
 #[cfg(test)]
