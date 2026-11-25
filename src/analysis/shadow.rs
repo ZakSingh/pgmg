@@ -14,6 +14,8 @@
 //! - for every table a pending migration adds columns to, an empty copy of
 //!   the table with those columns added (and the types the migrations create,
 //!   so a new column can be of a new type);
+//! - for every table a pending migration creates, an empty table with the
+//!   same columns;
 //! - for every view or materialized view the plan creates or updates, a plain
 //!   view with the new definition, pointed at the stand-ins.
 //!
@@ -89,93 +91,118 @@ async fn build(
     let mut shadowed: HashSet<(String, String)> = HashSet::new();
     let mut schemas: HashSet<String> = HashSet::new();
 
-    // Types the migrations create, so an added column can be of one. They are
+    let parsed: Vec<_> = migrations.iter().filter_map(|content| pg_query::parse(content).ok()).collect();
+    let statements = || {
+        parsed.iter()
+            .flat_map(|migration| migration.protobuf.stmts.iter())
+            .filter_map(|stmt| stmt.stmt.as_ref()?.node.as_ref())
+    };
+
+    // Types the migrations create, so a new column can be of one. They are
     // created under their real names: nothing existing is touched or locked,
     // and the rollback removes them.
-    for content in migrations {
-        let Ok(parsed) = pg_query::parse(content) else { continue };
-        for stmt in &parsed.protobuf.stmts {
-            let Some(node) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else { continue };
-            if matches!(
-                node,
-                NodeEnum::CreateEnumStmt(_) | NodeEnum::CompositeTypeStmt(_) | NodeEnum::CreateDomainStmt(_)
-            ) {
-                if let Ok(sql) = node.deparse() {
-                    step(client, &sql).await;
-                }
+    for node in statements() {
+        if matches!(
+            node,
+            NodeEnum::CreateEnumStmt(_) | NodeEnum::CompositeTypeStmt(_) | NodeEnum::CreateDomainStmt(_)
+        ) {
+            if let Ok(sql) = node.deparse() {
+                step(client, &sql).await;
             }
         }
     }
 
-    // Tables that gain columns.
-    for content in migrations {
-        let Ok(parsed) = pg_query::parse(content) else { continue };
-        for stmt in &parsed.protobuf.stmts {
-            let Some(NodeEnum::AlterTableStmt(alter)) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
-                continue;
-            };
-            let Some(add_columns) = add_columns_only(alter) else { continue };
-            let Some(relation) = &alter.relation else { continue };
-            let spelled = introspect::quote_qualified_identifier(
-                (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str()),
-                &relation.relname,
-            );
-            let row = client
-                .query_opt(
-                    "SELECT n.nspname, c.relname FROM pg_class c \
-                     JOIN pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE c.oid = to_regclass($1)",
-                    &[&spelled],
-                )
-                .await?;
-            // A table the migration itself creates has nothing to copy.
-            let Some(row) = row else { continue };
-            let (schema, name): (String, String) = (row.get(0), row.get(1));
-            let shadow = shadow_schema(&schema);
+    // Where a migration's unqualified table names land.
+    let default_schema: Option<String> = client.query_one("SELECT current_schema()::text", &[]).await?.get(0);
+    let schema_of = |relation: &pg_query::protobuf::RangeVar| {
+        if relation.schemaname.is_empty() { default_schema.clone() } else { Some(relation.schemaname.clone()) }
+    };
 
-            if schemas.insert(schema.clone())
-                && !step(client, &format!("CREATE SCHEMA {}", quote_identifier(&shadow))).await
-            {
-                // Without the right to create schemas nothing below can work.
-                return Ok(HashMap::new());
-            }
-            if !shadowed.contains(&(schema.clone(), name.clone())) {
-                let copy = format!(
-                    "CREATE TABLE {}.{} (LIKE {}.{})",
-                    quote_identifier(&shadow),
-                    quote_identifier(&name),
-                    quote_identifier(&schema),
-                    quote_identifier(&name),
-                );
-                if !step(client, &copy).await {
+    // Tables the migrations create or add columns to, in statement order, so
+    // a table created by one statement can gain columns from a later one.
+    for node in statements() {
+        match node {
+            NodeEnum::CreateStmt(create) => {
+                let Some(mut table) = stand_in_table(create) else { continue };
+                let Some(relation) = table.relation.as_mut() else { continue };
+                let Some(schema) = schema_of(relation) else { continue };
+                let name = relation.relname.clone();
+                // `CREATE TABLE IF NOT EXISTS` over a table that is already
+                // there creates nothing; a stand-in would hide the real shape.
+                if shadowed.contains(&(schema.clone(), name.clone()))
+                    || existing_relation(client, Some(&schema), &name).await?.is_some()
+                {
                     continue;
                 }
-                shadowed.insert((schema.clone(), name.clone()));
+                if !ensure_shadow_schema(client, &mut schemas, &schema).await {
+                    return Ok(HashMap::new());
+                }
+                relation.schemaname = shadow_schema(&schema);
+                if let Ok(sql) = NodeEnum::CreateStmt(table).deparse() {
+                    if step(client, &sql).await {
+                        shadowed.insert((schema, name));
+                    }
+                }
             }
+            NodeEnum::AlterTableStmt(alter) => {
+                let Some(add_columns) = add_columns_only(alter) else { continue };
+                let Some(relation) = &alter.relation else { continue };
 
-            let mut add = add_columns;
-            if let Some(relation) = add.relation.as_mut() {
-                relation.schemaname = shadow.clone();
-                relation.relname = name.clone();
+                // A table created earlier in the batch already has its
+                // stand-in; an existing one gets an empty copy.
+                let created = schema_of(relation)
+                    .map(|schema| (schema, relation.relname.clone()))
+                    .filter(|key| shadowed.contains(key));
+                let (schema, name) = match created {
+                    Some(key) => key,
+                    None => {
+                        let schema = (!relation.schemaname.is_empty()).then_some(relation.schemaname.as_str());
+                        let Some((schema, name)) = existing_relation(client, schema, &relation.relname).await? else {
+                            continue;
+                        };
+                        if !ensure_shadow_schema(client, &mut schemas, &schema).await {
+                            return Ok(HashMap::new());
+                        }
+                        if !shadowed.contains(&(schema.clone(), name.clone())) {
+                            let copy = format!(
+                                "CREATE TABLE {}.{} (LIKE {}.{})",
+                                quote_identifier(&shadow_schema(&schema)),
+                                quote_identifier(&name),
+                                quote_identifier(&schema),
+                                quote_identifier(&name),
+                            );
+                            if !step(client, &copy).await {
+                                continue;
+                            }
+                            shadowed.insert((schema.clone(), name.clone()));
+                        }
+                        (schema, name)
+                    }
+                };
+                let shadow = shadow_schema(&schema);
+
+                let mut add = add_columns;
+                if let Some(relation) = add.relation.as_mut() {
+                    relation.schemaname = shadow.clone();
+                    relation.relname = name.clone();
+                }
+                let added = match NodeEnum::AlterTableStmt(add).deparse() {
+                    Ok(sql) => step(client, &sql).await,
+                    Err(_) => false,
+                };
+                if !added {
+                    // A stand-in missing a column would under-report shapes.
+                    step(client, &format!("DROP TABLE {}.{}", quote_identifier(&shadow), quote_identifier(&name))).await;
+                    shadowed.remove(&(schema, name));
+                }
             }
-            let added = match NodeEnum::AlterTableStmt(add).deparse() {
-                Ok(sql) => step(client, &sql).await,
-                Err(_) => false,
-            };
-            if !added {
-                // A stand-in missing a column would under-report shapes.
-                step(client, &format!("DROP TABLE {}.{}", quote_identifier(&shadow), quote_identifier(&name))).await;
-                shadowed.remove(&(schema, name));
-            }
+            _ => {}
         }
     }
 
     // Views, in whatever order lets each find the ones it reads from.
     for view in views {
-        let schema = view_schema(view).to_string();
-        if schemas.insert(schema.clone())
-            && !step(client, &format!("CREATE SCHEMA {}", quote_identifier(&shadow_schema(&schema)))).await
-        {
+        if !ensure_shadow_schema(client, &mut schemas, view_schema(view)).await {
             return Ok(HashMap::new());
         }
     }
@@ -233,6 +260,33 @@ async fn build(
     Ok(shapes)
 }
 
+/// Create the scratch schema standing in for `schema` unless it exists
+/// already. False when it cannot be created: without the right to create
+/// schemas nothing else here can work.
+async fn ensure_shadow_schema(client: &Client, schemas: &mut HashSet<String>, schema: &str) -> bool {
+    !schemas.insert(schema.to_string())
+        || step(client, &format!("CREATE SCHEMA {}", quote_identifier(&shadow_schema(schema)))).await
+}
+
+/// The (schema, name) of an existing relation as the catalog has it, resolving
+/// an unqualified name along the search path.
+async fn existing_relation(
+    client: &Client,
+    schema: Option<&str>,
+    name: &str,
+) -> Result<Option<(String, String)>, tokio_postgres::Error> {
+    let spelled = introspect::quote_qualified_identifier(schema, name);
+    let row = client
+        .query_opt(
+            "SELECT n.nspname, c.relname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.oid = to_regclass($1)",
+            &[&spelled],
+        )
+        .await?;
+    Ok(row.map(|row| (row.get(0), row.get(1))))
+}
+
 fn view_schema(view: &SqlObject) -> &str {
     view.qualified_name.schema.as_deref().unwrap_or("public")
 }
@@ -263,17 +317,58 @@ fn add_columns_only(alter: &pg_query::protobuf::AlterTableStmt) -> Option<pg_que
             let Some(NodeEnum::ColumnDef(column)) = cmd.def.as_mut().and_then(|def| def.node.as_mut()) else {
                 return None;
             };
-            column.constraints.clear();
-            column.raw_default = None;
-            column.cooked_default = None;
-            column.identity_sequence = None;
-            column.identity.clear();
-            column.generated.clear();
-            column.is_not_null = false;
+            strip_to_name_and_type(column);
             Some(pg_query::protobuf::Node { node: Some(NodeEnum::AlterTableCmd(cmd)) })
         })
         .collect();
     (!out.cmds.is_empty()).then_some(out)
+}
+
+fn strip_to_name_and_type(column: &mut pg_query::protobuf::ColumnDef) {
+    column.constraints.clear();
+    column.raw_default = None;
+    column.cooked_default = None;
+    column.identity_sequence = None;
+    column.identity.clear();
+    column.generated.clear();
+    column.is_not_null = false;
+}
+
+/// A `CREATE TABLE` reduced to column names and types (and `LIKE` clauses),
+/// or `None` for a table whose columns are not spelled out in the statement
+/// (a partition, an inheritance child, a typed table) or that is temporary.
+/// Constraints, defaults and partitioning are dropped for the same reason as
+/// in [`add_columns_only`].
+fn stand_in_table(create: &pg_query::protobuf::CreateStmt) -> Option<pg_query::protobuf::CreateStmt> {
+    let relation = create.relation.as_ref()?;
+    if !create.inh_relations.is_empty()
+        || create.partbound.is_some()
+        || create.of_typename.is_some()
+        || relation.relpersistence == "t"
+    {
+        return None;
+    }
+    let mut out = create.clone();
+    out.if_not_exists = false;
+    out.partspec = None;
+    out.constraints.clear();
+    out.options.clear();
+    out.tablespacename.clear();
+    out.access_method.clear();
+    out.table_elts = create
+        .table_elts
+        .iter()
+        .filter_map(|element| match &element.node {
+            Some(NodeEnum::ColumnDef(column)) => {
+                let mut column = column.clone();
+                strip_to_name_and_type(&mut column);
+                Some(pg_query::protobuf::Node { node: Some(NodeEnum::ColumnDef(column)) })
+            }
+            Some(NodeEnum::TableLikeClause(_)) => Some(element.clone()),
+            _ => None,
+        })
+        .collect();
+    (!out.table_elts.is_empty()).then_some(out)
 }
 
 /// `CREATE VIEW` for a view's stand-in: its new defining query with references
@@ -379,6 +474,43 @@ mod tests {
         assert!(lower.contains("bnpl") && lower.contains("ref"), "{sql}");
         assert!(!lower.contains("default") && !lower.contains("references") && !lower.contains("legacy"), "{sql}");
         assert!(!lower.contains("not null"), "{sql}");
+    }
+
+    fn stand_in(sql: &str) -> Option<String> {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(NodeEnum::CreateStmt(create)) = parsed.protobuf.stmts[0].stmt.as_ref().and_then(|s| s.node.clone())
+        else {
+            panic!("not a CREATE TABLE");
+        };
+        stand_in_table(&create).map(|table| NodeEnum::CreateStmt(table).deparse().unwrap().to_lowercase())
+    }
+
+    #[test]
+    fn stand_in_table_keeps_names_and_types() {
+        let sql = stand_in(
+            "CREATE TABLE IF NOT EXISTS core.note (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+             listing_id int NOT NULL REFERENCES listing (id), body text DEFAULT '', \
+             CONSTRAINT body_len CHECK (length(body) < 100), UNIQUE (listing_id)) PARTITION BY HASH (id)",
+        ).unwrap();
+        for kept in ["core.note", "id bigint", "listing_id int", "body text"] {
+            assert!(sql.contains(kept), "{kept} missing from {sql}");
+        }
+        for dropped in ["references", "default", "check", "unique", "primary", "identity", "partition", "not null", "if not exists"] {
+            assert!(!sql.contains(dropped), "{dropped} left in {sql}");
+        }
+    }
+
+    #[test]
+    fn stand_in_table_skips_tables_without_their_own_column_list() {
+        for sql in [
+            "CREATE TABLE note_1 PARTITION OF note FOR VALUES WITH (MODULUS 2, REMAINDER 0)",
+            "CREATE TABLE child () INHERITS (parent)",
+            "CREATE TABLE typed OF some_type",
+            "CREATE TEMP TABLE scratch (id int)",
+            "CREATE TABLE empty ()",
+        ] {
+            assert!(stand_in(sql).is_none(), "{sql}");
+        }
     }
 
     #[test]

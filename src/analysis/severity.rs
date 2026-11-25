@@ -85,42 +85,30 @@ pub fn classify_delete(object_type: &ObjectType, _object_name: &str) -> Severity
 /// `Breaking`; this adds the defaults. The returned severity is the one a
 /// DROP + CREATE would have; a routine that is in the end replaced in place
 /// keeps its OID and is `Safe`.
+///
+/// A routine installed with a SQL-standard body is only replaceable by
+/// another one. Its body is bound to everything it references, and pgmg
+/// decides what a routine is bound to (and so whether it must be dropped for
+/// a migration or a deletion) from the new definition; a string body there
+/// would hide the bindings of the one that is actually installed.
 pub async fn classify_routine_edit<C: GenericClient>(client: &C, object: &SqlObject) -> (Severity, bool) {
     let Some(new) = extract_routine_interface(&object.ddl_statement) else {
         return (breaking_warn(object, "could not parse routine interface from DDL"), false);
     };
-    let prokind = if object.object_type == ObjectType::Procedure { "p" } else { "f" };
-    let severity = match classify_routine_against_catalog(client, object, prokind, &new).await {
-        RoutineChange::Identical => Severity::Transient,
+    let Some(info) = lookup_routine(client, object).await else {
+        return (Severity::Breaking, false);
+    };
+    match classify_routine_against_catalog(client, object, &info, &new).await {
+        RoutineChange::Identical => {}
         // An extended interface is a different routine to PostgreSQL: it has
         // to be dropped and created, never replaced.
         RoutineChange::Extended => return (Severity::Transient, false),
         RoutineChange::Breaking => return (Severity::Breaking, false),
-    };
-    let Some(new_defaults) = count_parameter_defaults(&object.ddl_statement) else {
-        return (severity, false);
-    };
-    let old_defaults = match introspect::get_routine_catalog_info(
-        client, object_schema(object), &object.qualified_name.name, prokind,
-    ).await {
-        Ok(Some(info)) => info.nargdefaults as usize,
-        _ => return (severity, false),
-    };
+    }
     // "cannot remove parameter defaults from existing function"
-    (severity, new_defaults >= old_defaults)
-}
-
-/// Number of parameters with a DEFAULT in a CREATE FUNCTION / PROCEDURE.
-fn count_parameter_defaults(ddl: &str) -> Option<usize> {
-    let parsed = pg_query::parse(ddl).ok()?;
-    let stmt = parsed.protobuf.stmts.first()?.stmt.as_ref()?;
-    let Some(pg_query::NodeEnum::CreateFunctionStmt(func)) = &stmt.node else {
-        return None;
-    };
-    Some(func.parameters.iter().filter(|param| matches!(
-        &param.node,
-        Some(pg_query::NodeEnum::FunctionParameter(fp)) if fp.defexpr.is_some()
-    )).count())
+    let keeps_defaults = new.defaults >= info.nargdefaults.max(0) as usize;
+    let keeps_bindings_visible = !info.has_sql_body || crate::sql::has_sql_standard_body(&object.ddl_statement);
+    (Severity::Transient, keeps_defaults && keeps_bindings_visible)
 }
 
 /// Classify an update applied as DROP + CREATE, where the best case for a
@@ -274,25 +262,52 @@ async fn classify_routine_update<C: GenericClient>(client: &C, object: &SqlObjec
     let Some(new) = extract_routine_interface(&object.ddl_statement) else {
         return breaking_warn(object, "could not parse routine interface from DDL");
     };
-    let prokind = if object.object_type == ObjectType::Procedure { "p" } else { "f" };
-    match classify_routine_against_catalog(client, object, prokind, &new).await {
+    let Some(info) = lookup_routine(client, object).await else {
+        return Severity::Breaking;
+    };
+    match classify_routine_against_catalog(client, object, &info, &new).await {
         RoutineChange::Identical | RoutineChange::Extended => Severity::Transient,
         RoutineChange::Breaking => Severity::Breaking,
     }
 }
 
+fn routine_prokind(object: &SqlObject) -> &'static str {
+    if object.object_type == ObjectType::Procedure { "p" } else { "f" }
+}
+
+/// The live pg_proc row of a managed routine, or `None` (with a warning) when
+/// it cannot be identified.
+async fn lookup_routine<C: GenericClient>(client: &C, object: &SqlObject) -> Option<introspect::RoutineCatalogInfo> {
+    let lookup = introspect::get_routine_catalog_info(
+        client, object_schema(object), &object.qualified_name.name, routine_prokind(object),
+    ).await;
+    match lookup {
+        Ok(Some(info)) => Some(info),
+        Ok(None) => {
+            breaking_warn(object, "existing routine not found (or overloaded) in catalog");
+            None
+        }
+        Err(e) => {
+            breaking_warn(object, &format!("catalog lookup failed: {e}"));
+            None
+        }
+    }
+}
+
+/// A comparison that could not be carried out: warn and assume the worst.
+fn unclassifiable(object: &SqlObject, why: &str) -> RoutineChange {
+    breaking_warn(object, why);
+    RoutineChange::Breaking
+}
+
 async fn classify_routine_against_catalog<C: GenericClient>(
     client: &C,
     object: &SqlObject,
-    prokind: &str,
+    info: &introspect::RoutineCatalogInfo,
     new: &RoutineInterface,
 ) -> RoutineChange {
     let schema = object_schema(object);
-    let info = match introspect::get_routine_catalog_info(client, schema, &object.qualified_name.name, prokind).await {
-        Ok(Some(info)) => info,
-        Ok(None) => return breaking(breaking_warn(object, "existing routine not found (or overloaded) in catalog")),
-        Err(e) => return breaking(breaking_warn(object, &format!("catalog lookup failed: {e}"))),
-    };
+    let prokind = routine_prokind(object);
 
     // Identity arguments: resolve the new signature through to_regprocedure;
     // hitting the same OID means the identity argument types are unchanged.
@@ -321,10 +336,10 @@ async fn classify_routine_against_catalog<C: GenericClient>(
             match introspect::resolve_regprocedure(client, &old_signature).await {
                 Ok(Some(oid)) if oid == info.oid => extended = true,
                 Ok(_) => return RoutineChange::Breaking,
-                Err(e) => return breaking(breaking_warn(object, &format!("signature resolution failed: {e}"))),
+                Err(e) => return unclassifiable(object, &format!("signature resolution failed: {e}")),
             }
         }
-        Err(e) => return breaking(breaking_warn(object, &format!("signature resolution failed: {e}"))),
+        Err(e) => return unclassifiable(object, &format!("signature resolution failed: {e}")),
     }
 
     // Parameter renames break clients using named notation. Only names that
@@ -345,10 +360,10 @@ async fn classify_routine_against_catalog<C: GenericClient>(
         let new_types: Vec<String> = new.out_cols.iter().map(|(_, t)| t.clone()).collect();
         let new_oids = match introspect::resolve_types(client, &new_types).await {
             Ok(oids) => oids,
-            Err(e) => return breaking(breaking_warn(object, &format!("type resolution failed: {e}"))),
+            Err(e) => return unclassifiable(object, &format!("type resolution failed: {e}")),
         };
         if new_oids.iter().any(|o| o.is_none()) {
-            return breaking(breaking_warn(object, "could not resolve an output parameter type"));
+            return unclassifiable(object, "could not resolve an output parameter type");
         }
         let new_out: Vec<(String, u32)> = new
             .out_cols
@@ -374,14 +389,14 @@ async fn classify_routine_against_catalog<C: GenericClient>(
                     Ok(oids) => match oids.first().copied().flatten() {
                         Some(oid) if oid == info.rettype => {}
                         Some(_) => return RoutineChange::Breaking,
-                        None => return breaking(breaking_warn(object, "could not resolve the return type")),
+                        None => return unclassifiable(object, "could not resolve the return type"),
                     },
-                    Err(e) => return breaking(breaking_warn(object, &format!("type resolution failed: {e}"))),
+                    Err(e) => return unclassifiable(object, &format!("type resolution failed: {e}")),
                 }
             }
             // Procedures have no RETURNS clause; both sides are void.
             None if prokind == "p" => {}
-            None => return breaking(breaking_warn(object, "routine has no parseable return type")),
+            None => return unclassifiable(object, "routine has no parseable return type"),
         }
     }
 
@@ -391,11 +406,6 @@ async fn classify_routine_against_catalog<C: GenericClient>(
         RoutineChange::Identical
     }
 }
-
-fn breaking(_: Severity) -> RoutineChange {
-    RoutineChange::Breaking
-}
-
 
 // ---------------------------------------------------------------------------
 // Aggregates

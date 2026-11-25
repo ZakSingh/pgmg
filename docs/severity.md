@@ -144,12 +144,14 @@ A migration's severity is the worst of its statements:
   migration adds (or a column a view upstream of it gains) cannot be prepared
   before the apply. For views that would otherwise be `breaking`, pgmg builds
   the post-apply shapes in scratch schemas named `pgmg_shadow__*`: empty copies
-  of the altered tables with the new columns, the types the migrations create,
-  and the plan's new and changed views on top. This happens in a transaction
+  of the altered tables with the new columns, empty versions of the tables the
+  migrations create, the types the migrations create, and the plan's new and
+  changed views on top. This happens in a transaction
   that is always rolled back and takes no lock stronger than `ACCESS SHARE` on
   an existing object. It needs the `CREATE` privilege on the database; without
-  it, or when a stand-in cannot be built (the view uses a table the migration
-  creates, or an enum label it adds), the view stays `breaking`.
+  it, or when a stand-in cannot be built (the view uses a partition or
+  `CREATE TABLE AS` table the migration creates, or an enum label it adds),
+  the view stays `breaking`.
 - **Cascade recreations are probed against pre-apply state.** When a
   migration alters a table in a way that requires it (see "Which table changes
   recreate dependents" in the README) or an upstream object changes, dependent

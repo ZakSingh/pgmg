@@ -102,6 +102,10 @@ impl DependencyGraph {
                 None
             };
 
+            let sql_standard_body = routine_header.is_none()
+                && matches!(obj.object_type, ObjectType::Function | ObjectType::Procedure)
+                && crate::sql::has_sql_standard_body(&obj.ddl_statement);
+
             // Add edges for relation dependencies
             for dep in &filtered_deps.relations {
                 // Relations could be tables, views, or materialized views
@@ -139,6 +143,9 @@ impl DependencyGraph {
 
                     // Determine dependency type based on the dependent object type
                     let dep_type = match &obj.object_type {
+                        // A SQL-standard body is parsed at creation, so the
+                        // catalog ties the routine to every function it calls.
+                        ObjectType::Function | ObjectType::Procedure if sql_standard_body => structural,
                         // Functions/procedures calling other functions/procedures use runtime lookup
                         ObjectType::Function | ObjectType::Procedure => DependencyType::Soft,
                         // Views, triggers, and other objects have structural dependencies
@@ -261,13 +268,6 @@ impl DependencyGraph {
         }
     }
 
-    /// Find all objects that must be recreated because the given objects are
-    /// being dropped and recreated. Shorthand for [`Self::recreation_set`]
-    /// with nothing merely stale.
-    pub fn affected_by_changes(&self, changed_objects: &[ObjectRef]) -> Vec<ObjectRef> {
-        self.recreation_set(changed_objects, &[])
-    }
-
     /// Work out which objects must be dropped and recreated, given
     ///
     /// - `dropped`: objects that are being dropped and recreated, and
@@ -283,17 +283,16 @@ impl DependencyGraph {
     ///    computed when it was built. If anything it is derived from changes,
     ///    even something that itself stays in place, those values are out of
     ///    date, so it is rebuilt (and what is bound to it follows by rule 1).
-    ///    "Derived from" follows `Hard` and `LateBound` edges from both
-    ///    `dropped` and `stale`.
+    ///    "Derived from" follows every edge from both `dropped` and `stale`:
+    ///    a function that calls a changed function computes something else
+    ///    now, just like one that queries a changed view.
     ///
     /// Returns the objects to recreate, excluding `dropped` themselves. A
     /// member of `stale` is returned if it turns out to be bound to something
     /// dropped, in which case it cannot stay in place after all.
     pub fn recreation_set(&self, dropped: &[ObjectRef], stale: &[ObjectRef]) -> Vec<ObjectRef> {
         let changed: Vec<ObjectRef> = dropped.iter().chain(stale).cloned().collect();
-        let outdated = self.reachable(&changed, |dep_type| {
-            matches!(dep_type, DependencyType::Hard | DependencyType::LateBound)
-        });
+        let outdated = self.reachable(&changed, |_| true);
 
         let mut seeds: Vec<ObjectRef> = dropped.to_vec();
         seeds.extend(outdated.into_iter().filter(|obj| {
@@ -347,11 +346,6 @@ impl DependencyGraph {
         seen
     }
 
-    /// Get all dependents including soft dependencies (for visualization and checks)
-    pub fn all_dependents_of(&self, object_ref: &ObjectRef) -> Vec<ObjectRef> {
-        self.dependents_of(object_ref)
-    }
-    
     /// Get dependents that look this object up at run time (`Soft` and
     /// `LateBound` edges): routines to check but not recreate.
     pub fn soft_dependents_of(&self, object_ref: &ObjectRef) -> Vec<ObjectRef> {
@@ -539,13 +533,13 @@ mod tests {
         let job = ObjectRef::new(ObjectType::CronJob, QualifiedIdent::from_name("refresh_counts_job".to_string()));
 
         // Changing the function recreates the view that embeds it, not the job.
-        let affected = graph.affected_by_changes(&[function.clone()]);
+        let affected = graph.recreation_set(&[function.clone()], &[]);
         assert!(affected.contains(&report));
         assert!(!affected.contains(&job), "cron job must not be recreated for a function change");
 
         // Changing the relation the job's command names does not reach the job either,
         // even though it does reach the function (and through it the report view).
-        let affected = graph.affected_by_changes(&[counts.clone()]);
+        let affected = graph.recreation_set(&[counts.clone()], &[]);
         assert!(affected.contains(&function));
         assert!(affected.contains(&report));
         assert!(!affected.contains(&job), "cron job must not be recreated for a relation change");
@@ -639,7 +633,7 @@ mod tests {
             QualifiedIdent::from_name("users".to_string())
         );
 
-        let affected = graph.affected_by_changes(&[users_ref]);
+        let affected = graph.recreation_set(&[users_ref], &[]);
         
         // Should include both user_stats and user_summary (transitively)
         assert_eq!(affected.len(), 2);
@@ -710,7 +704,7 @@ mod tests {
         // but the materialized view storing its results is out of date, and
         // that view's index goes with it.
         assert_eq!(
-            names(graph.affected_by_changes(&[orders.clone()])),
+            names(graph.recreation_set(&[orders.clone()], &[])),
             vec!["list_orders", "order_ids", "order_stats", "order_stats_idx", "order_total"],
         );
 
@@ -784,14 +778,14 @@ mod tests {
         ];
         let graph = DependencyGraph::build_from_objects(&objects, &BuiltinCatalog::new()).unwrap();
 
-        assert_eq!(names(graph.affected_by_changes(&[obj_ref(ObjectType::Type, "money_pair")])), vec!["uses_type"]);
-        assert_eq!(names(graph.affected_by_changes(&[obj_ref(ObjectType::View, "prices")])), vec!["uses_rowtype"]);
+        assert_eq!(names(graph.recreation_set(&[obj_ref(ObjectType::Type, "money_pair")], &[])), vec!["uses_type"]);
+        assert_eq!(names(graph.recreation_set(&[obj_ref(ObjectType::View, "prices")], &[])), vec!["uses_rowtype"]);
         // (uses_rowtype also queries nothing, but its relation edge is
         // late-bound alongside the binding type edge; re-checking it is harmless.)
         assert!(names(graph.soft_dependents_of(&obj_ref(ObjectType::View, "prices"))).contains(&"purge".to_string()));
-        assert!(!graph.affected_by_changes(&[obj_ref(ObjectType::View, "prices")]).contains(&obj_ref(ObjectType::Procedure, "purge")));
+        assert!(!graph.recreation_set(&[obj_ref(ObjectType::View, "prices")], &[]).contains(&obj_ref(ObjectType::Procedure, "purge")));
         assert_eq!(names(graph.soft_dependents_of(&obj_ref(ObjectType::Function, "uses_type"))), vec!["calls"]);
-        assert!(graph.affected_by_changes(&[obj_ref(ObjectType::Function, "uses_type")]).is_empty());
+        assert!(graph.recreation_set(&[obj_ref(ObjectType::Function, "uses_type")], &[]).is_empty());
     }
 
     #[test]
@@ -834,7 +828,7 @@ mod tests {
         );
 
         // Check affected by changes (only hard dependencies)
-        let affected = graph.affected_by_changes(&[func1_ref.clone()]);
+        let affected = graph.recreation_set(&[func1_ref.clone()], &[]);
         
         // Should only include view1 (hard dependency), not func2 (soft dependency)
         assert_eq!(affected.len(), 1);
@@ -847,7 +841,7 @@ mod tests {
         assert!(soft_deps.iter().any(|obj| obj.qualified_name.name == "func2"));
         
         // Check hard dependents
-        let hard_deps = graph.affected_by_changes(&[func1_ref.clone()]);
+        let hard_deps = graph.recreation_set(&[func1_ref.clone()], &[]);
         assert_eq!(hard_deps.len(), 1);
         assert!(hard_deps.iter().any(|obj| obj.qualified_name.name == "view1"));
     }

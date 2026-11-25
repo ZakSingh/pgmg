@@ -68,6 +68,41 @@ pub fn routine_header_identifiers(ddl: &str) -> Option<HashSet<String>> {
     Some(identifiers)
 }
 
+/// The single CREATE FUNCTION / PROCEDURE statement `ddl` consists of, if any.
+fn create_function_stmt(ddl: &str) -> Option<pg_query::protobuf::CreateFunctionStmt> {
+    let parsed = pg_query::parse(ddl).ok()?;
+    let mut stmts = parsed.protobuf.stmts.iter().filter_map(|s| s.stmt.as_ref()?.node.as_ref());
+    match (stmts.next(), stmts.next()) {
+        (Some(NodeEnum::CreateFunctionStmt(func)), None) => Some((**func).clone()),
+        _ => None,
+    }
+}
+
+/// True when `ddl` is a routine with a SQL-standard body (`BEGIN ATOMIC ...
+/// END` or `RETURN expr`). PostgreSQL parses such a body when the routine is
+/// created and records everything it references, functions included, as a
+/// dependency of the routine.
+pub fn has_sql_standard_body(ddl: &str) -> bool {
+    create_function_stmt(ddl).is_some_and(|func| func.sql_body.is_some())
+}
+
+/// True when `ddl` is a `LANGUAGE sql` routine with a string body. Nothing
+/// binds it to what the body references, but PostgreSQL validates the body
+/// against the catalog whenever the routine is created or replaced, which is
+/// how pgmg re-checks one it left in place.
+pub fn is_sql_language_routine(ddl: &str) -> bool {
+    create_function_stmt(ddl).is_some_and(|func| {
+        func.sql_body.is_none()
+            && func.options.iter().any(|option| match &option.node {
+                Some(NodeEnum::DefElem(def)) if def.defname == "language" => matches!(
+                    def.arg.as_ref().and_then(|arg| arg.node.as_ref()),
+                    Some(NodeEnum::String(language)) if language.sval.eq_ignore_ascii_case("sql")
+                ),
+                _ => false,
+            })
+    })
+}
+
 /// True when `ddl` is a routine whose body PostgreSQL parses at call time.
 pub fn has_late_bound_body(ddl: &str) -> bool {
     routine_header_identifiers(ddl).is_some()
@@ -167,6 +202,25 @@ mod tests {
             "create procedure p() language plpgsql as $$ begin delete from listing; end $$",
         ] {
             assert!(references_only_from_body(ddl, "listing"), "{ddl}");
+        }
+    }
+
+    #[test]
+    fn body_kinds_are_told_apart() {
+        for (ddl, sql_standard, sql_string) in [
+            ("create function f() returns int language sql as $$ select 1 $$", false, true),
+            ("create or replace function f() returns int LANGUAGE SQL stable as 'select 1'", false, true),
+            ("create procedure p() language sql as $$ delete from t $$", false, true),
+            ("create function f() returns int language plpgsql as $$ begin return 1; end $$", false, false),
+            ("create function f() returns int language sql begin atomic select 1; end", true, false),
+            ("create function f() returns int language sql return 1", true, false),
+            // SQL is the default language of a SQL-standard body.
+            ("create function f() returns int return 1", true, false),
+            ("create view v as select 1", false, false),
+            ("create function f( returns int", false, false),
+        ] {
+            assert_eq!(has_sql_standard_body(ddl), sql_standard, "{ddl}");
+            assert_eq!(is_sql_language_routine(ddl), sql_string, "{ddl}");
         }
     }
 

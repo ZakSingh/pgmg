@@ -116,6 +116,28 @@ pub fn extract_dependencies_from_parse_result_with_sql(parse_result: &pg_query::
                         functions.insert(func_ident);
                     }
                     
+                    // A SQL-standard body (BEGIN ATOMIC ... END / RETURN expr)
+                    // arrives parsed; pg_query's table and function walkers do
+                    // not descend into it.
+                    if let Some(body) = &create_func.sql_body {
+                        let body_statements = pg_query::protobuf::ParseResult {
+                            version: parse_result.version,
+                            stmts: sql_standard_body_statements(body)
+                                .into_iter()
+                                .map(|stmt| pg_query::protobuf::RawStmt {
+                                    stmt: Some(Box::new(stmt)),
+                                    stmt_location: 0,
+                                    stmt_len: 0,
+                                })
+                                .collect(),
+                        };
+                        if let Ok(body_deps) = extract_dependencies_from_parse_result(&body_statements) {
+                            relations.extend(body_deps.relations);
+                            functions.extend(body_deps.functions);
+                            types.extend(body_deps.types);
+                        }
+                    }
+
                     if is_language_sql_function(create_func) {
                         if let Some(sql_body) = extract_sql_function_body(create_func) {
                             // Split the SQL body into individual statements and analyze each one
@@ -225,6 +247,26 @@ pub fn filter_builtins(deps: Dependencies, catalog: &BuiltinCatalog) -> Dependen
         types: deps.types.into_iter()
             .filter(|typ| !catalog.types.contains(typ))
             .collect(),
+    }
+}
+
+/// The statements of a SQL-standard routine body. `BEGIN ATOMIC` holds them in
+/// (nested) lists; `RETURN expr` is turned into `SELECT expr` so it can be
+/// analyzed like any other statement.
+fn sql_standard_body_statements(body: &pg_query::protobuf::Node) -> Vec<pg_query::protobuf::Node> {
+    use pg_query::protobuf::{Node, ResTarget, SelectStmt};
+    match &body.node {
+        Some(NodeEnum::List(list)) => list.items.iter().flat_map(sql_standard_body_statements).collect(),
+        Some(NodeEnum::ReturnStmt(ret)) => {
+            let target = ResTarget { val: ret.returnval.clone(), ..Default::default() };
+            let select = SelectStmt {
+                target_list: vec![Node { node: Some(NodeEnum::ResTarget(Box::new(target))) }],
+                ..Default::default()
+            };
+            vec![Node { node: Some(NodeEnum::SelectStmt(Box::new(select))) }]
+        }
+        Some(_) => vec![body.clone()],
+        None => Vec::new(),
     }
 }
 
@@ -1341,6 +1383,27 @@ fn extract_type_name_from_node(node: &pg_query::protobuf::Node) -> Option<Qualif
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_standard_bodies_are_analyzed() {
+        let has = |set: &HashSet<QualifiedIdent>, name: &str| set.iter().any(|ident| ident.name == name);
+
+        let deps = analyze_statement(
+            "create function f(p int) returns bigint language sql begin atomic \
+             insert into audit (n) values (p); \
+             select count(*) + helper(p) from core.listing l join seller s on s.id = l.seller_id; end",
+        ).unwrap();
+        for relation in ["audit", "listing", "seller"] {
+            assert!(has(&deps.relations, relation), "{relation} missing from {:?}", deps.relations);
+        }
+        assert!(has(&deps.functions, "helper"), "{:?}", deps.functions);
+
+        let deps = analyze_statement(
+            "create function g() returns int language sql return (select max(id) from listing) + helper(1)",
+        ).unwrap();
+        assert!(has(&deps.relations, "listing"), "{:?}", deps.relations);
+        assert!(has(&deps.functions, "helper"), "{:?}", deps.functions);
+    }
 
     #[test]
     fn test_basic_type_cast() {

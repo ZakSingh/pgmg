@@ -101,6 +101,9 @@ pub struct RoutineCatalogInfo {
     pub nargdefaults: i16,
     /// How many input parameters the routine has.
     pub nargs: i16,
+    /// Whether the body is SQL-standard (`BEGIN ATOMIC` / `RETURN expr`):
+    /// parsed at creation and bound to everything it references.
+    pub has_sql_body: bool,
 }
 
 /// Look up the single pg_proc row for a managed routine. Returns None when the
@@ -121,7 +124,9 @@ pub async fn get_routine_catalog_info<C: GenericClient>(
                p.proargmodes::text[]   AS argmodes,
                p.proargnames           AS argnames,
                p.pronargdefaults       AS nargdefaults,
-               p.pronargs              AS nargs
+               p.pronargs              AS nargs,
+               -- prosqlbody only exists from PostgreSQL 14
+               (to_jsonb(p) ->> 'prosqlbody') IS NOT NULL AS has_sql_body
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = $1 AND p.proname = $2 AND p.prokind = $3::char
@@ -142,6 +147,7 @@ pub async fn get_routine_catalog_info<C: GenericClient>(
         argnames: row.get("argnames"),
         nargdefaults: row.get("nargdefaults"),
         nargs: row.get("nargs"),
+        has_sql_body: row.get("has_sql_body"),
     }))
 }
 

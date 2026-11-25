@@ -451,6 +451,45 @@ async fn emit_apply_succeeded_if_changed<C: GenericClient>(
     }
 }
 
+/// SQL-language routines the apply left in place although something they
+/// reach at run time was changed: the ones the plan marked for re-checking
+/// (they read a table a migration altered, dropped or renamed), and the ones
+/// that query a relation or call a function this apply created or recreated.
+fn routines_to_revalidate<'a>(
+    plan_result: &'a PlanResult,
+    modified_objects: &[&SqlObject],
+) -> Vec<&'a SqlObject> {
+    let modified: HashSet<ObjectRef> = modified_objects.iter().map(|object| ObjectRef::from(*object)).collect();
+    let mut seen: HashSet<ObjectRef> = HashSet::new();
+    let mut routines: Vec<&SqlObject> = Vec::new();
+
+    let mut consider = |object: &'a SqlObject| {
+        let object_ref = ObjectRef::from(object);
+        if matches!(object.object_type, ObjectType::Function | ObjectType::Procedure)
+            && !modified.contains(&object_ref)
+            && seen.insert(object_ref)
+            && crate::sql::is_sql_language_routine(&object.ddl_statement)
+        {
+            routines.push(object);
+        }
+    };
+
+    for object in &plan_result.recheck_objects {
+        consider(object);
+    }
+    if let Some(graph) = &plan_result.dependency_graph {
+        for dependent in modified.iter().flat_map(|object| graph.soft_dependents_of(object)) {
+            if let Some(object) = plan_result.file_objects.iter().find(|object| ObjectRef::from(*object) == dependent) {
+                consider(object);
+            }
+        }
+    }
+
+    // Hash iteration order must not decide which broken routine is reported.
+    routines.sort_by_key(|object| format_object_name(object));
+    routines
+}
+
 // Helper function to execute all changes using GenericClient (works with both Transaction and Client)
 async fn execute_all_changes<C: GenericClient>(
     client: &C,
@@ -730,13 +769,40 @@ async fn execute_all_changes<C: GenericClient>(
         return Err("Apply operation failed".into());
     }
     
+    // Step 4.4: Re-validate SQL-language routines that were left in place
+    // while something they use at run time changed underneath them. Nothing
+    // in the catalog ties such a routine to what its body references, so the
+    // change went through; replacing the routine with its own, unchanged
+    // definition makes PostgreSQL check the body against the new schema (and
+    // keeps its OID and privileges). A body the change broke fails the apply
+    // here instead of failing its callers later.
+    for object in routines_to_revalidate(plan_result, &modified_objects) {
+        let Some(ddl) = crate::sql::with_or_replace(&object.ddl_statement) else { continue };
+        if let Err(e) = client.execute(&ddl, &[]).await {
+            let detailed_error = format!(
+                "{} was left in place, but its body is no longer valid after this change:\n{}",
+                format_object_name(object),
+                format_postgres_error_with_details(
+                    &format_object_name(object),
+                    object.source_file.as_deref(),
+                    object.start_line,
+                    &object.ddl_statement,
+                    &e,
+                ),
+            );
+            error!(error = %detailed_error, "Routine validation failed");
+            apply_result.errors.push(detailed_error);
+            return Err("Apply operation failed".into());
+        }
+        debug!(routine = %format_object_name(object), "Re-validated routine left in place");
+    }
+
     // Step 4.5: Run plpgsql_check on modified functions if in development mode
     // IMPORTANT: Run plpgsql_check WITHIN the transaction before committing
     //
-    // Functions that read a table a migration added columns to are checked
-    // too, even though they were left in place: their bodies are parsed at
-    // run time, so this is where a reference the new column made ambiguous
-    // surfaces.
+    // Functions that read a table a migration changed are checked too, even
+    // though they were left in place: their bodies are parsed at run time, so
+    // this is where a reference the new column made ambiguous surfaces.
     for object in &plan_result.recheck_objects {
         let already_tracked = modified_objects.iter().any(|modified|
             modified.object_type == object.object_type &&

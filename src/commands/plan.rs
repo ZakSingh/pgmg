@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use crate::db::{StateManager, connect_with_url, scan_sql_files, scan_migrations};
-use crate::sql::{SqlObject, ObjectType, QualifiedIdent, objects::calculate_ddl_hash, analyze_table_alterations, analyze_type_changes, definition_sensitive_to_added_columns, references_only_from_body, AlterImpact, TableAlteration, format_qualified_name, state_object_name, parse_state_object_name, human_object_name, with_or_replace};
+use crate::db::state::ConstraintUse;
+use crate::sql::{SqlObject, ObjectType, QualifiedIdent, objects::calculate_ddl_hash, MigrationAnalysis, definition_sensitive_to_added_columns, has_late_bound_body, references_only_from_body, AlterImpact, TableAlteration, format_qualified_name, state_object_name, parse_state_object_name, human_object_name, with_or_replace};
 use crate::analysis::{DependencyGraph, ObjectRef, Severity, SeverityCounts, severity};
 use crate::BuiltinCatalog;
 #[cfg(feature = "cli")]
 use owo_colors::OwoColorize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, serde::Serialize)]
 pub struct PlanResult {
@@ -15,11 +16,12 @@ pub struct PlanResult {
     #[serde(serialize_with = "serialize_graph_summary")]
     pub dependency_graph: Option<DependencyGraph>,
     pub file_objects: Vec<SqlObject>,
-    /// Functions and procedures that read a table a pending migration adds
-    /// columns to, but that are left in place rather than recreated. Their
-    /// bodies are parsed when they run, so the new column can still break them
-    /// (an unqualified reference turning ambiguous); apply re-runs
-    /// plpgsql_check on them when checking is enabled.
+    /// Functions and procedures that read a table a pending migration alters,
+    /// drops or renames, but that are left in place rather than recreated.
+    /// Their bodies are parsed when they run, so the change can still break
+    /// them (a dropped column, an unqualified reference turning ambiguous).
+    /// Apply re-validates the SQL-language ones and, when checking is enabled,
+    /// re-runs plpgsql_check on the rest.
     #[serde(skip)]
     pub recheck_objects: Vec<SqlObject>,
     /// Worst client-compatibility impact across all changes (Safe when empty).
@@ -141,12 +143,13 @@ pub async fn execute_plan(
         for migration_name in &plan_result.new_migrations {
             // Read migration content for the plan
             let migration_path = migrations_dir.join(format!("{}.sql", migration_name));
-            if let Ok(content) = std::fs::read_to_string(&migration_path) {
-                plan_result.changes.push(ChangeOperation::ApplyMigration {
+            match std::fs::read_to_string(&migration_path) {
+                Ok(content) => plan_result.changes.push(ChangeOperation::ApplyMigration {
                     name: migration_name.clone(),
                     content,
                     severity: Severity::Breaking,
-                });
+                }),
+                Err(e) => warn!("Could not read migration {}: {}", migration_path.display(), e),
             }
         }
     }
@@ -160,13 +163,16 @@ pub async fn execute_plan(
         
         let db_objects = state_manager.get_tracked_objects().await?;
         
-        let mut object_changes = detect_object_changes(&file_objects, &db_objects).await?;
+        let mut object_changes = ObjectChanges::new(detect_object_changes(&file_objects, &db_objects).await?);
+        let files: HashMap<ObjectRef, &SqlObject> = file_objects.iter()
+            .map(|object| (ObjectRef::from(object), object))
+            .collect();
 
         // Edited functions and procedures whose interface is unchanged can be
         // replaced in place rather than dropped. Whether one actually is gets
         // settled once the dependency graph is known (Step 3.5).
         let mut replaceable: Vec<ObjectRef> = Vec::new();
-        for change in &object_changes {
+        for change in &object_changes.changes {
             let ChangeOperation::UpdateObject { object, .. } = change else { continue };
             if !matches!(object.object_type, ObjectType::Function | ObjectType::Procedure)
                 || with_or_replace(&object.ddl_statement).is_none()
@@ -186,228 +192,174 @@ pub async fn execute_plan(
         // Routines a migration leaves in place although the table they read
         // is being rebuilt around them. See `DependencyGraph::recreation_set`.
         let mut stale_routines: Vec<ObjectRef> = Vec::new();
+        // Routines left in place whose body a migration may have broken.
+        let mut recheck: Vec<ObjectRef> = Vec::new();
+        // Routines whose signature names a table that gains columns. A routine
+        // returning the table's row type follows the table, but an object
+        // that recorded its result columns when it was created does not.
+        let mut widened: Vec<ObjectRef> = Vec::new();
 
-        // Step 2.5: Analyze migrations for tables they will alter, and mark
-        // the managed objects that must be dropped before the migrations run
-        // and recreated afterwards. What that covers depends on what the
-        // migrations do to each table; see `AlterImpact`.
-        if !plan_result.new_migrations.is_empty() {
-            if let Some(migrations_dir) = &migrations_dir {
-                let mut alterations: HashMap<QualifiedIdent, TableAlteration> = HashMap::new();
-                let mut changed_types: HashSet<QualifiedIdent> = HashSet::new();
+        // Step 2.5: Work out what the pending migrations do to tables and
+        // types, and mark the managed objects that must be dropped before the
+        // migrations run and recreated afterwards. What that covers depends on
+        // what the migrations do; see `MigrationAnalysis` and `AlterImpact`.
+        let mut analysis = MigrationAnalysis::default();
+        for change in &plan_result.changes {
+            let ChangeOperation::ApplyMigration { name, content, .. } = change else { continue };
+            match MigrationAnalysis::analyze(content) {
+                Ok(migration) => analysis.merge(migration),
+                Err(e) => warn!(
+                    "Could not parse migration {}; managed objects it affects will not be recreated around it: {}",
+                    name, e
+                ),
+            }
+        }
 
-                for migration_name in &plan_result.new_migrations {
-                    let path = migrations_dir.join(format!("{}.sql", migration_name));
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        if let Ok(types) = analyze_type_changes(&content) {
-                            changed_types.extend(types);
-                        }
-                        if let Ok(tables) = analyze_table_alterations(&content) {
-                            for (table, alteration) in tables {
-                                alterations.entry(table)
-                                    .and_modify(|existing| existing.merge(&alteration))
-                                    .or_insert(alteration);
+        // Sorted so the plan does not depend on hash iteration order.
+        let mut altered: Vec<(&QualifiedIdent, &TableAlteration)> = analysis.alterations.iter().collect();
+        altered.sort_by_key(|(table, _)| format_qualified_name(table));
+
+        for (table, alteration) in altered {
+            // Dropping a constraint only matters if something depends
+            // on the constraint itself, which the catalog knows.
+            let mut dropped_constraint_in_use = false;
+            for constraint in &alteration.dropped_constraints {
+                let in_use = match state_manager.dropped_constraint_use(table, constraint).await? {
+                    ConstraintUse::DependedOn | ConstraintUse::UnknownTable => true,
+                    ConstraintUse::Unused => false,
+                    // Nothing existing depends on a constraint that is not
+                    // there, unless an existing one is renamed to that name.
+                    ConstraintUse::NoSuchConstraint => analysis.renames_constraints,
+                };
+                if in_use {
+                    debug!("  Constraint {} on {} is depended on (or unknown)",
+                        constraint, format_qualified_name(table));
+                    dropped_constraint_in_use = true;
+                    break;
+                }
+            }
+            let impact = alteration.impact_given(dropped_constraint_in_use);
+
+            debug!("Migrations alter {} ({:?})", format_qualified_name(table), impact);
+            if impact == AlterImpact::Unaffected {
+                continue;
+            }
+
+            let dependents = state_manager
+                .find_dependents_of_relations(std::slice::from_ref(table))
+                .await?;
+            debug!("  {} managed objects depend on it", dependents.len());
+
+            for (obj_type, obj_name) in dependents {
+                // A cron job's command is stored as text and resolved when
+                // the job runs, so an altered table never requires the job
+                // to be rescheduled. Rescheduling would only churn cron.job.
+                if obj_type == ObjectType::CronJob {
+                    debug!("  Skipping cron job {} (command resolves at run time)", obj_name);
+                    continue;
+                }
+                let obj_ref = state_object_ref(&obj_type, &obj_name);
+                let Some(&file_obj) = files.get(&obj_ref) else { continue };
+
+                // A routine that only queries the table from a
+                // string body is not bound to it: PostgreSQL never
+                // refuses an ALTER on its account and it reads the
+                // table's current shape whenever it runs.
+                let is_routine = matches!(obj_type, ObjectType::Function | ObjectType::Procedure);
+                let late_bound = is_routine
+                    && references_only_from_body(&file_obj.ddl_statement, &table.name);
+
+                if is_routine && !late_bound && impact == AlterImpact::ColumnsAdded {
+                    widened.push(obj_ref.clone());
+                }
+
+                let forced = match impact {
+                    AlterImpact::Rebuild if !late_bound => Some("Migration alters dependent table"),
+                    AlterImpact::ColumnsAdded
+                        if definition_sensitive_to_added_columns(
+                            &file_obj.ddl_statement,
+                            &alteration.added_columns,
+                        ) => Some("Migration adds columns its definition picks up"),
+                    _ => None,
+                };
+
+                match forced {
+                    Some(reason) => object_changes.force_recreation(file_obj, reason, &mut replaceable),
+                    // Its file changed too, so it is being updated anyway.
+                    None if object_changes.targets(&obj_ref) => {}
+                    None => {
+                        debug!("  Leaving {:?} {} in place ({:?} does not change its definition)",
+                            obj_type, human_name(file_obj), impact);
+                        if is_routine {
+                            // Left in place, but the change may have
+                            // broken its body: re-check it.
+                            recheck.push(obj_ref.clone());
+                            // What it computes may have changed with
+                            // the table, which matters to anything
+                            // that stores its results.
+                            if impact == AlterImpact::Rebuild {
+                                stale_routines.push(obj_ref);
                             }
                         }
                     }
                 }
+            }
 
-                // Sorted so the plan does not depend on hash iteration order.
-                let mut altered: Vec<(&QualifiedIdent, &TableAlteration)> = alterations.iter().collect();
-                altered.sort_by_key(|(table, _)| format_qualified_name(table));
-
-                for (table, alteration) in altered {
-                    // Dropping a constraint only matters if something depends
-                    // on the constraint itself, which the catalog knows.
-                    let mut dropped_constraint_in_use = false;
-                    for constraint in &alteration.dropped_constraints {
-                        if state_manager.dropped_constraint_in_use(table, constraint).await? {
-                            debug!("  Constraint {} on {} is depended on (or unknown)",
-                                constraint, format_qualified_name(table));
-                            dropped_constraint_in_use = true;
-                            break;
-                        }
-                    }
-                    let impact = alteration.impact_given(dropped_constraint_in_use);
-
-                    debug!("Migrations alter {} ({:?})", format_qualified_name(table), impact);
-                    if impact == AlterImpact::Unaffected {
-                        continue;
-                    }
-
-                    let dependents = state_manager
-                        .find_dependents_of_relations(std::slice::from_ref(table))
-                        .await?;
-                    debug!("  {} managed objects depend on it", dependents.len());
-
-                    for (obj_type, obj_name) in dependents {
-                        // A cron job's command is stored as text and resolved when
-                        // the job runs, so an altered table never requires the job
-                        // to be rescheduled. Rescheduling would only churn cron.job.
-                        if obj_type == ObjectType::CronJob {
-                            debug!("  Skipping cron job {} (command resolves at run time)", obj_name);
-                            continue;
-                        }
-
-                        let (obj_qualified, obj_trigger_table) = parse_state_object_name(&obj_type, &obj_name);
-
-                        // An object the plan already updates (its file changed).
-                        let already_included = object_changes.iter().any(|change| match change {
-                            ChangeOperation::UpdateObject { object, .. } |
-                            ChangeOperation::CreateObject { object, .. } => {
-                                object.object_type == obj_type &&
-                                object.qualified_name == obj_qualified &&
-                                object.trigger_table == obj_trigger_table
-                            }
-                            ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                                let (qname, ttable) = parse_state_object_name(object_type, object_name);
-                                object_type == &obj_type && qname == obj_qualified && ttable == obj_trigger_table
-                            }
-                            _ => false,
-                        });
-
-                        // Find the object in file_objects to get its DDL
-                        let Some(file_obj) = file_objects.iter().find(|obj|
-                            obj.object_type == obj_type &&
-                            obj.qualified_name == obj_qualified &&
-                            obj.trigger_table == obj_trigger_table
-                        ) else {
-                            continue;
-                        };
-                        let display_name = human_object_name(&obj_type, &obj_qualified, obj_trigger_table.as_ref());
-
-                        // A routine that only queries the table from a
-                        // string body is not bound to it: PostgreSQL never
-                        // refuses an ALTER on its account and it reads the
-                        // table's current shape whenever it runs.
-                        let is_routine = matches!(obj_type, ObjectType::Function | ObjectType::Procedure);
-                        let late_bound = is_routine
-                            && references_only_from_body(&file_obj.ddl_statement, &table.name);
-
-                        let forced = match impact {
-                            AlterImpact::Rebuild if !late_bound => Some("Migration alters dependent table"),
-                            AlterImpact::ColumnsAdded
-                                if definition_sensitive_to_added_columns(
-                                    &file_obj.ddl_statement,
-                                    &alteration.added_columns,
-                                ) => Some("Migration adds columns its definition picks up"),
-                            _ => None,
-                        };
-
-                        let Some(reason) = forced else {
-                            if already_included {
-                                continue;
-                            }
-                            debug!("  Leaving {:?} {} in place ({:?} does not change its definition)",
-                                obj_type, display_name, impact);
-                            if is_routine {
-                                // Left in place, but the change may have
-                                // broken its body: re-check it.
-                                if !plan_result.recheck_objects.iter().any(|obj|
-                                    obj.object_type == obj_type && obj.qualified_name == obj_qualified)
-                                {
-                                    plan_result.recheck_objects.push(file_obj.clone());
-                                }
-                                // What it computes may have changed with
-                                // the table, which matters to anything
-                                // that stores its results.
-                                if impact == AlterImpact::Rebuild {
-                                    stale_routines.push(ObjectRef::from(file_obj));
-                                }
-                            }
-                            continue;
-                        };
-
-                        if already_included {
-                            // Its file changed too, so it is being updated
-                            // anyway; but it has to be dropped for the
-                            // migration, so it cannot be replaced in place.
-                            replaceable.retain(|obj| obj != &ObjectRef::from(file_obj));
-                            continue;
-                        }
-
-                        debug!("  Adding {:?} {} for recreation ({})", obj_type, display_name, reason);
-                        object_changes.push(ChangeOperation::UpdateObject {
-                            object: file_obj.clone(),
-                            old_hash: String::new(),
-                            new_hash: calculate_ddl_hash(&file_obj.ddl_statement),
-                            reason: reason.to_string(),
-                            severity: Severity::Breaking,
-                            in_place: false,
-                        });
+            // A routine can name the table in its signature without querying
+            // it (`RETURNS SETOF t` over another function, say).
+            if impact == AlterImpact::ColumnsAdded {
+                for (obj_type, obj_name) in state_manager.find_dependents_of_types(std::slice::from_ref(table)).await? {
+                    let obj_ref = state_object_ref(&obj_type, &obj_name);
+                    let Some(&file_obj) = files.get(&obj_ref) else { continue };
+                    if matches!(obj_type, ObjectType::Function | ObjectType::Procedure)
+                        && !references_only_from_body(&file_obj.ddl_statement, &table.name)
+                        && !widened.contains(&obj_ref)
+                    {
+                        widened.push(obj_ref);
                     }
                 }
+            }
+        }
 
-                // Types the migrations rename, drop or restructure take what
-                // is bound to them along, whatever tables those objects read:
-                // a type named in a signature or used in a body is a binding
-                // even for a routine that is otherwise late-bound.
-                if !changed_types.is_empty() {
-                    let mut type_names: Vec<QualifiedIdent> = changed_types.into_iter().collect();
-                    type_names.sort_by_key(format_qualified_name);
-                    let dependents = state_manager.find_dependents_of_types(&type_names).await?;
-                    debug!("Migrations change {} types; {} managed objects depend on them",
-                        type_names.len(), dependents.len());
+        // Types the migrations rename, drop or restructure, and tables they
+        // drop or rename, take what is bound to them along, whatever tables
+        // those objects read: a type named in a signature or used in a body
+        // is a binding even for a routine that is otherwise late-bound.
+        if !analysis.changed_types.is_empty() {
+            let mut type_names: Vec<QualifiedIdent> = analysis.changed_types.iter().cloned().collect();
+            type_names.sort_by_key(format_qualified_name);
+            let dependents = state_manager.find_dependents_of_types(&type_names).await?;
+            debug!("Migrations change {} types; {} managed objects depend on them",
+                type_names.len(), dependents.len());
 
-                    for (obj_type, obj_name) in dependents {
-                        if obj_type == ObjectType::CronJob {
-                            continue;
-                        }
-                        let (obj_qualified, obj_trigger_table) = parse_state_object_name(&obj_type, &obj_name);
-                        let already_included = object_changes.iter().any(|change| match change {
-                            ChangeOperation::UpdateObject { object, .. } |
-                            ChangeOperation::CreateObject { object, .. } => {
-                                object.object_type == obj_type &&
-                                object.qualified_name == obj_qualified &&
-                                object.trigger_table == obj_trigger_table
-                            }
-                            ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                                let (qname, ttable) = parse_state_object_name(object_type, object_name);
-                                object_type == &obj_type && qname == obj_qualified && ttable == obj_trigger_table
-                            }
-                            _ => false,
-                        });
-                        let Some(file_obj) = file_objects.iter().find(|obj|
-                            obj.object_type == obj_type &&
-                            obj.qualified_name == obj_qualified &&
-                            obj.trigger_table == obj_trigger_table
-                        ) else {
-                            continue;
-                        };
-                        if already_included {
-                            // Updated anyway, but bound to a type the
-                            // migration changes: it has to be dropped first.
-                            replaceable.retain(|obj| obj != &ObjectRef::from(file_obj));
-                            continue;
-                        }
-                        debug!("  Adding {:?} {} for recreation (migration alters dependent type)",
-                            obj_type, human_object_name(&obj_type, &obj_qualified, obj_trigger_table.as_ref()));
-                        object_changes.push(ChangeOperation::UpdateObject {
-                            object: file_obj.clone(),
-                            old_hash: String::new(),
-                            new_hash: calculate_ddl_hash(&file_obj.ddl_statement),
-                            reason: "Migration alters dependent type".to_string(),
-                            severity: Severity::Breaking,
-                            in_place: false,
-                        });
-                    }
+            for (obj_type, obj_name) in dependents {
+                if obj_type == ObjectType::CronJob {
+                    continue;
                 }
+                if let Some(&file_obj) = files.get(&state_object_ref(&obj_type, &obj_name)) {
+                    object_changes.force_recreation(file_obj, "Migration alters dependent type", &mut replaceable);
+                }
+            }
+        }
 
-                // An object recreated on account of one table needs no separate
-                // recheck on account of another.
-                plan_result.recheck_objects.retain(|recheck| !object_changes.iter().any(|change| matches!(
-                    change,
-                    ChangeOperation::UpdateObject { object, .. }
-                        if object.object_type == recheck.object_type
-                            && object.qualified_name == recheck.qualified_name
-                )));
+        // A table can be dropped, renamed or have a column renamed under a
+        // routine that only queries it from a string body. Nothing needs
+        // dropping for that, but the body may no longer be valid.
+        if !analysis.reshaped_tables.is_empty() {
+            let mut tables: Vec<QualifiedIdent> = analysis.reshaped_tables.iter().cloned().collect();
+            tables.sort_by_key(format_qualified_name);
+            for (obj_type, obj_name) in state_manager.find_dependents_of_relations(&tables).await? {
+                let obj_ref = state_object_ref(&obj_type, &obj_name);
+                if matches!(obj_type, ObjectType::Function | ObjectType::Procedure) && files.contains_key(&obj_ref) {
+                    recheck.push(obj_ref);
+                }
             }
         }
 
         // Step 3: Build dependency graph for affected objects
-        if !file_objects.is_empty() || !object_changes.is_empty() {
+        if !file_objects.is_empty() || !object_changes.changes.is_empty() {
             // First, identify deleted objects to get their stored dependencies
-            let deleted_objects: Vec<(ObjectType, String)> = object_changes.iter()
+            let deleted_objects: Vec<(ObjectType, String)> = object_changes.changes.iter()
                 .filter_map(|change| match change {
                     ChangeOperation::DeleteObject { object_type, object_name, .. } => {
                         Some((object_type.clone(), object_name.clone()))
@@ -426,7 +378,7 @@ pub async fn execute_plan(
             // Also get stored dependencies for updated objects
             // This is critical for pre-drop ordering: the database still has the OLD dependencies,
             // so we need to consider them when determining drop order
-            let updated_objects_for_deps: Vec<(ObjectType, String)> = object_changes.iter()
+            let updated_objects_for_deps: Vec<(ObjectType, String)> = object_changes.changes.iter()
                 .filter_map(|change| match change {
                     ChangeOperation::UpdateObject { object, .. } => {
                         Some((object.object_type.clone(),
@@ -499,42 +451,25 @@ pub async fn execute_plan(
             // IMPORTANT: Use file_graph (not graph) for validation - we want to check
             // the NEW dependencies from source files, not the old stored dependencies
             let mut deletion_errors = Vec::new();
-            let deleted_object_refs: HashSet<ObjectRef> = object_changes.iter()
-                .filter_map(|change| match change {
-                    ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                        let (qname, trigger_table) = parse_state_object_name(object_type, object_name);
-                        Some(ObjectRef {
-                            object_type: object_type.clone(),
-                            qualified_name: qname,
-                            trigger_table,
-                        })
-                    }
-                    _ => None,
-                })
+            let deleted_object_refs: HashSet<ObjectRef> = object_changes.changes.iter()
+                .filter(|change| matches!(change, ChangeOperation::DeleteObject { .. }))
+                .filter_map(change_target)
                 .collect();
 
             for deleted_ref in &deleted_object_refs {
                 // Use file_graph for validation - this checks if the NEW state is consistent
                 let dependents = file_graph.dependents_of(deleted_ref);
                 for dependent in dependents {
-                    // Check if this dependent is also being deleted
-                    if !deleted_object_refs.contains(&dependent) {
-                        // Also check if the dependent exists in the file objects (i.e., it's not being deleted)
-                        let dependent_exists_in_files = file_objects.iter().any(|obj| {
-                            obj.object_type == dependent.object_type &&
-                            obj.qualified_name == dependent.qualified_name &&
-                            obj.trigger_table == dependent.trigger_table
-                        });
-
-                        if dependent_exists_in_files {
-                            deletion_errors.push(format!(
-                                "Cannot delete {} '{}' because {} '{}' depends on it",
-                                format!("{:?}", deleted_ref.object_type).to_lowercase(),
-                                format_qualified_name(&deleted_ref.qualified_name),
-                                format!("{:?}", dependent.object_type).to_lowercase(),
-                                format_qualified_name(&dependent.qualified_name),
-                            ));
-                        }
+                    // A dependent that is itself being deleted is fine; one
+                    // that still exists in the files is not.
+                    if !deleted_object_refs.contains(&dependent) && files.contains_key(&dependent) {
+                        deletion_errors.push(format!(
+                            "Cannot delete {} '{}' because {} '{}' depends on it",
+                            format!("{:?}", deleted_ref.object_type).to_lowercase(),
+                            format_qualified_name(&deleted_ref.qualified_name),
+                            format!("{:?}", dependent.object_type).to_lowercase(),
+                            format_qualified_name(&dependent.qualified_name),
+                        ));
                     }
                 }
             }
@@ -542,24 +477,41 @@ pub async fn execute_plan(
             if !deletion_errors.is_empty() {
                 return Err(deletion_errors.join("\n").into());
             }
-            
+
+            // Step 3.4: An object parsed at creation that uses a routine
+            // whose row type gains columns (`SELECT ... FROM list_items()`
+            // where the function returns `SETOF item`) recorded the routine's
+            // result columns as they were, star or no star.
+            for routine in &widened {
+                for dependent in graph.dependents_of(routine) {
+                    let Some(&file_obj) = files.get(&dependent) else { continue };
+                    if !has_late_bound_body(&file_obj.ddl_statement) {
+                        object_changes.force_recreation(
+                            file_obj,
+                            "Migration adds columns its definition picks up",
+                            &mut replaceable,
+                        );
+                    }
+                }
+            }
+
             // Step 3.5: Find all pgmg-managed objects affected by changes
-            let updated_objects: Vec<ObjectRef> = object_changes.iter()
-                .filter_map(|change| match change {
-                    ChangeOperation::UpdateObject { object, .. } => Some(ObjectRef::from(object)),
-                    _ => None,
-                })
+            let updated_objects: Vec<ObjectRef> = object_changes.changes.iter()
+                .filter(|change| matches!(change, ChangeOperation::UpdateObject { .. }))
+                .filter_map(change_target)
                 .collect();
 
             if !updated_objects.is_empty() || !stale_routines.is_empty() {
                 // A replaceable routine stays in place unless it is bound to
                 // something that is being dropped (its result type is a view
-                // that is recreated, say), in which case it has to be dropped
-                // with it. Dropping it can in turn force others out, so settle
-                // by iteration; the set only ever shrinks.
+                // that is recreated, say, or its SQL-standard body uses a view
+                // that is deleted), in which case it has to be dropped with
+                // it. Dropping it can in turn force others out, so settle by
+                // iteration; the set only ever shrinks.
                 let affected_objects = loop {
                     let dropped: Vec<ObjectRef> = updated_objects.iter()
                         .filter(|obj| !replaceable.contains(obj))
+                        .chain(deleted_object_refs.iter())
                         .cloned()
                         .collect();
                     let stale: Vec<ObjectRef> = replaceable.iter()
@@ -577,7 +529,7 @@ pub async fn execute_plan(
                 debug!("{} pgmg-managed objects affected by changes, {} replaced in place",
                     affected_objects.len(), replaceable.len());
 
-                for change in object_changes.iter_mut() {
+                for change in object_changes.changes.iter_mut() {
                     if let ChangeOperation::UpdateObject { object, in_place, reason, .. } = change {
                         if replaceable.contains(&ObjectRef::from(&*object)) {
                             *in_place = true;
@@ -588,45 +540,23 @@ pub async fn execute_plan(
 
                 // Add dependent objects that need to be recreated
                 for affected_ref in affected_objects {
-                    // Skip objects that are already in the change list
-                    let already_included = object_changes.iter().any(|change| match change {
-                        ChangeOperation::UpdateObject { object, .. } |
-                        ChangeOperation::CreateObject { object, .. } => {
-                            object.object_type == affected_ref.object_type &&
-                            object.qualified_name == affected_ref.qualified_name &&
-                            object.trigger_table == affected_ref.trigger_table
-                        }
-                        ChangeOperation::DeleteObject { object_type, object_name, .. } => {
-                            let (qname, ttable) = parse_state_object_name(object_type, object_name);
-                            object_type == &affected_ref.object_type &&
-                            qname == affected_ref.qualified_name &&
-                            ttable == affected_ref.trigger_table
-                        }
-                        _ => false,
-                    });
-
-                    if !already_included {
-                        // Find the object in file_objects to get its DDL
-                        if let Some(file_obj) = file_objects.iter().find(|obj|
-                            obj.object_type == affected_ref.object_type &&
-                            obj.qualified_name == affected_ref.qualified_name &&
-                            obj.trigger_table == affected_ref.trigger_table
-                        ) {
-                            // Add as an update operation (drop and recreate due to dependency)
-                            object_changes.push(ChangeOperation::UpdateObject {
-                                object: file_obj.clone(),
-                                old_hash: String::new(), // We don't have the old hash, but it's not critical
-                                new_hash: calculate_ddl_hash(&file_obj.ddl_statement),
-                                reason: "Dependency requires recreation".to_string(),
-                                severity: Severity::Breaking,
-                                in_place: false,
-                            });
-                        }
+                    if let Some(&file_obj) = files.get(&affected_ref) {
+                        object_changes.force_recreation(file_obj, "Dependency requires recreation", &mut replaceable);
                     }
                 }
             }
-            
-            plan_result.changes.extend(object_changes);
+
+            // An object that is recreated or replaced needs no separate check.
+            for obj_ref in recheck {
+                if object_changes.targets(&obj_ref) || plan_result.recheck_objects.iter().any(|o| ObjectRef::from(o) == obj_ref) {
+                    continue;
+                }
+                if let Some(&file_obj) = files.get(&obj_ref) {
+                    plan_result.recheck_objects.push(file_obj.clone());
+                }
+            }
+
+            plan_result.changes.extend(object_changes.changes);
             
             // Write graph output if requested
             if let Some(output_path) = output_graph {
@@ -644,6 +574,67 @@ pub async fn execute_plan(
     classify_changes(&client, &mut plan_result, &classified_edits).await;
 
     Ok(plan_result)
+}
+
+/// The managed object a change creates, updates or deletes.
+fn change_target(change: &ChangeOperation) -> Option<ObjectRef> {
+    match change {
+        ChangeOperation::CreateObject { object, .. } | ChangeOperation::UpdateObject { object, .. } => {
+            Some(ObjectRef::from(object))
+        }
+        ChangeOperation::DeleteObject { object_type, object_name, .. } => Some(state_object_ref(object_type, object_name)),
+        ChangeOperation::ApplyMigration { .. } => None,
+    }
+}
+
+/// The object a name in pgmg's state tables refers to.
+fn state_object_ref(object_type: &ObjectType, object_name: &str) -> ObjectRef {
+    let (qualified_name, trigger_table) = parse_state_object_name(object_type, object_name);
+    ObjectRef { object_type: object_type.clone(), qualified_name, trigger_table }
+}
+
+fn human_name(object: &SqlObject) -> String {
+    human_object_name(&object.object_type, &object.qualified_name, object.trigger_table.as_ref())
+}
+
+/// The changes planned for managed objects, with the objects they target
+/// indexed so "is this object already part of the plan?" is a lookup.
+struct ObjectChanges {
+    changes: Vec<ChangeOperation>,
+    targeted: HashSet<ObjectRef>,
+}
+
+impl ObjectChanges {
+    fn new(changes: Vec<ChangeOperation>) -> Self {
+        let targeted = changes.iter().filter_map(change_target).collect();
+        Self { changes, targeted }
+    }
+
+    fn targets(&self, object: &ObjectRef) -> bool {
+        self.targeted.contains(object)
+    }
+
+    /// Make sure `object` is dropped before the migrations run and recreated
+    /// afterwards. An object the plan does not touch yet is scheduled for it;
+    /// one that is being updated anyway is dropped already, unless it was
+    /// going to be replaced in place, which it now cannot be.
+    fn force_recreation(&mut self, object: &SqlObject, reason: &str, replaceable: &mut Vec<ObjectRef>) {
+        let object_ref = ObjectRef::from(object);
+        if self.targets(&object_ref) {
+            replaceable.retain(|candidate| candidate != &object_ref);
+            return;
+        }
+        debug!("  Adding {:?} {} for recreation ({})", object.object_type, human_name(object), reason);
+        self.changes.push(ChangeOperation::UpdateObject {
+            object: object.clone(),
+            old_hash: String::new(),
+            new_hash: calculate_ddl_hash(&object.ddl_statement),
+            reason: reason.to_string(),
+            severity: Severity::Breaking,
+            in_place: false,
+        });
+        self.targeted.insert(object_ref);
+    }
 }
 
 /// Annotate each change with its client-compatibility severity and roll the

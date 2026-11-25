@@ -637,41 +637,63 @@ impl<'a> StateManager<'a> {
             .collect())
     }
 
-    /// Whether dropping `constraint` from `table` could disturb objects that
-    /// exist in the database now: true when something in the catalog depends
-    /// on the constraint itself (a view that groups by a primary key and
-    /// selects other columns does), and also when the table or constraint
-    /// cannot be found, since then nothing is known about it (it may have been
-    /// renamed by an earlier pending migration).
+    /// What the catalog knows about a constraint a pending migration drops.
     ///
     /// An unqualified table name means `public`, as everywhere in pgmg.
-    pub async fn dropped_constraint_in_use(
+    pub async fn dropped_constraint_use(
         &self,
         table: &QualifiedIdent,
         constraint: &str,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<ConstraintUse, Box<dyn std::error::Error>> {
         let schema = table.schema.as_deref().unwrap_or("public");
         let row = self.client.query_one(
             r#"
             SELECT
+                count(DISTINCT r.oid) AS tables,
                 count(c.oid) AS found,
                 count(d.objid) AS dependents
-            FROM pg_constraint c
-            JOIN pg_class r ON r.oid = c.conrelid
+            FROM pg_class r
             JOIN pg_namespace n ON n.oid = r.relnamespace
+            LEFT JOIN pg_constraint c ON c.conrelid = r.oid AND c.conname = $3
             LEFT JOIN pg_depend d
                 ON d.refclassid = 'pg_constraint'::regclass
                AND d.refobjid = c.oid
                AND d.deptype = 'n'
-            WHERE n.nspname = $1 AND r.relname = $2 AND c.conname = $3
+            WHERE n.nspname = $1 AND r.relname = $2
             "#,
             &[&schema, &table.name, &constraint],
         ).await?;
 
+        let tables: i64 = row.get("tables");
         let found: i64 = row.get("found");
         let dependents: i64 = row.get("dependents");
-        Ok(found == 0 || dependents > 0)
+        Ok(if tables == 0 {
+            ConstraintUse::UnknownTable
+        } else if found == 0 {
+            ConstraintUse::NoSuchConstraint
+        } else if dependents > 0 {
+            ConstraintUse::DependedOn
+        } else {
+            ConstraintUse::Unused
+        })
     }
+}
+
+/// See [`StateManager::dropped_constraint_use`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintUse {
+    /// Something in the catalog depends on the constraint itself (a view that
+    /// groups by a primary key and selects other columns does).
+    DependedOn,
+    /// The constraint exists and nothing depends on it.
+    Unused,
+    /// The table exists but has no constraint of that name. Nothing existing
+    /// can depend on it, unless an earlier pending migration gives an
+    /// existing constraint that name.
+    NoSuchConstraint,
+    /// The table cannot be found (it may be created or renamed by an earlier
+    /// pending migration), so nothing is known.
+    UnknownTable,
 }
 
 #[cfg(test)]

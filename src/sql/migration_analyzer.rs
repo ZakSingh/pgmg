@@ -130,39 +130,133 @@ pub(crate) fn classify_subcommand(subtype: AlterTableType) -> AlterImpact {
     }
 }
 
-/// Analyze every ALTER TABLE statement in migration SQL and return, per
-/// altered table, what the statements require of the table's dependents.
-///
-/// Table names are keyed as the migration spelled them (schema `None` when
-/// unqualified). `ALTER INDEX / VIEW / MATERIALIZED VIEW / SEQUENCE / TYPE`
-/// share ALTER TABLE's parse node; they are reported as `Rebuild` under the
-/// name they alter, as they always have been.
-pub fn analyze_table_alterations(sql: &str) -> Result<HashMap<QualifiedIdent, TableAlteration>, Box<dyn std::error::Error>> {
-    let parsed = pg_query::parse(sql)?;
-    let mut tables: HashMap<QualifiedIdent, TableAlteration> = HashMap::new();
+/// Everything the planner needs to know about a batch of pending migrations,
+/// read off one parse of each.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MigrationAnalysis {
+    /// Per altered table, what its ALTER TABLE statements require of the
+    /// table's dependents. Keyed as the migration spelled the table (schema
+    /// `None` when unqualified).
+    pub alterations: HashMap<QualifiedIdent, TableAlteration>,
+    /// Types, domains and table row types that are renamed, dropped, moved to
+    /// another schema or restructured (`ALTER TYPE ... ADD / DROP / ALTER
+    /// ATTRIBUTE`), under the name they had before the statement.
+    ///
+    /// Whatever is bound to one has to be dropped before the migration and
+    /// recreated after it: a drop is refused while dependents exist, and after
+    /// a rename a dependent keeps pointing at the renamed type where a fresh
+    /// build of its file would resolve the name again (to the type's
+    /// replacement, when the migration creates one). A table counts because a
+    /// routine whose signature uses its row type is bound to it the same way.
+    ///
+    /// `ALTER TYPE ... ADD VALUE` and `RENAME VALUE` are not included: they
+    /// change an enum's labels, not what is bound to it.
+    pub changed_types: HashSet<QualifiedIdent>,
+    /// Tables that are dropped, renamed, moved, or have a column renamed.
+    /// PostgreSQL lets all of these happen under a routine that only queries
+    /// the table from a string body, so those routines need re-validating.
+    pub reshaped_tables: HashSet<QualifiedIdent>,
+    /// Whether any statement renames a table constraint, after which a
+    /// constraint name later in the batch may not be the one in the catalog.
+    pub renames_constraints: bool,
+}
 
-    for stmt in &parsed.protobuf.stmts {
-        let Some(node) = &stmt.stmt else { continue };
-        let Some(NodeEnum::AlterTableStmt(alter)) = &node.node else { continue };
-        let Some(relation) = &alter.relation else { continue };
-
-        let schema = if relation.schemaname.is_empty() {
-            None
-        } else {
-            Some(relation.schemaname.clone())
-        };
-        let entry = tables
-            .entry(QualifiedIdent::new(schema, relation.relname.clone()))
-            .or_insert_with(TableAlteration::new);
-
-        let is_table = matches!(
-            PgObjectType::try_from(alter.objtype),
-            Ok(PgObjectType::ObjectTable) | Ok(PgObjectType::ObjectForeignTable)
-        );
-        if !is_table {
-            entry.impact = AlterImpact::Rebuild;
-            continue;
+impl MigrationAnalysis {
+    pub fn analyze(sql: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let parsed = pg_query::parse(sql)?;
+        let mut analysis = Self::default();
+        for stmt in &parsed.protobuf.stmts {
+            let Some(node) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else { continue };
+            analysis.record(node);
         }
+        Ok(analysis)
+    }
+
+    /// Fold the analysis of a later migration into this one.
+    pub fn merge(&mut self, other: MigrationAnalysis) {
+        for (table, alteration) in other.alterations {
+            self.alterations.entry(table)
+                .and_modify(|existing| existing.merge(&alteration))
+                .or_insert(alteration);
+        }
+        self.changed_types.extend(other.changed_types);
+        self.reshaped_tables.extend(other.reshaped_tables);
+        self.renames_constraints |= other.renames_constraints;
+    }
+
+    fn record(&mut self, node: &NodeEnum) {
+        let object_type = |object_type: i32| PgObjectType::try_from(object_type).ok();
+        let is_type = |t: i32| matches!(object_type(t), Some(PgObjectType::ObjectType | PgObjectType::ObjectDomain));
+        let is_table = |t: i32| matches!(object_type(t), Some(PgObjectType::ObjectTable | PgObjectType::ObjectForeignTable));
+
+        match node {
+            // ALTER TYPE / DOMAIN x RENAME TO y
+            NodeEnum::RenameStmt(rename) if is_type(rename.rename_type) => {
+                self.changed_types.extend(rename.object.as_deref().and_then(qualified_name_of));
+            }
+            // ALTER TABLE x RENAME TO y
+            NodeEnum::RenameStmt(rename) if is_table(rename.rename_type) => {
+                self.record_replaced_tables(rename.relation.as_ref().map(range_var_name));
+            }
+            // ALTER TYPE x RENAME ATTRIBUTE a TO b
+            NodeEnum::RenameStmt(rename) if is_type(rename.relation_type) => {
+                self.changed_types.extend(rename.relation.as_ref().map(range_var_name));
+            }
+            // ALTER TABLE x RENAME CONSTRAINT a TO b
+            NodeEnum::RenameStmt(rename)
+                if object_type(rename.rename_type) == Some(PgObjectType::ObjectTabconstraint) =>
+            {
+                self.renames_constraints = true;
+            }
+            // ALTER TABLE x RENAME COLUMN a TO b
+            NodeEnum::RenameStmt(rename)
+                if is_table(rename.relation_type)
+                    && object_type(rename.rename_type) == Some(PgObjectType::ObjectColumn) =>
+            {
+                self.reshaped_tables.extend(rename.relation.as_ref().map(range_var_name));
+            }
+            // DROP TYPE / DOMAIN x, y
+            NodeEnum::DropStmt(drop) if is_type(drop.remove_type) => {
+                self.changed_types.extend(drop.objects.iter().filter_map(qualified_name_of));
+            }
+            // DROP TABLE x, y
+            NodeEnum::DropStmt(drop) if is_table(drop.remove_type) => {
+                self.record_replaced_tables(drop.objects.iter().filter_map(qualified_name_of));
+            }
+            // ALTER TYPE / DOMAIN x SET SCHEMA s
+            NodeEnum::AlterObjectSchemaStmt(alter) if is_type(alter.object_type) => {
+                self.changed_types.extend(alter.object.as_deref().and_then(qualified_name_of));
+            }
+            // ALTER TABLE x SET SCHEMA s
+            NodeEnum::AlterObjectSchemaStmt(alter) if is_table(alter.object_type) => {
+                self.record_replaced_tables(alter.relation.as_ref().map(range_var_name));
+            }
+            // ALTER TYPE x ADD / DROP / ALTER ATTRIBUTE
+            NodeEnum::AlterTableStmt(alter) if is_type(alter.objtype) => {
+                self.changed_types.extend(alter.relation.as_ref().map(range_var_name));
+            }
+            NodeEnum::AlterTableStmt(alter) if is_table(alter.objtype) => self.record_alter_table(alter),
+            // ALTER INDEX / VIEW / MATERIALIZED VIEW / SEQUENCE share ALTER
+            // TABLE's parse node. None of their forms (options, ownership,
+            // column defaults, storage) is refused because of a dependent or
+            // changes what a dependent is bound to.
+            _ => {}
+        }
+    }
+
+    /// A table that stops existing under its name takes its row type with it.
+    fn record_replaced_tables(&mut self, tables: impl IntoIterator<Item = QualifiedIdent>) {
+        for table in tables {
+            self.changed_types.insert(table.clone());
+            self.reshaped_tables.insert(table);
+        }
+    }
+
+    fn record_alter_table(&mut self, alter: &pg_query::protobuf::AlterTableStmt) {
+        let Some(relation) = &alter.relation else { return };
+        let entry = self.alterations
+            .entry(range_var_name(relation))
+            .or_insert_with(TableAlteration::new);
 
         for cmd in &alter.cmds {
             let Some(NodeEnum::AlterTableCmd(cmd)) = &cmd.node else {
@@ -193,59 +287,20 @@ pub fn analyze_table_alterations(sql: &str) -> Result<HashMap<QualifiedIdent, Ta
             }
         }
     }
-
-    Ok(tables)
 }
 
-/// Find the types and domains a migration renames, drops, moves to another
-/// schema, or restructures (`ALTER TYPE ... ADD / DROP / ALTER ATTRIBUTE`).
-///
-/// Whatever is bound to such a type has to be dropped before the migration
-/// and recreated after it: a drop is refused while dependents exist, and after
-/// a rename a dependent keeps pointing at the renamed type where a fresh build
-/// of its file would resolve the name again (to the type's replacement, when
-/// the migration creates one). Names are as the migration spelled them, under
-/// the name the type had before the statement.
-///
-/// `ALTER TYPE ... ADD VALUE` and `RENAME VALUE` are not included: they change
-/// an enum's labels, not what is bound to it.
+/// Analyze every ALTER TABLE statement in migration SQL and return, per
+/// altered table, what the statements require of the table's dependents.
+/// See [`MigrationAnalysis::alterations`].
+pub fn analyze_table_alterations(sql: &str) -> Result<HashMap<QualifiedIdent, TableAlteration>, Box<dyn std::error::Error>> {
+    Ok(MigrationAnalysis::analyze(sql)?.alterations)
+}
+
+/// Find the types, domains and table row types a migration renames, drops,
+/// moves to another schema, or restructures. See
+/// [`MigrationAnalysis::changed_types`].
 pub fn analyze_type_changes(sql: &str) -> Result<HashSet<QualifiedIdent>, Box<dyn std::error::Error>> {
-    let parsed = pg_query::parse(sql)?;
-    let mut types = HashSet::new();
-
-    let is_type = |object_type: i32| matches!(
-        PgObjectType::try_from(object_type),
-        Ok(PgObjectType::ObjectType) | Ok(PgObjectType::ObjectDomain)
-    );
-
-    for stmt in &parsed.protobuf.stmts {
-        let Some(node) = stmt.stmt.as_ref().and_then(|s| s.node.as_ref()) else { continue };
-        match node {
-            // ALTER TYPE / DOMAIN x RENAME TO y
-            NodeEnum::RenameStmt(rename) if is_type(rename.rename_type) => {
-                types.extend(rename.object.as_deref().and_then(qualified_name_of));
-            }
-            // ALTER TYPE x RENAME ATTRIBUTE a TO b
-            NodeEnum::RenameStmt(rename) if is_type(rename.relation_type) => {
-                types.extend(rename.relation.as_ref().map(range_var_name));
-            }
-            // DROP TYPE / DOMAIN x, y
-            NodeEnum::DropStmt(drop) if is_type(drop.remove_type) => {
-                types.extend(drop.objects.iter().filter_map(qualified_name_of));
-            }
-            // ALTER TYPE / DOMAIN x SET SCHEMA s
-            NodeEnum::AlterObjectSchemaStmt(alter) if is_type(alter.object_type) => {
-                types.extend(alter.object.as_deref().and_then(qualified_name_of));
-            }
-            // ALTER TYPE x ADD / DROP / ALTER ATTRIBUTE
-            NodeEnum::AlterTableStmt(alter) if is_type(alter.objtype) => {
-                types.extend(alter.relation.as_ref().map(range_var_name));
-            }
-            _ => {}
-        }
-    }
-
-    Ok(types)
+    Ok(MigrationAnalysis::analyze(sql)?.changed_types)
 }
 
 fn range_var_name(relation: &pg_query::protobuf::RangeVar) -> QualifiedIdent {
@@ -276,14 +331,6 @@ fn string_value(node: &pg_query::protobuf::Node) -> Option<&str> {
     }
 }
 
-/// Extract tables affected by ALTER TABLE statements in migration SQL.
-///
-/// Returns every altered table regardless of what the statement does. Use
-/// [`analyze_table_alterations`] to learn whether dependents need recreating.
-pub fn extract_altered_tables(sql: &str) -> Result<HashSet<QualifiedIdent>, Box<dyn std::error::Error>> {
-    Ok(analyze_table_alterations(sql)?.into_keys().collect())
-}
-
 /// Whether adding `added_columns` to a table this object reads could make the
 /// object's stored definition differ from what its DDL produces when run
 /// afresh, in which case it must be recreated to keep the database matching
@@ -296,6 +343,7 @@ pub fn extract_altered_tables(sql: &str) -> Result<HashSet<QualifiedIdent>, Box<
 ///
 /// - `*` / `t.*` was expanded to the columns that existed at the time, so the
 ///   object would not expose the new column;
+/// - `TABLE t` is the same expansion spelled without a star;
 /// - `NATURAL JOIN` fixed its join columns at the time, so a new common column
 ///   would change the join condition;
 /// - an unqualified reference spelled like a new column may now be captured by
@@ -328,6 +376,23 @@ pub fn definition_sensitive_to_added_columns(ddl: &str, added_columns: &BTreeSet
 
         match tok.token() {
             Token::Natural => return true,
+
+            // `TABLE t` is `SELECT * FROM t` without a star to find. The word
+            // also appears in DDL that expands nothing; anywhere else it is
+            // taken for the query form.
+            Token::Table => {
+                let before = i.checked_sub(1)
+                    .and_then(|p| token_text(ddl, tokens[p]))
+                    .map(|text| text.to_lowercase());
+                let ddl_keyword = matches!(
+                    before.as_deref(),
+                    Some("create" | "alter" | "drop" | "temp" | "temporary" | "unlogged" | "foreign"
+                        | "global" | "local" | "on" | "returns" | "old" | "new" | "truncate" | "lock")
+                );
+                if !ddl_keyword {
+                    return true;
+                }
+            }
 
             Token::Ascii42 => {
                 // `t.*` is always an expansion, whatever follows it.
@@ -366,6 +431,10 @@ pub fn definition_sensitive_to_added_columns(ddl: &str, added_columns: &BTreeSet
     }
 
     false
+}
+
+fn token_text<'a>(sql: &'a str, tok: &pg_query::protobuf::ScanToken) -> Option<&'a str> {
+    sql.get(usize::try_from(tok.start).ok()?..usize::try_from(tok.end).ok()?)
 }
 
 /// Extract `ALTER TYPE ... ADD VALUE` statements from migration SQL and return
@@ -407,6 +476,10 @@ pub fn extract_enum_add_value_statements(sql: &str) -> Result<Vec<(String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn extract_altered_tables(sql: &str) -> Result<HashSet<QualifiedIdent>, Box<dyn std::error::Error>> {
+        Ok(analyze_table_alterations(sql)?.into_keys().collect())
+    }
 
     #[test]
     fn test_alter_column_type() {
@@ -696,19 +769,19 @@ mod tests {
     }
 
     #[test]
-    fn non_table_alters_keep_rebuilding() {
-        // These share ALTER TABLE's parse node. They were never classified,
-        // so they keep the conservative treatment.
-        for (sql, name) in [
-            ("ALTER INDEX t_idx SET (fillfactor = 70)", "t_idx"),
-            ("ALTER VIEW v ALTER COLUMN a SET DEFAULT 1", "v"),
-            ("ALTER VIEW v OWNER TO app", "v"),
-            ("ALTER MATERIALIZED VIEW mv SET (autovacuum_enabled = false)", "mv"),
-            ("ALTER SEQUENCE s OWNER TO app", "s"),
-            ("ALTER TYPE pair ADD ATTRIBUTE z int", "pair"),
+    fn non_table_alters_are_not_table_alterations() {
+        // These share ALTER TABLE's parse node, but none of their forms
+        // disturbs a dependent.
+        for sql in [
+            "ALTER INDEX t_idx SET (fillfactor = 70)",
+            "ALTER VIEW v ALTER COLUMN a SET DEFAULT 1",
+            "ALTER VIEW v OWNER TO app",
+            "ALTER MATERIALIZED VIEW mv SET (autovacuum_enabled = false)",
+            "ALTER SEQUENCE s OWNER TO app",
+            // Reported as a type change instead.
+            "ALTER TYPE pair ADD ATTRIBUTE z int",
         ] {
-            let tables = analyze_table_alterations(sql).unwrap();
-            assert_eq!(tables[&table(name)].impact, AlterImpact::Rebuild, "{sql}");
+            assert!(analyze_table_alterations(sql).unwrap().is_empty(), "{sql}");
         }
 
         // Foreign tables are tables.
@@ -785,20 +858,90 @@ mod tests {
             "CREATE TYPE grade AS ENUM ('a', 'b')",
             "CREATE DOMAIN probability AS real",
             "COMMENT ON TYPE grade IS 'x'",
-            // Not types
-            "ALTER TABLE grade RENAME TO grade_old",
+            // Not types, and the table's row type keeps its name
             "ALTER TABLE t RENAME COLUMN a TO b",
-            "DROP TABLE grade",
+            "ALTER TABLE t RENAME CONSTRAINT a TO b",
             "DROP VIEW grade",
             "DROP FUNCTION grade()",
-            "ALTER TABLE t SET SCHEMA archive",
+            "DROP INDEX grade",
             "ALTER TABLE t ADD COLUMN g grade",
+            "ALTER TABLE t DROP COLUMN g",
         ] {
             assert!(changed_types(sql).is_empty(), "{sql}: {:?}", changed_types(sql));
         }
     }
 
+    #[test]
+    fn tables_that_stop_existing_under_their_name_take_their_row_type_along() {
+        for (sql, expected) in [
+            ("DROP TABLE listing", vec!["listing"]),
+            ("DROP TABLE IF EXISTS core.listing, seller CASCADE", vec!["core.listing", "seller"]),
+            ("ALTER TABLE listing RENAME TO listing_old", vec!["listing"]),
+            ("ALTER TABLE core.listing SET SCHEMA archive", vec!["core.listing"]),
+            ("DROP FOREIGN TABLE remote_listing", vec!["remote_listing"]),
+            ("ALTER TABLE listing RENAME TO listing_old; CREATE TABLE listing (id int); DROP TABLE listing_old;",
+             vec!["listing", "listing_old"]),
+        ] {
+            assert_eq!(changed_types(sql), expected, "{sql}");
+            let analysis = MigrationAnalysis::analyze(sql).unwrap();
+            assert_eq!(analysis.reshaped_tables, analysis.changed_types, "{sql}");
+            assert!(analysis.alterations.is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn renamed_columns_and_constraints_are_noted() {
+        let analysis = MigrationAnalysis::analyze("ALTER TABLE api.t RENAME COLUMN a TO b").unwrap();
+        assert_eq!(analysis.reshaped_tables, HashSet::from([table("api.t")]));
+        assert!(analysis.changed_types.is_empty() && !analysis.renames_constraints);
+
+        let analysis = MigrationAnalysis::analyze("ALTER TABLE t RENAME CONSTRAINT a TO b").unwrap();
+        assert!(analysis.renames_constraints);
+        assert!(analysis.reshaped_tables.is_empty());
+
+        assert!(!MigrationAnalysis::analyze("ALTER TABLE t DROP CONSTRAINT a").unwrap().renames_constraints);
+    }
+
+    #[test]
+    fn analyses_of_successive_migrations_merge() {
+        let mut all = MigrationAnalysis::analyze("ALTER TABLE t ADD COLUMN a int; DROP TYPE grade;").unwrap();
+        all.merge(MigrationAnalysis::analyze(
+            "ALTER TABLE t DROP COLUMN b; ALTER TABLE u RENAME COLUMN x TO y; ALTER TABLE u RENAME CONSTRAINT c TO d;",
+        ).unwrap());
+        assert_eq!(all.alterations[&table("t")].impact, AlterImpact::Rebuild);
+        assert_eq!(all.alterations[&table("t")].added_columns, columns(&["a"]));
+        assert_eq!(all.changed_types, HashSet::from([table("grade")]));
+        assert_eq!(all.reshaped_tables, HashSet::from([table("u")]));
+        assert!(all.renames_constraints);
+    }
+
     // ---- Sensitivity of a definition to added columns ---------------------
+
+    #[test]
+    fn the_table_command_is_a_star_expansion() {
+        for ddl in [
+            "CREATE VIEW v AS TABLE t",
+            "CREATE VIEW v AS table public.t",
+            "CREATE VIEW v AS (TABLE t)",
+            "CREATE VIEW v AS SELECT t.id FROM t UNION ALL TABLE u",
+            "CREATE VIEW v AS WITH c AS (TABLE t) SELECT c.id FROM c",
+            "CREATE MATERIALIZED VIEW mv AS TABLE ONLY t",
+            "CREATE FUNCTION f() RETURNS SETOF t LANGUAGE sql BEGIN ATOMIC TABLE t; END",
+        ] {
+            assert!(sensitive(ddl, &[]), "{ddl}");
+        }
+        // The word in DDL that expands nothing.
+        for ddl in [
+            "CREATE TABLE t (id int)",
+            "CREATE UNLOGGED TABLE t (id int)",
+            "COMMENT ON TABLE t IS 'x'",
+            "CREATE FUNCTION f() RETURNS TABLE (id int) LANGUAGE sql BEGIN ATOMIC SELECT t.id FROM t; END",
+            "CREATE TRIGGER trg AFTER INSERT ON t REFERENCING NEW TABLE AS inserted FOR EACH STATEMENT EXECUTE FUNCTION f()",
+            "CREATE VIEW v AS SELECT t.\"table\" FROM t",
+        ] {
+            assert!(!sensitive(ddl, &["added"]), "{ddl}");
+        }
+    }
 
     fn sensitive(ddl: &str, added: &[&str]) -> bool {
         definition_sensitive_to_added_columns(ddl, &columns(added))

@@ -254,7 +254,9 @@ edited file or from a migration:
   recreated afterwards.
 - **Stored results.** A materialized view or an index holds values computed
   when it was built. When anything it is derived from changes, it is rebuilt,
-  even if nothing forces a drop.
+  even if nothing forces a drop. "Derived from" is followed through function
+  calls: editing a function rebuilds a materialized view that reaches it
+  through any chain of other functions.
 
 Everything else is left in place. In particular:
 
@@ -265,18 +267,24 @@ Everything else is left in place. In particular:
   signature: a parameter or result of a table's or view's row type, a
   `tbl.col%TYPE` parameter, a type used in a default. A variable declared with
   a composite type, or a cast to one, binds as well. SQL-standard bodies
-  (`BEGIN ATOMIC`, `RETURN expr`) are parsed at creation and bind like a view.
+  (`BEGIN ATOMIC`, `RETURN expr`) are parsed at creation and bind like a view,
+  to the functions they call as well as the relations they read.
 - **An edited function or procedure is replaced in place** with `CREATE OR
   REPLACE` when its interface is unchanged: same argument types, parameter
   names, result type and `OUT` columns, and no parameter default removed. It
   keeps its OID, its privileges and everything built on it. If the interface
-  changed, it is dropped and recreated along with what is bound to it. The
-  plan marks in-place updates as "replaced in place" (`"in_place": true` in
-  JSON output).
+  changed, it is dropped and recreated along with what is bound to it. So is
+  a routine whose installed body is SQL-standard and whose new body is a
+  string. The plan marks in-place updates as "replaced in place"
+  (`"in_place": true` in JSON output).
 
-When `check_plpgsql` is on, routines left in place are re-checked whenever
-something they call or query was changed, which is where a change that broke
-their body shows up.
+A routine left in place can still be broken by the change: a column its body
+reads is dropped, a function it calls takes different arguments. `LANGUAGE
+sql` routines that call or query something the apply changed are therefore
+re-validated by replacing them with their own unchanged definition, which
+keeps their OID and privileges; a body that is no longer valid fails the apply.
+PL/pgSQL bodies are only checked by plpgsql_check, so for those this happens
+when `check_plpgsql` is on.
 
 ### Which table changes recreate dependents
 
@@ -288,7 +296,7 @@ table's dependents are treated.
 | `ALTER TABLE ...` | Dependents |
 |---|---|
 | `ALTER COLUMN ... TYPE`, `DROP COLUMN` | Everything bound to the table is dropped before the migration and recreated after. PostgreSQL refuses these while a dependent view uses the column. |
-| `DROP CONSTRAINT` | Left in place, unless something in the database depends on the constraint itself (a view that groups by a primary key and selects other columns does). Then, and when pgmg cannot find the constraint to check, as above. |
+| `DROP CONSTRAINT` | Left in place, unless something in the database depends on the constraint itself (a view that groups by a primary key and selects other columns does). Then, and when pgmg cannot find the table to check, as above. A constraint that does not exist (`DROP CONSTRAINT IF EXISTS`) has no dependents, unless a pending migration also renames constraints. |
 | `ADD COLUMN` | Left in place, except those whose definition the new column changes (below). |
 | `ADD CONSTRAINT`, `VALIDATE CONSTRAINT`, `SET`/`DROP DEFAULT`, `SET`/`DROP NOT NULL`, identity and generated-column changes, `OWNER TO`, storage parameters, `SET TABLESPACE`, `ENABLE`/`DISABLE TRIGGER`, row-level security switches | Left in place. |
 | Anything else (`INHERIT`, `ATTACH PARTITION`, rules, ...) | Everything bound to the table is dropped and recreated, as a conservative default. |
@@ -301,12 +309,24 @@ what makes the usual way of removing an enum label work: rename the type
 aside, create its replacement, move the columns over, drop the old one.
 `ALTER TYPE ... ADD VALUE` and `RENAME VALUE` leave dependents alone.
 
+A table's row type is a type too. When a pending migration drops a table,
+renames it or moves it to another schema, routines whose signature uses its
+row type (`RETURNS SETOF item`, a parameter of type `item`) are dropped first
+and recreated after, so they end up bound to whatever carries the name once
+the migration has run.
+
+`ALTER VIEW`, `ALTER MATERIALIZED VIEW`, `ALTER INDEX` and `ALTER SEQUENCE`
+in a migration recreate nothing.
+
 PostgreSQL resolves a view's column references once, when the view is created.
 After an `ADD COLUMN`, pgmg therefore still recreates the dependents whose
 source would now resolve differently, so the database keeps matching what a
 fresh build of your files produces:
 
-- definitions using `*` or `t.*`, which would otherwise not expose the new column;
+- definitions using `*`, `t.*` or `TABLE t`, which would otherwise not expose the new column;
+- views and other parsed definitions that use a function whose signature names
+  the table (`SELECT ... FROM list_items()` where the function `RETURNS SETOF
+  item`), which recorded the function's result columns when they were created;
 - definitions using `NATURAL JOIN`, whose join columns may now differ;
 - definitions with an unqualified reference spelled like a new column, which
   the new column may capture or make ambiguous. If it is ambiguous the apply
